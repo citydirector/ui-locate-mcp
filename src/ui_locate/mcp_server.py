@@ -194,6 +194,25 @@ def _post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return r.json()
 
 
+def _post_any(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """POST 并解析 JSON，不看状态码。
+
+    /act 与 /steps 把「指令写错了」报成 400，那是**有效回答**不是故障：
+    里面带着「第几步、什么原因」这些模型必须看到的信息。用 _post 会把它
+    变成一条 RuntimeError 字符串，结构化信息全丢。
+    """
+    ensure_ready()
+    r = _http().post(path, json=payload)
+    try:
+        body = r.json()
+    except ValueError:
+        return {"ok": False, "error": f"/act 返回 {r.status_code}，且不是 JSON：{r.text[:300]}"}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": f"/act 返回了 {type(body).__name__}，期望对象"}
+    body.setdefault("status", r.status_code)
+    return body
+
+
 # ── 工具 ────────────────────────────────────────────────────────────────────
 
 
@@ -363,6 +382,135 @@ def find_all(
     for h in hits:
         h.pop("_rank", None)
     return json.dumps({"query": text, "matches": hits}, ensure_ascii=False)
+
+
+@mcp.tool()
+def ui_locate_act(
+    text: str = "",
+    action: str = "click",
+    x: int | None = None,
+    y: int | None = None,
+    verify: str = "screen",
+    monitor: str = "",
+    settle_ms: int = 220,
+    count: int = 1,
+    button: str = "left",
+    delivery: str = "auto",
+    to: str = "",
+    delta: int = -3,
+    value: str = "",
+    key: str = "",
+    keys: str = "",
+    verify_text: str = "",
+    verify_timeout_ms: int = 3000,
+) -> str:
+    """定位 → 动作 → 验证，**一次调用走完**。
+
+    这是「快」的关键：以前是「找坐标」一次往返、「点击」一次往返、「截图确认」
+    又一次往返，每次 8~12 秒。现在中间这些步骤都在服务进程里跑，只把结论
+    带回来。
+
+    参数：
+      text        要操作的目标文字（推荐）。界面一变坐标就变，文字不变。
+                  也可以不给 text，改用 x + y 直接指定坐标。
+      action      click（默认）/ double_click / right_click / middle_click /
+                  hover / drag / scroll / type / press / hotkey / wait
+      verify      动作后怎么确认生效：
+                    "screen"（默认）—— 点击点周围像素变了没有
+                    "text"          —— 指定时间内有没有出现 verify_text
+                    "none"          —— 不验证，快，但也就不知道成没成
+      monitor     ""（整个虚拟桌面）/ "primary" / "0" / "1" / 设备名
+      settle_ms   动作后等多久再验证，默认 220 毫秒（等界面切换动画）
+      count       连点次数（action=click 时）
+      button      鼠标键 left / right / middle
+      delivery    输入通道 send_input（系统队列，要求前台）/ message（投窗口
+                  消息，后台可用）/ auto（先前者，光标没动再试后者）
+      to          action=drag 的终点：文字或 "x,y"
+      delta       action=scroll 的幅度，负数向下
+      value       action=type 要输入的文字
+      key / keys  action=press 的单键，或 action=hotkey 的组合键（"ctrl+s"）
+      verify_text verify="text" 时要等的文字
+      verify_timeout_ms  等文字的时限，默认 3000
+
+    返回 JSON：
+      ok        流程是否走完（**不代表动作生效了**）
+      verified  动作是否被确认生效（true / false / null=没验证）
+      target    实际点的位置 {text, cx, cy, w, h, conf}
+      verify    验证细节 {kind, changed, changed_enough} 或 {kind, found, ...}
+      timings   find_ms / act_ms / verify_ms / total_ms
+      stage     失败时在哪一步：find / act / verify
+
+    判读要点：`ok: true, verified: false` 表示「点了但屏幕上没看出变化」——
+    目标可能没吃到这次点击，也可能界面本来就不会变（比如点空白处）。
+    这种情况换 delivery="message" 或改用 hotkey 更可靠。
+    """
+    payload: dict[str, Any] = {"action": action, "verify": verify,
+                               "settle_ms": settle_ms}
+    if text:
+        payload["text"] = text
+    if x is not None and y is not None:
+        payload["x"] = x
+        payload["y"] = y
+    if monitor:
+        payload["monitor"] = monitor
+    if count and int(count) != 1:
+        payload["count"] = int(count)
+    if button:
+        payload["button"] = button
+    if delivery:
+        payload["delivery"] = delivery
+    if to:
+        payload["to"] = to
+    if delta != -3:
+        payload["delta"] = int(delta)
+    if value:
+        payload["value"] = value
+    if key:
+        payload["key"] = key
+    if keys:
+        payload["keys"] = keys
+
+    if verify == "text":
+        payload["verify"] = {"text": verify_text, "timeout_ms": int(verify_timeout_ms)}
+    elif verify in ("none", ""):
+        payload["verify"] = None
+
+    return json.dumps(_post_any("/act", payload), ensure_ascii=False)
+
+
+@mcp.tool()
+def ui_locate_steps(steps: str) -> str:
+    """顺序执行一串动作，任一步失败即停。
+
+    用来把「打开背包 → 切到材料页 → 找到助剂 → 数量拉到 20 → 确认购买」这种
+    流程压成一次工具调用。五步就是五次模型往返，合成一条只剩一次。
+
+    steps 是一个 JSON 数组字符串，每项是一个 `ui_locate_act` 的参数对象，另外
+    支持两个额外字段：
+
+      wait_before  动作前先等某段文字出现（比固定 sleep 靠谱）
+                   写成 "确认购买" 或 {"text": "...", "timeout_ms": 8000}
+      on_fail      "abort"（默认，失败即停）| "continue"（失败继续下一步）
+      action:"wait" 时是纯等待步骤：不动手，只等 text 出现
+
+    示例：
+      [{"text": "背包", "action": "click", "verify": "text",
+        "verify_text": "材料"},
+       {"wait_before": "材料", "text": "精锻助剂", "action": "double_click"},
+       {"text": "确认购买", "action": "click", "verify": "screen"}]
+
+    返回 JSON：{ok, stage, steps:[每步的结果], completed, failed_index?, timings}
+      失败时 failed_index 是**从 0 开始**的序号，对照你传进来的数组即可。
+    """
+    try:
+        parsed = json.loads(steps) if isinstance(steps, str) else steps
+    except json.JSONDecodeError as exc:
+        return json.dumps({"ok": False, "error": f"steps 不是合法 JSON：{exc}"},
+                          ensure_ascii=False)
+    if not isinstance(parsed, list) or not parsed:
+        return json.dumps({"ok": False, "error": "steps 需要一个非空数组"},
+                          ensure_ascii=False)
+    return json.dumps(_post_any("/steps", {"steps": parsed}), ensure_ascii=False)
 
 
 @mcp.tool()

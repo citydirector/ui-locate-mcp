@@ -14,11 +14,16 @@
   POST /detect   {"path": "..."}   检测指定图片
   POST /detect                    body 直接是 PNG/JPEG 字节
   GET  /find?text=保存             按文字找元素（服务内部先检测+OCR）
-  POST /locate   {"text": "保存"}  只返回坐标，不点击；点由 cua_driver 执行
+  POST /locate   {"text": "保存"}  只返回坐标，不点击
+  POST /act      {"text": "...", "action": "click", "verify": "screen"}
+                                   定位 → 动作 → 验证，一次请求走完
+  POST /steps    {"steps": [ ... ]} 一串 act 顺序执行，任一步失败即停
 
-边界：服务只负责「看得见，说得清坐标」。输入注入交给 cua_driver ——
-实测本进程调 SetCursorPos / SendInput 全部静默失败（返回成功、错误码 0、
-光标不动），而 cua_driver 的点击一直正常。两边各做各擅长的事。
+关于「谁来做动作」：本服务确实会调 SendInput / PostMessage（`actions.py`），
+但**不保证生效**。实测本机 Python 进程的鼠标指针类注入会被拦（SetCursorPos
+返回失败、SendInput 移动光标无效），键盘通道可用。所以每个动作都可以用
+`delivery` 指定通道，并且 `/act` 一律回带独立的验证结果 —— 调用方据
+`verified` 判断到底成没成，而不是信 `ok`。
 
 启动：
   uv run python -m ui_locate.server --port 7788
@@ -43,6 +48,8 @@ from ui_locate import config, cuda_dlls
 
 cuda_dlls.register()
 
+from ui_locate import act as act_mod  # noqa: E402
+from ui_locate import actions  # noqa: E402
 from ui_locate import screen  # noqa: E402
 from ui_locate.detect import Detector, default_model  # noqa: E402
 from ui_locate.locate import grab_screen  # noqa: E402
@@ -300,6 +307,129 @@ class Handler(BaseHTTPRequestHandler):
 
         return {"ok": False, "error": "需要 text，或 x 与 y"}
 
+    # ── act 层的四个注入点 ──────────────────────────────────────────────────
+    #
+    # act.py 是全纯的编排逻辑（定位 → 动作 → 验证），外部世界一律靠参数注入。
+    # 这里就是把「参数」接成「真东西」的地方。分成四个小方法而不是一个大函数，
+    # 是因为它们的失败语义完全不同：probe 找不到只是没命中，perform 抛异常
+    # 说明输入通道不可用，compare 拿不到图说明抓屏出了问题。
+
+    def _probe_hit(self, text: str, spec: dict) -> dict | None:
+        """按文字找元素，返回 act 层认的那几个字段（找不到就 None）。
+
+        注意返回的是**归一化**过的字典，不是 find() 的原始元素：act 层只关心
+        「中心点 + 尺寸 + 置信度 + 实际匹配到的文字」，多给它字段只会让两边
+        的耦合变紧。
+        """
+        elements, _stats = detect_monitors(
+            spec.get("monitor"),
+            float(spec.get("conf", 0.25)),
+            0.5,
+            _as_bool(spec.get("tiled"), True),
+            int(spec.get("max_side") or config.max_side()),
+            0.15,
+            True,
+            str(spec.get("text_mode", "mosaic")),
+            _as_bool(spec.get("smart"), True),
+        )
+        hits = find(elements, text)
+        if not hits:
+            return None
+        top = hits[0]
+        return {
+            "matched": top.get("text"),
+            "cx": top["cx"],
+            "cy": top["cy"],
+            "w": top.get("w") or 0,
+            "h": top.get("h") or 0,
+            "conf": float(top.get("conf") or 0.0),
+        }
+
+    def _capture(self, monitor: object) -> tuple[np.ndarray, tuple[int, int]]:
+        """抓一张图，连同它的屏幕原点一起返回。
+
+        origin 必须跟着图走：验证阶段要在图里找「点击点周围那一小片」，
+        而点击点是屏幕绝对坐标、图内坐标是相对坐标，副屏原点为负时差得
+        很远。把它和图绑成一个不透明值传给 compare，act 层不必知道这件事。
+        """
+        return screen.grab(monitor)
+
+    def _perform(self, action_name: str, params: dict) -> dict:
+        """把动作名分派到输入层（`ui_locate.actions`）。"""
+        if action_name in ("click", "double_click", "right_click", "middle_click"):
+            return actions.click(
+                int(params["x"]), int(params["y"]),
+                button=str(params.get("button") or "left"),
+                count=int(params.get("count") or 1),
+                delivery=str(params.get("delivery") or "auto"),
+                delay_ms=int(params.get("delay_ms") or 40),
+            )
+        if action_name in ("hover", "move"):
+            return actions.move(int(params["x"]), int(params["y"]))
+        if action_name == "drag":
+            return actions.drag(
+                int(params["x1"]), int(params["y1"]),
+                int(params["x2"]), int(params["y2"]),
+                button=str(params.get("button") or "left"),
+                steps=int(params.get("steps") or 12),
+                duration_ms=int(params.get("duration_ms") or 300),
+            )
+        if action_name == "scroll":
+            return actions.scroll(
+                int(params["x"]), int(params["y"]),
+                delta=int(params.get("delta") or -3),
+                horizontal=bool(params.get("horizontal")),
+            )
+        if action_name == "type":
+            return actions.type_text(str(params.get("text") or ""),
+                                     delay_ms=int(params.get("delay_ms") or 12))
+        if action_name == "press":
+            return actions.press(str(params.get("key") or ""))
+        if action_name == "hotkey":
+            return actions.hotkey(str(params.get("keys") or ""))
+        raise actions.InputError(f"服务端不认识的动作 {action_name!r}")
+
+    def _compare(self, before: object, after: object, x: int, y: int,
+                 radius: int) -> float | None:
+        """比对点击点周围 `radius` 像素的方块，返回平均绝对差（0~255）。
+
+        为什么只看一小片：整屏里有太多与本次动作无关的变化 —— 时钟跳秒、
+        光标闪烁、背景粒子。实测游戏里什么都不做连抓两张，整屏平均差就有
+        2.8；敲一次 ESC 才 4.3。框住点击点附近，信噪比才够。
+        """
+        try:
+            img_a, org_a = before  # type: ignore[misc]
+            img_b, org_b = after   # type: ignore[misc]
+        except (TypeError, ValueError):
+            return None
+        if img_a.shape != img_b.shape or org_a != org_b:
+            return None
+
+        ox, oy = org_a
+        h, w = img_a.shape[:2]
+        x0 = max(0, min(w, x - ox - radius))
+        x1 = max(0, min(w, x - ox + radius))
+        y0 = max(0, min(h, y - oy - radius))
+        y1 = max(0, min(h, y - oy + radius))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        a = img_a[y0:y1, x0:x1].astype(np.float32)
+        b = img_b[y0:y1, x0:x1].astype(np.float32)
+        return float(np.abs(a - b).mean())
+
+    def _act(self, data: dict) -> dict:
+        """跑一次 act / steps。两个端点共用，差别只在 spec 的形状。"""
+        common = {
+            "probe": self._probe_hit,
+            "capture": self._capture,
+            "perform": self._perform,
+            "compare": self._compare,
+        }
+        if "steps" in data:
+            return act_mod.run_steps(data["steps"], **common)
+        return act_mod.act(data, **common)
+
     def _body(self) -> bytes:
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
@@ -450,12 +580,31 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if u.path == "/locate":
-            # 只给坐标，不点。点击交给 cua_driver（它有可用的输入通道）。
+            # 只给坐标，不点。
             try:
                 data = json.loads(self._body() or b"{}")
                 self._send(200, self._handle_click(data))
             except Exception as e:
                 self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path in ("/act", "/steps"):
+            # 定位 + 动作 + 验证一次走完。act.py 会重试、等待、比对，
+            # 但**不会**替调用方判断成败 —— 结果里的 verified 才是判据。
+            try:
+                data = json.loads(self._body() or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+            except Exception as e:
+                self._send(400, {"error": f"{type(e).__name__}: {e}"})
+                return
+            try:
+                self._send(200, self._act(data))
+            except act_mod.ActError as e:
+                # 指令本身写错了，重试没有意义 → 400 而不是 500
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return
 
         self._send(404, {"error": "unknown path"})
