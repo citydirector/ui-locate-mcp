@@ -99,7 +99,8 @@ def resolve_target(
             "h": int(round(float(hit.get("h") or 0))),
             "conf": float(hit.get("conf") or 0),
             "score": hit.get("score"),
-        }, {"reason": "text"}
+            "match_tier": hit.get("match_tier"),
+        }, {"reason": "text", "match_tier": hit.get("match_tier")}
 
     if spec.get("x") is not None and spec.get("y") is not None:
         timings["find_ms"] = _ms(t0, clock)
@@ -412,6 +413,13 @@ def act(
         "target_source": info.get("reason"),
         "action": action,
     }
+
+    # 命中靠哪一档。exact 最可靠，starts 次之（通常就是图标被 OCR 读成了
+    # 一个字符，剥掉之后才相等）；contains 在动手路径上已经被 probe 拦掉，
+    # 真出现在这里说明调用方自己绕过了 _probe_hit，值得在结果里留痕。
+    # 不把它做成"是否成功"的判据 —— 成没成看 verified，那是另一件事。
+    if info.get("match_tier"):
+        result["match_tier"] = info["match_tier"]
 
     if action == "none":
         timings["total_ms"] = _ms(t_all, clock)

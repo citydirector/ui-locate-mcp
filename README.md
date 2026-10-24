@@ -398,6 +398,9 @@ Origin/Referer 必须同源；桌面壳转发过来的 `dsh-app://app` 单独放
 # 结构自检（不启动任何东西，纯静态核对 bundle 规范）
 python tests\check_bundle.py
 
+# 纯逻辑测试（76 例：匹配档位与排序、动作编排、HTTP 层、bundle 规则）
+python -m unittest discover -s tests -p "test_*.py"
+
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
@@ -517,8 +520,12 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 6. **bash 里变量展开失效**（本机 shell 特性），命令里一律写绝对路径。
 7. **别给 mosaic 分页**。每页都要付一次 OCR 固定开销，页数越多越慢
    （实测 1 页 579 ms，6 页 4948 ms）。要快就把整张拼图压到一个 1200 宽的页面里。
-8. **别在本服务进程里调 `SendInput` / `SetCursorPos`**。会静默失败：返回成功、
-   错误码 0、光标不动（实测 0/6）。点击统一交给 `cua_driver_native__click`。
+8. **输入注入成不生效，取决于前台是谁，不是取决于本进程的权限**。桌面程序在
+   前台时光标移动正常（实测 `cursor_moved: true`）；全屏游戏捕获鼠标时
+   `SetCursorPos` 与 `SendInput` 的移动全部失败（返回成功、错误码含糊、光标
+   一步不动）。**别看「读回光标」判断注入有没有成功** —— 被捕获时这个值本
+   来就不变，判据本身失效。要判成没成，比截图。这也是为什么 `/act` 的
+   `verified` 要和 `ok` 分开看，且抓屏失败时它给 `null` 而不是 `false`。
 9. **`.python-version` 必须是 3.12**。uv 默认拿 3.14，而 `onnxruntime-gpu==1.23.2`
    只发到 cp313，装不上。
 10. **`/detect` 的参数要同时支持 query 和 body**。MCP 层习惯把参数放 JSON body，
@@ -758,6 +765,20 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     这两个坑都有回归检查：`tests/check_http.py`（5 项），需要真起服务、
     真复用一条 TCP 连接，所以不能并进纯逻辑的 `test_act.py`。
 
+32. **动手前别只认 `mosaic`，它漏框就等于那段文字没进 OCR**。`mosaic` 只对
+    **检测框内**的裁片做 OCR —— 检测器一旦没框住目标，匹配就只能往下降档，
+    于是查「插件」掉到 contains 档、命中任务栏上「视觉定位MCP插件开发」，
+    点下去窗口获得焦点、屏幕确实变了、`verified: true`。**工具报告成功，
+    实际点错了地方**，比报失败危险得多。
+
+    两条独立防线，缺一不可：
+    - `find(min_tier="starts")`：动手路径不接受 contains 档，宁可报「没找到」；
+    - `_probe_hit` 在 mosaic 空手时自动退回 `full` 再找一遍 —— 多花两三倍
+      OCR 时间，换「不点错」。只查不点的 `/locate` 不做这个回退，快更重要。
+
+    排错时有个反直觉的地方：**别靠「读回光标」判断注入成没成**。目标程序
+    捕获鼠标时那个值本来就不变，判据本身失效。要判成没成，比截图。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -795,6 +816,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
 | `tests/test_act.py` | 动作编排测试（62 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
+| `tests/test_match.py` | 匹配档位与排序测试（14 例）—— 守那次「掉到 contains 档点错窗口」的事故 |
 | `tests/check_http.py` | HTTP 层回归检查（5 项）—— keep-alive 复用与 chunked 请求体（详见坑 30、31） |
 | `tests/update-plugin.test.mjs` | 插件行为测试（66 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
@@ -836,12 +858,25 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 所以游戏 UI 里 mosaic 不一定更快（检测框大、裁片多），
 而信息密集的应用界面里 mosaic 快 4 倍。
 
-## 一次失败的尝试，留个记录
+## 关于「在服务里顺手把点击也做了」
 
-曾经想在服务里顺手把点击也做了（用 `SendInput` 自己注入），失败。原因是本机
-Python 进程调输入 API 会静默失败（见坑 8）。教训：**定位和输入是两件事，
-各有各的强手**——定位这份活儿归 YOLO+OCR，输入归 `cua_driver`。
-硬要在一个进程里全包，就是在别人的地盘上打自己的仗。
+这件事做过两次，结论不一样，都留个记录。
+
+第一次失败：在本机 Python 进程里调 `SendInput`，`SetCursorPos` 返回失败、错误码
+0、光标一步不动（实测 0/6）。当时的结论是「定位和输入是两件事，各有各的强手」。
+
+后来发现结论下早了。同一条代码，在**桌面程序处于前台**时 `cursor_moved: true`，
+换到全屏游戏捕获鼠标时又全部失灵。也就是说**限制来自前台那个程序对鼠标的独占，
+不是本进程的权限**，换一个前台就可能变。所以现在服务里保留了 `actions.py`，
+提供 `send_input` / `message` 两条通道，由调用方按场景选。
+
+真正该记住的不是「能不能做」，而是**别靠 `ok` 判断做没做成**：
+- `ok` 只表示编排跑完了；
+- `verified` 才是「屏幕上真的变了没有」；
+- 抓屏被拦时 `verified` 给 `null`（没法判断），**不要当失败重试** —— 可能点两次。
+
+仍然推荐：拿不准的时候，定位交给这套工具，点击交给 `cua_driver_native__click`。
+它绕开了前台锁的问题，代价是多一次往返。
 
 ## find() 的排序：长度比置信度更可信，且要先剥图标噪声
 

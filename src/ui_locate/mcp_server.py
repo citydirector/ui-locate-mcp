@@ -12,10 +12,12 @@
   服务没起来时，本进程会自动在后台拉起它（首次预热较慢），
   之后的调用就都是几十到几百毫秒。
 
-**边界：只定位，不点击。**
-  找到坐标后，调用方用 `cua_driver_native__click(scope="desktop", x=, y=)` 去点。
-  理由见 README 的「边界」一节：本机 Python 进程调 SendInput / SetCursorPos
-  会静默失败，输入注入这件事有可靠通道，没必要重造。
+**边界：能动手，但不保证动手生效。**
+  想只拿坐标，用 `locate_text` / `detect_elements` / `find_all`，再自己调
+  `cua_driver_native__click(scope="desktop", x=, y=)`。
+  想让一次调用把「找 → 做 → 验」走完，用 `ui_locate_act` / `ui_locate_steps`。
+  后者会回带独立的 `verified`：`true` 才算看到效果，`false` 是确实没变化，
+  `null` 是**没法判断**（抓屏被拦）。判成败看 `verified`，不要只看 `ok`。
 """
 
 from __future__ import annotations

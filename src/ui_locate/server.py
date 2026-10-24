@@ -20,10 +20,11 @@
   POST /steps    {"steps": [ ... ]} 一串 act 顺序执行，任一步失败即停
 
 关于「谁来做动作」：本服务确实会调 SendInput / PostMessage（`actions.py`），
-但**不保证生效**。实测本机 Python 进程的鼠标指针类注入会被拦（SetCursorPos
-返回失败、SendInput 移动光标无效），键盘通道可用。所以每个动作都可以用
-`delivery` 指定通道，并且 `/act` 一律回带独立的验证结果 —— 调用方据
-`verified` 判断到底成没成，而不是信 `ok`。
+但**不保证生效**。实测两种截然不同的情况：桌面程序在前台时光标移动通道正常
+（`cursor_moved: true`），而全屏游戏捕获鼠标时 SetCursorPos 全部失败——所以
+「锁光标」是前台那个程序造成的，不是本进程的权限问题，换一个前台就可能变。
+每个动作都可以用 `delivery` 指定通道，并且 `/act` 一律回带独立的验证结果 ——
+调用方据 `verified` 判断到底成没成，而不是信 `ok`。
 
 启动：
   uv run python -m ui_locate.server --port 7788
@@ -285,12 +286,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_click(self, data: dict) -> dict:
-        """按文字或坐标返回目标位置——只负责「找到」，点由调用方（cua_driver）做。
+        """按文字或坐标返回目标位置——只负责「找到」，不碰输入。
 
-        为什么服务自己不下手：实测本进程调 SetCursorPos / SendInput 全部静默失败
-        （返回成功、错误码 0、光标不动），而同一台机器上 cua_driver 的输入
-        完全正常。输入注入这件事已经有可靠通道，没必要在这里重造一遍。
-        服务把边界划在「我给坐标，你给点击」，两边都干净。
+        与 `/act` 的分工：`/act` 会真的按下去，`/locate` 只回坐标。留着这条
+        只查不动的路，是因为它的成本低得多（不做 full 回退、接受 contains
+        档），适合「人看着屏幕，只想让工具告诉我在哪」的场合。
+
+        至于为什么 `/act` 不直接复用这里的宽松匹配：实测过一次掉到 contains
+        档、点中任务栏上另一个窗口，屏幕确实变了、`verified: true` —— 报告
+        成功但点错了地方。会动手的路径宁可报「没找到」，所以 `_probe_hit`
+        单独收紧到 starts 以上，并在 mosaic 空手时回退到 full。
         """
         assert ENGINE is not None
         conf = float(data.get("conf", 0.3))
@@ -303,7 +308,11 @@ class Handler(BaseHTTPRequestHandler):
                 data.get("monitor"), conf, 0.5, True, config.max_side(), 0.15,
                 True, text_mode, smart,
             )
-            hits = find(elements, str(text))
+            # min_tier 由调用方给：`/locate` 只回坐标、由人看着点，所以宽松
+            # 一些也无妨；但 `/act` 会真的点下去，必须收紧到 starts 以上，
+            # 否则会像实测那次——掉到 contains 档点中任务栏上另一个窗口，
+            # 还得回一个 verified:true。详见 ocr_match.find 的 docstring。
+            hits = find(elements, str(text), min_tier=str(data.get("min_tier") or "contains"))
             if not hits:
                 return {
                     "ok": False,
@@ -315,6 +324,7 @@ class Handler(BaseHTTPRequestHandler):
             return {
                 "ok": True,
                 "matched": target.get("text"),
+                "match_tier": target.get("match_tier"),
                 "score": round(float(target.get("conf", 0)), 3),
                 "x": int(target["cx"]),
                 "y": int(target["cy"]),
@@ -341,32 +351,52 @@ class Handler(BaseHTTPRequestHandler):
         """按文字找元素，返回 act 层认的那几个字段（找不到就 None）。
 
         注意返回的是**归一化**过的字典，不是 find() 的原始元素：act 层只关心
-        「中心点 + 尺寸 + 置信度 + 实际匹配到的文字」，多给它字段只会让两边
-        的耦合变紧。
+        「中心点 + 尺寸 + 置信度 + 实际匹配到的文字 + 靠哪一档命中」，多给它
+        字段只会让两边的耦合变紧。
+
+        **动手前比只查时更严**，两处收紧：
+
+          1. 不接受 contains 档。实测过一次查「插件」，那一帧 OCR 恰好没认出
+             侧栏按钮，于是掉到 contains 档命中任务栏上「视觉定位MCP插件开发」
+             ——点下去、窗口获得焦点、屏幕确实变了、`verified: true`。工具报告
+             成功，实际点错了地方。会动手的路径宁可报「没找到」。
+          2. mosaic 没找到就自动退回 full 再找一遍。mosaic 只对**检测框内**的
+             裁片做 OCR，检测器一旦漏框，那段文字就根本没进 OCR —— 这正是上面
+             那次漏掉按钮的原因。full 是整页扫描，召回更全但慢三倍；只在
+             「马上要动手、而省的那点时间会换来点错」时才值得付这个代价。
+             只查不点的 `/locate` 不做这个回退，快更重要。
         """
-        elements, _stats = detect_monitors(
-            spec.get("monitor"),
-            float(spec.get("conf", 0.25)),
-            0.5,
-            _as_bool(spec.get("tiled"), True),
-            int(spec.get("max_side") or config.max_side()),
-            0.15,
-            True,
-            str(spec.get("text_mode", "mosaic")),
-            _as_bool(spec.get("smart"), True),
-        )
-        hits = find(elements, text)
-        if not hits:
-            return None
-        top = hits[0]
-        return {
-            "matched": top.get("text"),
-            "cx": top["cx"],
-            "cy": top["cy"],
-            "w": top.get("w") or 0,
-            "h": top.get("h") or 0,
-            "conf": float(top.get("conf") or 0.0),
-        }
+        def scan(text_mode: str) -> dict | None:
+            elements, _stats = detect_monitors(
+                spec.get("monitor"),
+                float(spec.get("conf", 0.25)),
+                0.5,
+                _as_bool(spec.get("tiled"), True),
+                int(spec.get("max_side") or config.max_side()),
+                0.15,
+                True,
+                text_mode,
+                _as_bool(spec.get("smart"), True),
+            )
+            hits = find(elements, text, min_tier="starts")
+            if not hits:
+                return None
+            top = hits[0]
+            return {
+                "matched": top.get("text"),
+                "match_tier": top.get("match_tier"),
+                "cx": top["cx"],
+                "cy": top["cy"],
+                "w": top.get("w") or 0,
+                "h": top.get("h") or 0,
+                "conf": float(top.get("conf") or 0.0),
+            }
+
+        wanted = str(spec.get("text_mode") or "mosaic")
+        hit = scan(wanted)
+        if hit is None and wanted != "full":
+            hit = scan("full")
+        return hit
 
     def _capture(self, monitor: object) -> tuple[np.ndarray, tuple[int, int]]:
         """抓一张图，连同它的屏幕原点一起返回。
