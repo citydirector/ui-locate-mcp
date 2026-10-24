@@ -57,11 +57,11 @@
       "versions": [
         {
           "version": "0.2.0",
-          "publishTimestamp": 1792813285,
+          "publishTimestamp": 1792813330,
           "source": {
             "type": "git",
             "url": "https://github.com/citydirector/ui-locate-mcp",
-            "commit": "0000000000000000000000000000000000000000"
+            "commit": "879966ae96509bb94c8bfdb1f397a77a18b8e441"
           }
         }
       ]
