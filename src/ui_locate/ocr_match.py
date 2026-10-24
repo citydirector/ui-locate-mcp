@@ -155,13 +155,36 @@ def _strip_icon_noise(t: str) -> str:
     return core if core else s
 
 
-def find(items: list[dict], query: str, limit: int = 5) -> list[dict]:
+# 匹配档位，从强到弱。`find` 的 min_tier 就取这里的名字。
+_TIER_ORDER = ("exact", "starts", "contains")
+
+
+def _tier_of(raw: str, q: str) -> str | None:
+    """判断一段文字对查询词属于哪一档，不属于任何一档返回 None。"""
+    cleaned = _strip_icon_noise(raw).lower()
+    t = cleaned or raw.lower()
+    if t == q:
+        return "exact"
+    if t.startswith(q) or t.endswith(q):
+        return "starts"
+    if q in t or t in q:
+        return "contains"
+    return None
+
+
+def find(
+    items: list[dict],
+    query: str,
+    limit: int = 5,
+    *,
+    min_tier: str = "contains",
+) -> list[dict]:
     """按文字模糊查找元素，返回最匹配的几个。
 
     排序规则（这个顺序是踩过坑才定下来的）：
-      1. 完全相等
-      2. 以查询词开头 / 结尾（如查「插件」命中「8 插件」）
-      3. 包含查询词
+      1. 完全相等（``exact``）
+      2. 以查询词开头 / 结尾（``starts``，如查「插件」命中「8 插件」）
+      3. 包含查询词（``contains``）
       然后同档内按「文字长度与查询词的长度差」升序 —— 越接近越优先 ——
       最后才按 conf 降序。
 
@@ -172,26 +195,35 @@ def find(items: list[dict], query: str, limit: int = 5) -> list[dict]:
     「这次"插件"没有点中…」的 OCR 置信度是 0.99，而真正的按钮
     「8 插件」只有 0.46。只看 conf 会把长段落排在按钮前面，点下去
     落在正文中间。控件名的特点是**短**，所以长度差是最可靠的信号。
+
+    ``min_tier`` 决定最低接受哪一档，用来挡住「点了完全不相干的东西」：
+
+        实测过这么一次：查「插件」，那一帧 OCR 恰好没认出侧栏按钮，
+        于是掉到 contains 档，命中任务栏上「视觉定位MCP插件开发」——
+        点了它，窗口获得焦点，屏幕确实变了，于是 ``verified: true``。
+        工具报告成功，实际点错了地方。**这比报失败危险得多。**
+
+        凡是要**动手**的调用都应当传 ``min_tier="starts"``：宁可报
+        「没找到」，也不要落到一个只是"碰巧包含这两个字"的元素上。
+        只查不点的场景（``detect_elements`` / ``find_all``）保留默认的
+        ``contains``，因为把它们列出来给人挑是有价值的。
+
+    返回的每个元素是浅拷贝，多一个 ``match_tier`` 字段说明它靠哪一档
+    进来的 —— 调用方据此判断这一击有多可靠，原件不受影响。
     """
     q = query.strip().lower()
-    if not q:
+    if not q or min_tier not in _TIER_ORDER:
         return []
+    allowed = _TIER_ORDER.index(min_tier)
 
-    exact: list[dict] = []
-    starts: list[dict] = []
-    contains: list[dict] = []
+    buckets: dict[str, list[dict]] = {tier: [] for tier in _TIER_ORDER}
     for it in items:
         raw = (it.get("text") or "").strip()
         if not raw:
             continue
-        cleaned = _strip_icon_noise(raw).lower()
-        t = cleaned or raw.lower()
-        if t == q:
-            exact.append(it)
-        elif t.startswith(q) or t.endswith(q):
-            starts.append(it)
-        elif q in t or t in q:
-            contains.append(it)
+        tier = _tier_of(raw, q)
+        if tier is not None:
+            buckets[tier].append(it)
 
     def rank(d: dict) -> tuple[int, int, float]:
         # 用剥噪声后的长度算差，否则「8 插件」(4字) 会比「插件」(2字) 吃亏
@@ -199,6 +231,12 @@ def find(items: list[dict], query: str, limit: int = 5) -> list[dict]:
         core = _strip_icon_noise(raw)
         return (abs(len(core) - len(q)), len(raw), -d.get("conf", 0.0))
 
-    for group in (exact, starts, contains):
+    out: list[dict] = []
+    for tier in _TIER_ORDER:
+        if _TIER_ORDER.index(tier) > allowed:
+            break
+        group = buckets[tier]
         group.sort(key=rank)
-    return (exact + starts + contains)[:limit]
+        for it in group:
+            out.append({**it, "match_tier": tier})
+    return out[:limit]
