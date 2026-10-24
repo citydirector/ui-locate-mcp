@@ -404,7 +404,7 @@ python -m unittest discover -s tests -p "test_*.py"
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 插件行为测试（66 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json 的写与读）
+# 插件行为测试（69 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json 的写与读、后台任务的失败处置）
 node --test tests/
 ```
 
@@ -779,6 +779,36 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     排错时有个反直觉的地方：**别靠「读回光标」判断注入成没成**。目标程序
     捕获鼠标时那个值本来就不变，判据本身失效。要判成没成，比截图。
 
+33. **后台任务没人接 rejection，会把宿主带走**。实测过一次：装上插件、重启
+    DSH，MCP 那半身照常工作、`mcp__ui-locate__*` 全在，但 Host 那半身的两个
+    工具（`ui_locate_update` / `ui_locate_setup`）**一个都没出现**。宿主日志里
+    什么都没有 —— 因为它是被打断的，不是报错退出的。
+
+    现场是这样的链路：
+
+    ```
+    execFile spawn EPERM
+      → installedPythonVersion 没挂 onRejected，rejection 传下去
+      → syncPythonToBundle 的 await 抛
+      → syncPython 的 .then 没有第二个参数
+      → void syncPython()      ← void 只是「不等它」，不是错误处理
+      → unhandledRejection     → Node 终止进程
+    ```
+
+    三条纪律，缺一条都会重现：
+    - 凡是「可能起不来」的子进程，一律包在统一的 runner 里，把同步抛和回调
+      失败都折成同一种结果。**注意两个 runner 不一样**：`core.mjs` 的
+      `runProcess` 那个 Promise 带 reject，try 只是保险（拆掉测试仍绿，
+      因为构造器会接住）；`runtime.mjs` 的 `run` 只 resolve 不 reject，
+      拆掉 try 就真的漏（拆掉会红 2 条）。别照着一个改另一个。
+    - 启动时发起的后台动作，`void fn()` 换成 `fn().catch(...)`。`void` 是
+      语法糖，不接错误。
+    - 自愈性的附加动作（同步 venv 版本这类）失败要折成 `state`，不要让异常
+      冒到 `apply()`。宿主是拿「apply 跑完没有」判断插件活没活的。
+
+    排查提示：**Host 半身的工具消失、MCP 半身照常**，这个组合基本就指向
+    `apply()` 里炸了一次。验证方法是用假 ctx 跑一遍 `apply`（不必真启动 DSH）。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -818,7 +848,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `tests/test_act.py` | 动作编排测试（62 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
 | `tests/test_match.py` | 匹配档位、排序与动手前的两道防线（18 例）—— 守那次「掉到 contains 档点错窗口」的事故 |
 | `tests/check_http.py` | HTTP 层回归检查（5 项）—— keep-alive 复用与 chunked 请求体（详见坑 30、31） |
-| `tests/update-plugin.test.mjs` | 插件行为测试（66 例，`node --test tests/`） |
+| `tests/update-plugin.test.mjs` | 插件行为测试（69 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
 
