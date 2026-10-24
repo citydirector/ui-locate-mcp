@@ -398,7 +398,7 @@ Origin/Referer 必须同源；桌面壳转发过来的 `dsh-app://app` 单独放
 # 结构自检（不启动任何东西，纯静态核对 bundle 规范）
 python tests\check_bundle.py
 
-# 纯逻辑测试（76 例：匹配档位与排序、动作编排、HTTP 层、bundle 规则）
+# 纯逻辑测试（80 例：匹配档位与排序、动手前防线、动作编排、HTTP 层、bundle 规则）
 python -m unittest discover -s tests -p "test_*.py"
 
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
@@ -816,7 +816,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
 | `tests/test_act.py` | 动作编排测试（62 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
-| `tests/test_match.py` | 匹配档位与排序测试（14 例）—— 守那次「掉到 contains 档点错窗口」的事故 |
+| `tests/test_match.py` | 匹配档位、排序与动手前的两道防线（18 例）—— 守那次「掉到 contains 档点错窗口」的事故 |
 | `tests/check_http.py` | HTTP 层回归检查（5 项）—— keep-alive 复用与 chunked 请求体（详见坑 30、31） |
 | `tests/update-plugin.test.mjs` | 插件行为测试（66 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
