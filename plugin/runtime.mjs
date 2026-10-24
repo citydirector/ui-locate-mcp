@@ -183,7 +183,14 @@ export function runtimePlan({ home, modelDir, defaultHome, defaultModelDir, home
  */
 function run(exec, command, args, options = {}) {
   return new Promise((resolve) => {
-    exec(command, args, { timeout: 600_000, maxBuffer: 8 << 20, ...options }, (error, stdout, stderr) => {
+    // 抛异常和「退出码非零」在调用方看来应该是同一件事，统一成 ok:false。
+    //
+    // **exec 必须在 try 里调**：execFile 有两种失败姿势 —— 进回调（进程起来
+    // 了、退出码非零），以及根本没起来时**同步 throw**（spawn EPERM / ENOENT）。
+    // 后者在 new Promise(executor) 里抛会直接冒出构造器，调用方拿到的是同步
+    // 异常而不是 rejected Promise。这个差别在「没人接 rejection」的场合很致命，
+    // 见 core.mjs 的 runProcess 与 README 坑 33。
+    const settle = (error, stdout, stderr) =>
       resolve({
         ok: error === null || error === undefined,
         code: typeof error?.code === "number" ? error.code : error ? -1 : 0,
@@ -191,7 +198,14 @@ function run(exec, command, args, options = {}) {
         stderr: String(stderr ?? ""),
         error,
       })
-    })
+    try {
+      exec(command, args, { timeout: 600_000, maxBuffer: 8 << 20, ...options }, (error, stdout, stderr) => {
+        settle(error, stdout, stderr)
+      })
+    } catch (error) {
+      // spawn 层面就失败了：ENOENT / EPERM / EACCES 都走这里
+      settle(error, "", String(error?.message ?? error))
+    }
   })
 }
 

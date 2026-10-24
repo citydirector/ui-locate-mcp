@@ -165,6 +165,44 @@ export function venvPython(home, platform = process.platform) {
 // ── Python 侧 ──────────────────────────────────────────────────────────────
 
 /**
+ * 跑一次子进程，把「同步抛」也折成 rejected Promise。
+ *
+ * `execFile` 有两种失败姿势：
+ *   1. 进回调：进程起来了但退出码非零；
+ *   2. **同步 throw**：根本没起来（`spawn EPERM`、可执行文件不存在）。
+ *
+ * 第 2 种在 `new Promise(executor)` 里抛，会直接冒出 Promise 构造器 —— 调用
+ * 方拿到的是**同步异常**而不是 rejected Promise。这个差别在 `void fn()` 的
+ * 场合是致命的：`void` 接不住同步异常，它会把调用栈一路炸到 `apply()`，
+ * 于是插件加载失败、Host 半身整个不出现（实测过一次，见 README 坑 33）。
+ *
+ * 所以凡是「可能起不来」的子进程，都必须经过这里。
+ */
+function runProcess(exec, command, args, options) {
+  return new Promise((resolve, reject) => {
+    // 这里的 try 是保险，不是必需：这个 Promise 本身就带 reject，exec 同步抛
+    // 时 Promise 构造器会接住并把它变成 rejected —— 与下面 catch 里的
+    // reject(error) 等价。实测拆掉它测试不变红，就是这个原因。
+    // runtime.mjs 的 run() 不一样：那个 Promise 只 resolve 不 reject，拆掉
+    // try 就真的会漏出去。两个文件的差别是实的，别照着一个改另一个。
+    try {
+      exec(command, args, options, (error, stdout, stderr) => {
+        if (error) {
+          reject(Object.assign(new Error(String(error.message)), {
+            output: String(stderr ?? "").slice(-2000),
+          }))
+          return
+        }
+        resolve(stdout)
+      })
+    } catch (error) {
+      // spawn 层面的失败：ENOENT / EPERM / EACCES 都走这里
+      reject(error)
+    }
+  })
+}
+
+/**
  * 问 venv 里装的 Python 包是哪个版本。
  *
  * @param python - venv 解释器绝对路径。
@@ -173,21 +211,18 @@ export function venvPython(home, platform = process.platform) {
  */
 export function installedPythonVersion(python, { exec = execFile, exists = existsSync } = {}) {
   if (!exists(python)) return Promise.resolve(undefined)
-  return new Promise((resolve) => {
-    exec(
-      python,
-      ["-c", `import importlib.metadata as m; print(m.version(${JSON.stringify(PYTHON_PACKAGE)}))`],
-      { timeout: 20000 },
-      (error, stdout) => {
-        if (error) {
-          resolve(undefined)
-          return
-        }
-        const value = String(stdout ?? "").trim()
-        resolve(value === "" ? undefined : value)
-      },
-    )
-  })
+  return runProcess(
+    exec,
+    python,
+    ["-c", `import importlib.metadata as m; print(m.version(${JSON.stringify(PYTHON_PACKAGE)}))`],
+    { timeout: 20000 },
+  ).then(
+    (stdout) => {
+      const value = String(stdout ?? "").trim()
+      return value === "" ? undefined : value
+    },
+    () => undefined,
+  )
 }
 
 /**
@@ -201,16 +236,9 @@ export function installedPythonVersion(python, { exec = execFile, exists = exist
  */
 export function installIntoVenv(python, target, { exec = execFile, noDeps = false } = {}) {
   const run = (command, args) =>
-    new Promise((resolve, reject) => {
-      exec(
-        command,
-        args,
-        { timeout: 900000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
-        (error, stdout, stderr) => {
-          if (error) reject(Object.assign(new Error(String(error.message)), { output: String(stderr ?? "").slice(-2000) }))
-          else resolve(stdout)
-        },
-      )
+    runProcess(exec, command, args, {
+      timeout: 900000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     })
   const extra = noDeps ? ["--no-deps"] : []
   return run("uv", ["pip", "install", "--python", python, ...extra, target]).catch((error) => {
@@ -252,13 +280,39 @@ export async function syncPythonToBundle({
   if (wanted === undefined) return { state: "unknown", reason: "pyproject.toml unreadable" }
   const have = await installedPythonVersion(python, { exec, exists })
   if (have === wanted) return { state: "current", version: have }
+
+  // 读不到版本有两种可能：包真没装（重装有用），或者解释器根本跑不起来
+  // （重装没用，会白等一次安装超时）。后者要单独报，别让它伪装成「装上了
+  // 但版本不对」—— 那会把排查引到错误的方向上。
+  if (have === undefined && !(await canRunPython(python, { exec }))) {
+    return { state: "broken", home, python, wanted, reason: "venv 里的解释器跑不起来" }
+  }
+
   const target = root.replace(/[\\/]+$/, "")
   try {
     await installIntoVenv(python, target, { exec, noDeps: true })
     const after = await installedPythonVersion(python, { exec, exists })
-    return after === wanted ? { state: "updated", version: after } : { state: "mismatch", have: after, wanted }
+    if (after === wanted) return { state: "updated", version: after }
+    if (after === undefined) return { state: "failed", error: "装完之后仍然读不到版本", wanted }
+    return { state: "mismatch", have: after, wanted }
   } catch (error) {
     return { state: "failed", error: String(error?.message ?? error).split("\n")[0].slice(0, 200), wanted }
+  }
+}
+
+/**
+ * venv 里的解释器能不能跑起来。
+ *
+ * 只要它能打印一行东西就算活着 —— 这里问的不是版本，是「这个 exe 还能不能
+ * 被执行」。区分它和不区分它，决定了同步逻辑会不会在一个已经坏掉的 venv
+ * 上空转一次安装超时。
+ */
+async function canRunPython(python, { exec }) {
+  try {
+    const out = await runProcess(exec, python, ["-c", "print(1)"], { timeout: 20000 })
+    return String(out ?? "").trim().endsWith("1")
+  } catch {
+    return false
   }
 }
 

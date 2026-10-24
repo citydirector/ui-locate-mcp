@@ -235,6 +235,102 @@ check("installedPythonVersion：包没装好时返回 undefined，不抛", async
   assert.equal(await installedPythonVersion("D:/h/venv/Scripts/python.exe", { exec, exists: () => true }), undefined)
 })
 
+// ── 子进程「同步抛」这条坑 ────────────────────────────────────────────────
+// execFile 有两种失败姿势：进回调（进程起来了、退出码非零），以及**根本没起来**
+// 时同步 throw（spawn EPERM / ENOENT）。后者在 new Promise 里抛会直接冒出
+// Promise 构造器，调用方拿到的是同步异常而不是 rejected Promise —— 于是
+// `void syncPython()` 接不住，一路炸到 apply()，插件加载失败。
+// 实测过一次：Host 半身整个不出现，而 MCP 那半身照常工作，很容易误判。
+
+/** 造一个「一被调用就同步 throw」的 exec，模拟 spawn EPERM。 */
+function throwingExec(message = "spawn EPERM") {
+  const calls = []
+  const exec = (command, args, options, callback) => {
+    calls.push({ command, args })
+    throw Object.assign(new Error(message), { code: "EPERM", syscall: "spawn" })
+  }
+  exec.calls = calls
+  return exec
+}
+
+check("installedPythonVersion：exec 同步抛也不许把异常漏出去", async () => {
+  const exec = throwingExec()
+  // 关键是这里没有 try/catch —— 调用方拿到的必须是一个能 await 的 Promise
+  const answer = await installedPythonVersion("D:/h/venv/Scripts/python.exe", {
+    exec,
+    exists: () => true,
+  })
+  assert.equal(answer, undefined)
+})
+
+// 这条守的是那次事故本身：spawn 全军覆没时，apply 必须照样跑完。
+// 当时的表现是 Host 半身整个消失、MCP 半身照常工作 —— 极难判断。
+// 根因不是「同步抛」（Promise 构造器会接住它），而是 `void syncPython()`
+// 没人接 rejection，于是 unhandledRejection 把进程带走。
+check("index：venv 存在但解释器起不来时，apply 照样跑完并注册两个工具", async () => {
+  // 这条守的是那次事故的现场：Host 半身整个不出现，而 MCP 半身照常工作，
+  // 从外面看完全看不出问题。根因是 apply 里那个后台的 Python 同步把整个
+  // 宿主带走了。
+  //
+  // 说明白一点：真正拦住它的是 core.mjs 里 installedPythonVersion 的
+  // onRejected（那条有独立测试守着，拆掉会红）。apply 这层只是顺带验一遍
+  // 「整条装配在这个输入下能跑完」—— 所以这里不断言 unhandledRejection，
+  // 因为正常路径下压根不会有 rejection 冒出来，断言等于永远为真。
+  const { apply } = await import("../plugin/index.mjs")
+
+  const home = mkdtempSync(join(tmpdir(), "ui-locate-apply-"))
+  const binDir = process.platform === "win32"
+    ? join(home, "venv", "Scripts")
+    : join(home, "venv", "bin")
+  mkdirSync(binDir, { recursive: true })
+  // 文件"在"，但里面不是可执行的东西 —— 和「venv 建坏了」是一个样子
+  writeFileSync(join(binDir, process.platform === "win32" ? "python.exe" : "python"),
+                "not a real executable")
+
+  const savedHome = process.env.UI_LOCATE_HOME
+  process.env.UI_LOCATE_HOME = home
+
+  const tools = []
+  const ctx = {
+    tools: { register(definition) { tools.push(definition.name); return () => {} } },
+    inject() { return { dispose() {} } },
+    effect(fn) { return fn() },
+    get() { return undefined },
+    on() { return () => {} },
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+  }
+
+  try {
+    const answer = apply(ctx, {})
+    if (answer && typeof answer.then === "function") await answer
+    await new Promise((resolve) => setTimeout(resolve, 300))
+  } finally {
+    if (savedHome === undefined) delete process.env.UI_LOCATE_HOME
+    else process.env.UI_LOCATE_HOME = savedHome
+    rmSync(home, { recursive: true, force: true })
+  }
+
+  assert.deepEqual(tools.sort(), ["ui_locate_setup", "ui_locate_update"], "两个工具都要注册上")
+})
+
+check("inspectRuntime：exec 同步抛也不许把异常漏出去", async () => {
+  // runtime.mjs 的 run() 也走 execFile。它被 inspectRuntime / ensureRuntime
+  // 共用，设置页的「看状态」按钮就会触发 —— 在那里炸掉同样是整个 Host 半身
+  // 消失。这条与 core.mjs 那条配对，两边都要守住。
+  const { inspectRuntime } = await import("../plugin/runtime.mjs")
+  const facts = await inspectRuntime({
+    home: "D:/nope",
+    modelDir: "D:/nope",
+    packageName: "ui-locate-mcp",
+    exec: throwingExec(),
+    exists: () => true,          // 文件"在"，逼它真的去 spawn
+    statSize: () => 0,
+  })
+  assert.equal(facts.venv, true)
+  assert.equal(facts.installedVersion, undefined, "起不来就报 undefined，不抛")
+  assert.equal(facts.backend, undefined)
+})
+
 check("installIntoVenv：优先 uv", async () => {
   const exec = mockExec((command) => (command === "uv" ? { stdout: "ok" } : { error: "unexpected" }))
   await installIntoVenv("D:/h/py.exe", "D:/pkg", { exec })

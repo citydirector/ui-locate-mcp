@@ -239,10 +239,21 @@ export function apply(ctx, config) {
   /** 把 Python 侧同步到包内声明的版本；`pythonSync` 关掉时不动。 */
   function syncPython({ force = false } = {}) {
     if (!force && current?.pythonSync === false) return Promise.resolve({ state: "off" })
-    return syncPythonToBundle().then((result) => {
-      if (result.state !== "current" && result.state !== "missing") log(`python sync: ${JSON.stringify(result)}`)
-      return result
-    })
+    return syncPythonToBundle().then(
+      (result) => {
+        if (result.state !== "current" && result.state !== "missing") {
+          log(`python sync: ${JSON.stringify(result)}`)
+        }
+        return result
+      },
+      // 兜底：这一步是自愈性的附加动作，失败了下次启动还会再试。
+      // **绝不能让它的失败影响插件加载** —— 宿主是拿「apply 有没有跑完」
+      // 判断这个插件活没活的，一次同步失败不该把整个 Host 半身带走。
+      (error) => {
+        log(`python sync 失败: ${error?.message ?? error}`)
+        return { state: "failed", error: String(error?.message ?? error) }
+      },
+    )
   }
 
   /** 只读地看一眼运行环境，给工具与设置页共用。 */
@@ -550,7 +561,9 @@ export function apply(ctx, config) {
       ctx.on?.("loader/volatile-update", () => {
         readConfig()
         tracker.schedule(current?.updateCheck !== false)
-        void syncPython()
+        syncPython().catch((error) => {
+          log(`python sync 失败: ${error?.message ?? error}`)
+        })
       }),
     "ui-locate: follow the update settings",
   )
@@ -559,7 +572,13 @@ export function apply(ctx, config) {
   tracker.schedule(current?.updateCheck !== false)
   // Python 侧自愈：这一代实例启动时，如果 node_modules 里的新版本和 venv
   // 里装的不一致，就在这里补齐。首次安装时 venv 还不存在，会返回 missing。
-  void syncPython()
+  //
+  // `void` 只是声明「不等它」，**不是错误处理**。syncPython 内部已经把失败
+  // 折成 state:"failed"，这里再挂一个 catch 是第二道保险 —— 万一哪天有人改
+  // 动了那个 then 的第二个参数，也不至于让一次同步失败炸掉插件加载。
+  syncPython().catch((error) => {
+    log(`python sync 失败: ${error?.message ?? error}`)
+  })
 
   ctx.effect(
     () => () => {
