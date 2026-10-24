@@ -270,6 +270,14 @@ export async function bootstrapPip(python, home, version, {
   if (!got.ok) return { ok: false, error: `取 pip 失败：${got.error}` }
   const target = sitePackages(home, version, platform)
   const unzipped = await run(exec, python, ["-m", "zipfile", "-e", wheel, target])
+  // wheel 解完就没用了，留着白占 1.8MB —— 运行目录是给用户的，不该堆垃圾。
+  // 删不掉不算失败：pip 已经进去了，这个文件顶多占点地方。
+  try {
+    const { rm } = await import("node:fs/promises")
+    await rm(wheel, { force: true })
+  } catch {
+    /* 留着就留着 */
+  }
   if (!unzipped.ok) return { ok: false, error: `解 pip 失败：${brief(unzipped)}` }
   const check = await run(exec, python, ["-m", "pip", "--version"])
   if (!check.ok) return { ok: false, error: `pip 装上了但用不了：${brief(check)}` }
@@ -405,7 +413,7 @@ export async function ensureRuntime({
   if (!installed.ok) return fail("本包", `装 Python 侧失败：${brief(installed)}`)
   done("本包", { ok: true, path: packageRoot })
 
-  // ── 4. 模型 ────────────────────────────────────────────────────────────────
+  // ── 5. 模型 ────────────────────────────────────────────────────────────────
   if (exists(plan.model) && !force) {
     done("模型", { ok: true, path: plan.model, reused: true })
   } else {
