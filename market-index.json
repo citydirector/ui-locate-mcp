@@ -1,0 +1,70 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Local Plugins",
+    "zh": "本地插件"
+  },
+  "description": {
+    "en": "Local plugins that run on this machine.",
+    "zh": "在本机运行的本地插件。"
+  },
+  "metadata": {
+    "categories": {
+      "automation": {
+        "title": {
+          "en": "Automation",
+          "zh": "自动化"
+        }
+      }
+    },
+    "labels": {
+      "windows": {
+        "title": {
+          "en": "Windows",
+          "zh": "Windows"
+        }
+      },
+      "local": {
+        "title": {
+          "en": "Local",
+          "zh": "本地"
+        }
+      }
+    },
+    "sortKeys": {
+      "published": {
+        "title": {
+          "en": "Published",
+          "zh": "发布时间"
+        },
+        "order": "desc"
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "ui-locate-mcp",
+      "title": {
+        "en": "Screen Locator (ui-locate)",
+        "zh": "屏幕定位 (ui-locate)"
+      },
+      "description": {
+        "en": "Find the pixel-exact coordinates of on-screen text instead of guessing from screenshots.",
+        "zh": "按界面文字找到精确像素坐标，替代反复截图盲猜位置。"
+      },
+      "icon": "./icon.svg",
+      "metadata": {},
+      "versions": [
+        {
+          "version": "0.2.0",
+          "publishTimestamp": 1792813285,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/citydirector/ui-locate-mcp",
+            "commit": "0000000000000000000000000000000000000000"
+          }
+        }
+      ]
+    }
+  ]
+}

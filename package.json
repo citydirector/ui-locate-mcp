@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "ui-locate-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight local visual grounding engine exposed as agent tools",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "pyproject.toml",
+    "uv.lock",
+    ".python-version",
+    "src/**/*.py",
+    "scripts/*.ps1",
+    "README.md",
+    "market-index.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

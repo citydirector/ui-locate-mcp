@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时产物
+.cache/
+*.log
+
+# 本地环境
+.env
+_push_result.json

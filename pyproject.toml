@@ -1,0 +1,51 @@
+[project]
+name = "ui-locate-mcp"
+version = "0.2.0"
+description = "Lightweight local visual grounding engine: find on-screen elements by text and get pixel-exact coordinates"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # FastMCP 在 mcp<2；2.x 已把包名改为 MCPServer
+    "mcp>=1.10,<2",
+    "numpy>=2.0",
+    # CUDA 版 ORT。没有 NVIDIA GPU 的机器装它也能跑，provider 会落到 CPU。
+    "onnxruntime-gpu>=1.23,<1.24",
+    "opencv-python-headless",
+    "pillow",
+    "rapidocr>=3.0",
+    "httpx",
+]
+
+[project.optional-dependencies]
+# CUDA 运行库。onnxruntime-gpu 不会自动带上它们，缺了 CUDA provider 会报
+# "Error loading onnxruntime_providers_cuda.dll ... (Error 126)"。
+cuda = [
+    "nvidia-cudnn-cu12>=9,<10",
+    "nvidia-cublas-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-cuda-runtime-cu12",
+]
+# 只有做模型转换/量化时才需要。
+quantize = [
+    "onnx",
+    "onnxconverter-common",
+]
+
+[project.scripts]
+ui-locate = "ui_locate.client:main"
+ui-locate-server = "ui_locate.server:main"
+ui-locate-mcp = "ui_locate.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["ui_locate"]
+
+[tool.setuptools.package-data]
+ui_locate = ["models/*.onnx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

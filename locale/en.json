@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Screen Locator (ui-locate)",
+    "description": "Find the pixel-exact coordinates of on-screen text instead of guessing from screenshots."
+  }
+}

@@ -1,0 +1,27 @@
+# ui-locate 的 DSH 组合包补丁。
+#
+# 安装到 profile 后，本补丁向 Host 插入一个 MCP 客户端，从而把 ui-locate 的
+# 定位工具变成 agent 可调用的 mcp__ui-locate__* 工具。
+#
+# 关于路径：bundle 会被 pnpm 装进 node_modules 的深层目录，包内 .venv 的
+# 绝对路径无法在补丁里预先写死。所以运行环境统一落在**用户级固定目录**
+# （由 scripts/bootstrap.ps1 建立）：
+#
+#     %LOCALAPPDATA%\ui-locate\venv\Scripts\python.exe
+#
+# 这里用 `!!js` 在加载时拼出来 —— 只用到 Node 全局的 process 与模板字符串，
+# 不依赖任何模块，跨机器一致（Windows 用 LOCALAPPDATA，其余平台退回 HOME）。
+#
+# 没跑过 bootstrap 的机器上，command 指向的文件不存在，MCP 客户端会启动失败。
+# 那是预期行为：先跑 bootstrap，再启用本组合包。
+
+- insert:
+    - id: mcp-ui-locate
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ui-locate
+        transport: stdio
+        command: !!js '`${process.env.LOCALAPPDATA ?? process.env.HOME}/ui-locate/venv/Scripts/python.exe`'
+        args: [ '-m', 'ui_locate.mcp_server' ]
+        # 首次调用要等常驻服务预热（CUDA 首次建会话较慢）+ 一次整页 OCR
+        toolCallTimeoutMs: 180000
