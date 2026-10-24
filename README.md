@@ -26,6 +26,8 @@ cua_driver_native__click(scope="desktop", x=1423, y=290)  →  点中了
 | `locate_text(text, conf, text_mode, monitor, smart)` | **最常用**。按文字查坐标，返回中心点 |
 | `detect_elements(conf, text_mode, tiled, monitor, smart)` | 不知道叫什么时用：列出屏幕上所有元素 |
 | `find_all(text, img_path, conf, text_mode, monitor, smart)` | 同名元素有多处时，看全部候选自己挑 |
+| `ui_locate_act(text, action, verify, ...)` | **定位 + 动作 + 验证，一次调用做完**。`action` 可以是 `click` / `double_click` / `right_click` / `hover` / `move` / `drag` / `scroll` / `type` / `press` / `hotkey` / `wait` |
+| `ui_locate_steps(steps)` | 串多步（最多 40 步），每步可带 `wait_before` 与 `on_fail`；失败时返回第几步 |
 | `list_monitors()` | 有几块屏、各自尺寸与原点（副屏原点可能是负的） |
 | `health()` | 服务状态：是否就绪、哪个后端、预热多久 |
 
@@ -41,6 +43,35 @@ locate_text("插件")
 
 cua_driver_native__click(scope="desktop", x=147, y=166)
 ```
+
+**能一次做完的就别拆两次。**「先 `locate_text` 拿坐标，再 `cua_driver_native__click`」
+要两次模型往返；`ui_locate_act` 在**一次调用里**把定位、动作、验证连着做完，
+中间那几步不占上下文：
+
+```python
+ui_locate_act(text="确认购买", action="click", monitor="1")
+# → {"ok": true, "verified": true,
+#    "target": {"text": "确认购买", "cx": -1026, "cy": -178},
+#    "timings": {"find_ms": 214, "act_ms": 12, "verify_ms": 190, "total_ms": 416}}
+
+ui_locate_act(text="数量", action="scroll", delta=-3, monitor="1")
+ui_locate_act(text="搜索", action="type", value="精锻助剂", monitor="1")
+ui_locate_act(text="确定", action="wait", verify_text="已购买", monitor="1")
+```
+
+一串动作用 `ui_locate_steps`，`steps` 是 JSON 数组字符串：
+
+```python
+ui_locate_steps(steps='''[
+  {"text": "背包", "action": "click", "verify": "screen"},
+  {"action": "wait", "text": "材料", "wait_before": "背包已打开", "timeout_ms": 4000},
+  {"text": "精锻助剂", "action": "click"},
+  {"text": "数量", "action": "drag", "to": "最大值", "on_fail": "abort"}
+]''')
+```
+
+**`action: "wait"` 是纯等待步骤**（不动作，只等某段文字出现）。游戏里大量时间花在
+等动画上，用这个比 `sleep` 固定秒数准得多。
 
 副屏（原点为负）也一样，不需要换算：
 
@@ -75,24 +106,33 @@ DirectML 后端没有那个 35 秒问题（建会话 1.5 秒、首次推理直�
 常驻服务用 `DETACHED_PROCESS` 启动，**独立于 MCP 进程的生命周期**：宿主重启
 MCP 不会杀掉预热好的服务，下次直接可用。
 
-## 边界：只定位，不点击
+## 边界：能动手，但不保证动手生效
 
-定位完拿到坐标，**用 `cua_driver_native__click` 去点**，不要在这里自己调
-`SendInput` / `SetCursorPos`。
+服务现在能自己点击、拖动、打字（`/act`、`/steps`），但**「送出去」与「生效了」是两个
+不同的结论**，返回里分开报：
 
-原因不是设计偏好，是实测：本服务进程调这两个 API **会静默失败**——
-返回成功、`GetLastError()` 为 0、光标一步都不动（连续 6 次命中 0/6）。
-而同一台机器上 `cua_driver` 的桌面点击一直正常。查过进程的窗口站与桌面
-（`WinSta0` / `Default` / input desktop 也是 `Default`，会话同为 1），
-没有隔离迹象，也没找到 HIPS 拦截记录。**根因未定位**，但两边的行为
-稳定可复现：定位走本服务，输入走 cua_driver。
-
-完整链路实测（2026-10-23）：
-
+```jsonc
+{"ok": true,                 // 指令执行完了，动作确实发出去了
+ "verified": false,          // 但屏幕上没有看出变化
+ "verify": {"kind": "screen", "changed_enough": false, "changed": 1.2}}
 ```
-POST /locate {"text":"编辑"}  →  {"ok":true,"x":128,"y":20,"matched":"编辑"}
-cua_driver_native__click(scope="desktop", x=128, y=20)  →  菜单精确展开
-```
+
+**`ok: true` + `verified: false` 是最常见的一种情况**，尤其在这两处：
+
+- **目标窗口不接受合成消息**。`delivery: "message"` 走 `PostMessage`，不动光标、
+  不需要焦点，但有框架会直接忽略（tkinter 就是这样：三发消息全部 `accepted`，
+  回调一次都没触发）。
+- **前台不是目标窗口**。`delivery: "send_input"` 走系统输入队列，最接近真人，
+  但输入只会送给前台窗口。
+
+真遇到 `verified: false`，按这个顺序换：`delivery: "message"` → `delivery:
+"send_input"` → 改用 `action: "hotkey"`（键盘比鼠标更容易送进去，实测 ESC 能送达
+Unity 游戏）→ 回退到宿主那边用 `cua_driver_native__click`。
+
+**`verified` 为 `null` 表示「没法判断」**，不是失败也不是成功。最典型的就是**抓屏
+被拦**（受限进程里 `ImageGrab` 会抛 `OSError: screen grab failed`），这时返回里会多
+一个 `verify_unavailable` 字段说明原因。动作本身可能已经成功了，别因为验证不了就重试
+—— 重试可能点两次。
 
 `cua_driver_native__click` 不能同时传 `target` 和 `scope`（报
 `target cannot be combined with legacy scope, pid, or window_id fields`），
@@ -396,6 +436,8 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | GET | `/monitors` | 所有显示器的尺寸与原点（副屏原点是负数） |
 | POST | `/detect` | body 为 `{"path": "..."}`、原始图片字节，或 `{}` 表示抓当前屏 |
 | POST | `/locate` | body `{"text": "保存"}`，返回该元素中心坐标（**只给坐标，不点击**） |
+| POST | `/act` | body 为一条指令：`{"text": "保存", "action": "click", "verify": "screen"}` —— 定位 + 动作 + 验证一次做完 |
+| POST | `/steps` | body `{"steps": [...]}`，顺序跑多步，失败时返回 `failed_index` |
 | GET | `/find?text=保存` | 抓屏 + 检测 + 按文字查 |
 
 参数：`conf`（默认 0.3）、`iou`（0.5）、`tiled`（0/1）、`max_side`（960）、
@@ -701,6 +743,8 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `src/ui_locate/ocr_match.py` | 整页 OCR 与检测框做空间匹配、按文字查找、图标噪声剥离 |
 | `src/ui_locate/mosaic.py` | 裁片拼图 OCR（快 4 倍的路线） |
 | `src/ui_locate/annotate.py` | 把检出的元素裁片拼成带编号的总览图 |
+| `src/ui_locate/act.py` | **动作编排**：定位 → 动作 → 验证，含等待 / 重试 / 逐步记账。零外部依赖，外部世界全注入，所以能纯 Python 测 |
+| `src/ui_locate/actions.py` | **Win32 输入注入**：`SendInput` 与带坐标的 `PostMessage` 两条通道，键盘 / 鼠标 / 滚轮 / 拖拽 / 打字 |
 | `src/ui_locate/locate.py` | 抓屏包装 + OCR |
 | `src/ui_locate/client.py` | HTTP 客户端 + CLI |
 | `src/ui_locate/cuda_dlls.py` | 注册 nvidia 包里的 CUDA dll 目录 |
@@ -709,6 +753,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `scripts/serve.ps1` | 手动起停常驻服务 / 查状态 |
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
+| `tests/test_act.py` | 动作编排测试（62 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
 | `tests/update-plugin.test.mjs` | 插件行为测试（66 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
