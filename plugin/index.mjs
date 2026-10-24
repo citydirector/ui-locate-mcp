@@ -194,15 +194,28 @@ export function apply(ctx, config) {
     } catch (error) {
       return { ok: false, error: String(error?.message ?? error) }
     }
-    if (!answer?.ok) return { ok: false, error: answer?.error?.message ?? "install failed" }
-    const result = answer.value
+    // installBundle 的返回形态取决于 manager 是怎么拿到的：
+    //   同进程 `ctx.inject(["pluginManager"])` → 直接就是 install 结果对象，
+    //     带 `application` / `changed` / `version`，**没有 `ok` 字段**。
+    //   跨进程 remote 代理（官方插件页走这条）→ 外面再包一层
+    //     `{ ok: true, value }` 或 `{ ok: false, error }`。
+    // 只按后者判断，会让同进程调用把每次成功都报成 "install failed"（实测踩过）。
+    const wrapped = typeof answer?.ok === "boolean"
+    if (wrapped && !answer.ok) return { ok: false, error: answer?.error?.message ?? "install failed" }
+    const result = wrapped ? answer.value : answer
+    if (result === null || result === undefined) {
+      return { ok: false, error: "the plugin manager returned no result" }
+    }
+    if (result.application === "failed" || result.application === "cancelled") {
+      return { ok: false, error: result.error?.diagnostic ?? result.error?.code ?? String(result.application) }
+    }
     return {
       ok: true,
       state: "installed",
       tag,
-      application: result?.application,
-      restartReason: result?.restartReason,
-      version: result?.version,
+      application: result.application,
+      restartReason: result.restartReason,
+      version: result.version,
       // 新实例起来后自己会把 Python 侧补齐；这里只说明它会发生。
       note: "Python 侧会在新实例启动时自动同步到同一版本",
     }

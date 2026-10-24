@@ -843,6 +843,57 @@ check("index：apply 在拿到 pluginManager 后会把 spec 交出去", async ()
   }
 })
 
+check("index：apply 认得不裹 ok 的 installBundle 返回值（同进程调用就是这种）", async () => {
+  // 实测踩过的坑：`ctx.inject(["pluginManager"])` 拿到的是同进程的服务对象，
+  // 它的 installBundle 直接返回结果对象，**没有 `ok` 字段**；而官方插件页走
+  // 的 remote 代理会再包一层 `{ ok, value }`。代码若只认后者，同进程调用就会
+  // 把每一次成功都报成 "install failed"。
+  const plugin = await import("../plugin/index.mjs")
+  const ctx = fakeCtx()
+  ctx._manager = {
+    async installBundle() {
+      return { application: "applied", changed: true, version: "9.9.9", bundle: "ui-locate-mcp" }
+    },
+  }
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => [{ name: "v999.0.0" }] })
+  try {
+    plugin.apply(ctx, plugin.Config({ pythonSync: false }))
+    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
+    const value = await tool.execute({ action: "apply" })
+    assert.equal(value.result.ok, true, JSON.stringify(value.result))
+    assert.equal(value.result.state, "installed")
+    assert.equal(value.result.application, "applied")
+    assert.equal(value.result.version, "9.9.9")
+    ctx._disposeAll()
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+check("index：installBundle 报告 application=failed 时不能说成功", async () => {
+  const plugin = await import("../plugin/index.mjs")
+  const ctx = fakeCtx()
+  ctx._manager = {
+    async installBundle() {
+      // manager 内部把失败折进结果里，而不是抛出来 —— 只看有没有异常会漏掉。
+      return { application: "failed", changed: false, error: { code: "incompatible-version" } }
+    },
+  }
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => [{ name: "v999.0.0" }] })
+  try {
+    plugin.apply(ctx, plugin.Config({ pythonSync: false }))
+    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
+    const value = await tool.execute({ action: "apply" })
+    assert.equal(value.result.ok, false)
+    assert.match(value.result.error, /incompatible-version/)
+    ctx._disposeAll()
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
 // ── 收尾 ───────────────────────────────────────────────────────────────────
 
 test("全部用例已跑完", () => {
