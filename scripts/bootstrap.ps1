@@ -6,9 +6,16 @@
 #   DSH 负责装插件（node_modules 里的 JS/YAML 部分），本脚本负责 Python 侧。
 #
 # 它会做什么
-#   1. 在 %LOCALAPPDATA%\ui-locate\venv 建一个独立 venv（不污染系统 Python）
+#   1. 在 <HomeDir>\venv 建一个独立 venv（不污染系统 Python）
 #   2. 装本插件（含 cuda 可选依赖）
-#   3. 若 %LOCALAPPDATA%\ui-locate\models 下没有模型，自动下载
+#   3. 若 <HomeDir>\models 下没有模型，自动下载
+#
+# HomeDir 怎么定（与 cordis.patch.yml 里的表达式保持一致）：
+#   1. -HomeDir 参数
+#   2. $env:UI_LOCATE_HOME
+#   3. $env:DSH_HOME\ui-locate        ← 便携版 DSH，数据放 data 目录下
+#   4. %LOCALAPPDATA%\ui-locate
+#   5. $HOME/.local/share/ui-locate
 #
 # 用法（在插件根目录或任意位置都行）：
 #   pwsh -File scripts/bootstrap.ps1
@@ -29,6 +36,8 @@ $ErrorActionPreference = 'Stop'
 
 # ── 路径 ────────────────────────────────────────────────────────────────────
 $pkgRoot = Split-Path -Parent $PSScriptRoot
+if (-not $HomeDir) { $HomeDir = $env:UI_LOCATE_HOME }
+if (-not $HomeDir -and $env:DSH_HOME) { $HomeDir = Join-Path $env:DSH_HOME 'ui-locate' }
 if (-not $HomeDir) {
     $HomeDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'ui-locate' }
             else { Join-Path $HOME '.local/share/ui-locate' }

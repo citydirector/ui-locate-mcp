@@ -11,6 +11,7 @@
   5. 都没有 → ``ModelNotFound``，附带下载指引
 
 环境变量一览：
+  UI_LOCATE_HOME        状态目录根（模型 / 日志），见 ``state_dir``
   UI_LOCATE_MODEL       模型 onnx 绝对路径
   UI_LOCATE_MODEL_DIR   模型目录
   UI_LOCATE_HOST        服务监听地址，默认 127.0.0.1
@@ -47,10 +48,24 @@ def state_dir() -> Path:
 
     为什么不放包目录：bundle 装进 node_modules 后，那份目录可能只读，
     换版本时还会被整个替换 —— 模型和日志跟着丢。放用户级目录才稳。
+
+    解析顺序（先命中者胜）：
+
+    1. ``UI_LOCATE_HOME`` —— 显式指定，最优先。DSH 组合包的 ``cordis.patch.yml``
+       会把算好的目录从这里传进来，所以装成插件时走的就是这条。
+    2. ``DSH_HOME/ui-locate`` —— 便携版 DSH 把数据放在自己的 data 目录下，
+       跟着走就不会往系统盘塞东西。注意：MCP 子进程的环境会被 scrub 掉所有
+       ``DSH_`` 开头的变量，所以插件运行时这条通常读不到，靠第 1 条兜住；
+       这条对「手动跑 server、自己设了 DSH_HOME」的场景有效。
+    3. ``%LOCALAPPDATA%/ui-locate`` —— 普通 Windows 安装的兜底。
+    4. ``$XDG_CACHE_HOME/ui-locate`` 或 ``~/.local/share/ui-locate`` —— 其余平台。
     """
-    root = os.environ.get("UI_LOCATE_HOME")
-    if root:
-        return Path(root).expanduser()
+    for env_name in ("UI_LOCATE_HOME", "DSH_HOME"):
+        root = os.environ.get(env_name)
+        if root:
+            base = Path(root).expanduser()
+            # DSH_HOME 是 DSH 的数据根，插件自己的东西要放进它的子目录
+            return base if env_name == "UI_LOCATE_HOME" else base / "ui-locate"
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
     if base:
         return Path(base) / "ui-locate"

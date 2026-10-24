@@ -149,22 +149,31 @@ pwsh -File .\scripts\bootstrap.ps1 -Editable   # 装成 editable，改代码即�
       config:
         serverName: ui-locate
         transport: stdio
-        command: 'C:\Users\<你>\AppData\Local\ui-locate\venv\Scripts\python.exe'
+        command: 'D:\path\to\ui-locate\venv\Scripts\python.exe'
         args: [ '-m', 'ui_locate.mcp_server' ]
+        env:
+          UI_LOCATE_HOME: 'D:\path\to\ui-locate'
         toolCallTimeoutMs: 180000
 ```
 
 **注意 `command` 必须是绝对路径**（DSH 的 stdio 分支会校验 `isAbsolute`），
 且 `-m ui_locate.mcp_server` 依赖包已装进那个 venv —— 这正是 `bootstrap.ps1` 干的事。
 
-bundle 形态下 `cordis.patch.yml` 里的 command 用 `!!js` 现算：
+bundle 形态下 `cordis.patch.yml` 里的 command 用 `!!js` 现算，目录按
+`UI_LOCATE_HOME` → `DSH_HOME/ui-locate` → `%LOCALAPPDATA%/ui-locate` 的顺序挑：
 
 ```yaml
-command: !!js '`${process.env.LOCALAPPDATA ?? process.env.HOME}/ui-locate/venv/Scripts/python.exe`'
+command: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}/venv/Scripts/python.exe`'
+env:
+  UI_LOCATE_HOME: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}`'
 ```
 
 因为 bundle 会被 pnpm 装进 `node_modules` 深处的随机目录，包内 `.venv` 的绝对路径
 没法在 patch 里写死，所以运行环境统一放在用户级固定位置。
+
+`!!js` 表达式在 **Host 进程**里求值，能读到 `DSH_HOME`；但 MCP 子进程的环境会被
+scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `config.env` 显式传下去
+（`env` 是 scrub 之后的合并层，能穿透）。
 
 ### 环境变量
 
@@ -174,7 +183,7 @@ command: !!js '`${process.env.LOCALAPPDATA ?? process.env.HOME}/ui-locate/venv/S
 |------|------|------|
 | `UI_LOCATE_MODEL` | 模型 onnx 绝对路径 | 自动查找 |
 | `UI_LOCATE_MODEL_DIR` | 模型目录 | 自动查找 |
-| `UI_LOCATE_HOME` | 状态目录（模型 / 日志） | `%LOCALAPPDATA%\ui-locate` |
+| `UI_LOCATE_HOME` | 状态目录（模型 / 日志） | `$DSH_HOME/ui-locate`，再退回 `%LOCALAPPDATA%\ui-locate` |
 | `UI_LOCATE_HOST` / `UI_LOCATE_PORT` | 服务监听 | `127.0.0.1` / `7788` |
 | `UI_LOCATE_BASE` | 客户端连接的地址 | `http://<host>:<port>` |
 | `UI_LOCATE_PROVIDER` | `auto` / `cuda` / `cpu` | `auto` |

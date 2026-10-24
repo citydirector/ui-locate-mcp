@@ -5,12 +5,19 @@
 #
 # 关于路径：bundle 会被 pnpm 装进 node_modules 的深层目录，包内 .venv 的
 # 绝对路径无法在补丁里预先写死。所以运行环境统一落在**用户级固定目录**
-# （由 scripts/bootstrap.ps1 建立）：
+# （由 scripts/bootstrap.ps1 建立）。
 #
-#     %LOCALAPPDATA%\ui-locate\venv\Scripts\python.exe
+# 目录位置的优先级（下面这些 !!js 表达式在 Host 里求值，能看见 DSH_HOME）：
 #
-# 这里用 `!!js` 在加载时拼出来 —— 只用到 Node 全局的 process 与模板字符串，
-# 不依赖任何模块，跨机器一致（Windows 用 LOCALAPPDATA，其余平台退回 HOME）。
+#     1. $UI_LOCATE_HOME                        手动指定时最优先
+#     2. $DSH_HOME/ui-locate                    便携版 DSH：跟着 data 目录走
+#     3. %LOCALAPPDATA%/ui-locate               普通安装的兜底
+#     4. $HOME/ui-locate                        非 Windows 平台的兜底
+#
+# 为什么要显式传 UI_LOCATE_HOME 给子进程：MCP 子进程的环境会被 scrub 掉所有
+# DSH_ 开头的变量（harness 身份不外泄），Python 侧读不到 DSH_HOME。所以这里
+# 在 Host 里把路径算好，作为普通变量塞进 config.env —— env 是 scrub 之后的
+# 显式合并层，能穿透。
 #
 # 没跑过 bootstrap 的机器上，command 指向的文件不存在，MCP 客户端会启动失败。
 # 那是预期行为：先跑 bootstrap，再启用本组合包。
@@ -21,7 +28,10 @@
       config:
         serverName: ui-locate
         transport: stdio
-        command: !!js '`${process.env.LOCALAPPDATA ?? process.env.HOME}/ui-locate/venv/Scripts/python.exe`'
+        command: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}/venv/Scripts/python.exe`'
         args: [ '-m', 'ui_locate.mcp_server' ]
+        env:
+          # 同一个目录，传给 Python 侧（模型 / 日志落这里）
+          UI_LOCATE_HOME: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}`'
         # 首次调用要等常驻服务预热（CUDA 首次建会话较慢）+ 一次整页 OCR
         toolCallTimeoutMs: 180000
