@@ -8,7 +8,16 @@
 # 它会做什么
 #   1. 在 <HomeDir>\venv 建一个独立 venv（不污染系统 Python）
 #   2. 装本插件（含 cuda 可选依赖）
-#   3. 若 <HomeDir>\models 下没有模型，自动下载
+#   3. 若模型目录下没有模型，自动下载
+#
+# 模型目录怎么定（与 src/ui_locate/config.py 的查找顺序一致）：
+#   1. -ModelDir 参数
+#   2. $env:UI_LOCATE_MODEL_DIR
+#   3. <HomeDir>\models                 ← 跟着状态目录走
+#
+# 想把手里的模型（比如已有的 77MB 文件）直接用上，就别下第二份：设
+# $env:UI_LOCATE_MODEL_DIR 指向那个目录，或者传 -ModelDir。脚本按
+# 「先找现成的、找不到才下」的顺序走，找到就不再下载。
 #
 # HomeDir 怎么定（与 cordis.patch.yml 里的表达式保持一致）：
 #   1. -HomeDir 参数
@@ -29,7 +38,8 @@ param(
     [switch]$CpuOnly,
     [switch]$Editable,
     [switch]$Status,
-    [string]$HomeDir = ''
+    [string]$HomeDir = '',
+    [string]$ModelDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,8 +54,15 @@ if (-not $HomeDir) {
 }
 $venv = Join-Path $HomeDir 'venv'
 $py = Join-Path $venv 'Scripts/python.exe'
-$models = Join-Path $HomeDir 'models'
+
+# 模型目录独立于状态目录：它可能很大（77MB 起），也可能早就存在别处。
+if (-not $ModelDir) { $ModelDir = $env:UI_LOCATE_MODEL_DIR }
+if (-not $ModelDir) { $ModelDir = Join-Path $HomeDir 'models' }
+$models = $ModelDir
 $modelFile = Join-Path $models 'omniparser_icon_detect_yolo11m.onnx'
+
+# 已经有一份模型在别处（UI_LOCATE_MODEL 指着的那个）就别下第二份。
+$existingModel = $env:UI_LOCATE_MODEL
 
 # 仓库里只有 onnx/model.onnx 这一个文件
 $modelUrl = 'https://huggingface.co/onnx-community/OmniParser-v2.0_icon_detect/resolve/main/onnx/model.onnx'
@@ -53,9 +70,12 @@ $modelUrl = 'https://huggingface.co/onnx-community/OmniParser-v2.0_icon_detect/r
 function Show-Status {
     Write-Output "home   : $HomeDir"
     Write-Output ("venv   : " + $(if (Test-Path $py) { "OK  $py" } else { '缺失' }))
+    Write-Output "models : $models$(if ($models -ne (Join-Path $HomeDir 'models')) { '  (自定义)' })"
     Write-Output ("model  : " + $(if (Test-Path $modelFile) {
                 $mb = [math]::Round((Get-Item $modelFile).Length / 1MB, 1)
                 "OK  $modelFile ($mb MB)"
+            } elseif ($existingModel -and (Test-Path $existingModel)) {
+                "复用 $existingModel（UI_LOCATE_MODEL 指向的文件）"
             } else { "缺失  $modelFile" }))
     if (Test-Path $py) {
         try {
@@ -108,8 +128,18 @@ else {
 }
 
 # ── 3. 模型 ─────────────────────────────────────────────────────────────────
-if (-not $SkipModel -and -not (Test-Path $modelFile)) {
-    Write-Output "下载模型（约 80MB）…"
+if ($SkipModel) {
+    Write-Output '按 -SkipModel 跳过模型检查'
+}
+elseif (Test-Path $modelFile) {
+    Write-Output "模型已存在，跳过下载"
+}
+elseif ($existingModel -and (Test-Path $existingModel)) {
+    Write-Output "已有模型可用，不重复下载：$existingModel"
+    Write-Output "（Python 侧按 UI_LOCATE_MODEL 找它，无需再放一份到 $models）"
+}
+else {
+    Write-Output "下载模型（约 77MB）…"
     Write-Output "  来源: $modelUrl"
     try {
         $tmpModel = "$modelFile.part"
@@ -124,9 +154,6 @@ if (-not $SkipModel -and -not (Test-Path $modelFile)) {
         Write-Output "  然后重跑本脚本，或设环境变量 UI_LOCATE_MODEL 指向该文件"
         exit 1
     }
-}
-elseif (Test-Path $modelFile) {
-    Write-Output "模型已存在，跳过下载"
 }
 
 Write-Output ''
