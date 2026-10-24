@@ -471,6 +471,39 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     最大绝对误差 5.8e-4（值域 0~654）。三个 ORT 版本（1.22 / 1.23 / 1.24）都有
     这个问题，不是版本回归。
 
+21. **`installBundle` 的返回形态有两套，只认一套会把每次成功都报成失败**。
+
+    | 拿到 manager 的方式 | 返回值 |
+    |---|---|
+    | 同进程 `ctx.inject(["pluginManager"])` | **直接是结果对象**：`application` / `changed` / `version` / `bundle` / 可选 `error` —— **没有 `ok` 字段** |
+    | 跨进程 remote 代理（官方「插件」页走这条） | 外面再包一层 `{ ok: true, value }` 或 `{ ok: false, error: { message } }` |
+
+    写 `if (!answer?.ok) return { ok: false, ... }` 的话，同进程调用时 `answer.ok`
+    是 `undefined`，`!undefined === true`，于是 package.json 已升、pnpm 已 exit 0、
+    node_modules 里已是新版本，**返回值却报 "install failed"**。这个坑在 0.2.1 和
+    0.2.2 里都有，实测踩了两次。
+
+    正确写法：
+
+    ```js
+    const wrapped = typeof answer?.ok === "boolean"
+    if (wrapped && !answer.ok) return { ok: false, error: answer?.error?.message }
+    const result = wrapped ? answer.value : answer
+    if (result == null) return { ok: false, error: "the plugin manager returned no result" }
+    // 反方向的坑：manager 把失败**折进结果里**，不抛异常。
+    // 只看「有没有异常」会误判成功。
+    if (result.application === "failed" || result.application === "cancelled") {
+      return { ok: false, error: result.error?.diagnostic ?? result.error?.code }
+    }
+    ```
+
+    `application` 的取值：`applied`（HMR 生效）/ `restart-required`（带
+    `restartReason`，如 `no-hmr`）/ `failed` / `cancelled`。
+
+    **还有一层**：install 成功后，**正在执行这次调用的那个实例仍然是旧代码**。
+    HMR 只重载被它管理的行，不会重载自己。所以修完 bug 再 apply，那次返回的
+    还是旧代码算出来的结果 —— 要重启 DSH 才能看到修复生效。
+
 ## 文件
 
 | 文件 | 作用 |
