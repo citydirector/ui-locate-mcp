@@ -237,10 +237,22 @@ check("installedPythonVersion：包没装好时返回 undefined，不抛", async
 
 check("installIntoVenv：优先 uv", async () => {
   const exec = mockExec((command) => (command === "uv" ? { stdout: "ok" } : { error: "unexpected" }))
-  await installIntoVenv("D:/h/py.exe", "D:/pkg[cuda]", { exec })
+  await installIntoVenv("D:/h/py.exe", "D:/pkg", { exec })
   assert.equal(exec.calls.length, 1)
   assert.equal(exec.calls[0].command, "uv")
-  assert.deepEqual(exec.calls[0].args, ["pip", "install", "--python", "D:/h/py.exe", "D:/pkg[cuda]"])
+  assert.deepEqual(exec.calls[0].args, ["pip", "install", "--python", "D:/h/py.exe", "D:/pkg"])
+})
+
+check("installIntoVenv：noDeps 时两个分支都要带上 --no-deps", async () => {
+  const withUv = mockExec((command) => (command === "uv" ? { stdout: "ok" } : { error: "unexpected" }))
+  await installIntoVenv("D:/h/py.exe", "D:/pkg", { exec: withUv, noDeps: true })
+  assert.deepEqual(withUv.calls[0].args, ["pip", "install", "--python", "D:/h/py.exe", "--no-deps", "D:/pkg"])
+
+  const noUv = mockExec((command) =>
+    command === "uv" ? { error: "spawn uv ENOENT", code: "ENOENT" } : { stdout: "ok" },
+  )
+  await installIntoVenv("D:/h/py.exe", "D:/pkg", { exec: noUv, noDeps: true })
+  assert.deepEqual(noUv.calls[1].args, ["-m", "pip", "install", "--upgrade", "--no-deps", "D:/pkg"])
 })
 
 check("installIntoVenv：没有 uv 时退回 venv 自己的 pip", async () => {
@@ -304,16 +316,15 @@ check("syncPythonToBundle：版本不同就重装并复查", async () => {
     platform: "win32",
     exec,
     exists: () => true,
-    cpuOnly: true,
   })
   assert.deepEqual(answer, { state: "updated", version: want })
   const install = exec.calls.find((call) => call.command === "uv")
   assert.ok(install, "应当用 uv 装")
   // ROOT 是目录 URL 转来的，末尾带斜杠；target 是去掉斜杠之后拼的。
-  assert.equal(install.args.at(-1), ROOT.replace(/[\\/]+$/, ""), "cpuOnly 时不许带 [cuda]")
+  assert.equal(install.args.at(-1), ROOT.replace(/[\\/]+$/, ""), "只装代码目录，不带任何 extras")
 })
 
-check("syncPythonToBundle：cuda extras 跟着 cpuOnly 走", async () => {
+check("syncPythonToBundle：同步版本时不碰运行时依赖，免得把用户选的后端换掉", async () => {
   const want = packageVersion()
   let installed = false
   const exec = mockExec((command, args) => {
@@ -324,9 +335,13 @@ check("syncPythonToBundle：cuda extras 跟着 cpuOnly 走", async () => {
     assert.match(args.join(" "), /importlib\.metadata/)
     return { stdout: `${installed ? want : "0.0.1"}\n` }
   })
-  await syncPythonToBundle({ root: ROOT, home: "D:/h", platform: "win32", exec, exists: () => true, cpuOnly: false })
+  await syncPythonToBundle({ root: ROOT, home: "D:/h", platform: "win32", exec, exists: () => true })
   const install = exec.calls.find((call) => call.command === "uv")
-  assert.ok(install.args.at(-1).endsWith("[cuda]"), install.args.at(-1))
+  assert.ok(install, "应当用 uv 装")
+  // 三个 ORT wheel（cuda / directml / cpu）都提供同一个 onnxruntime 顶层包，
+  // 重装依赖就可能把用户 bootstrap 时选的 backend 悄悄换掉，所以必须 --no-deps。
+  assert.ok(install.args.includes("--no-deps"), install.args.join(" "))
+  assert.ok(!install.args.join(" ").includes("["), "不该带任何 extras")
 })
 
 check("syncPythonToBundle：装完版本还是不对要如实说", async () => {
@@ -337,7 +352,6 @@ check("syncPythonToBundle：装完版本还是不对要如实说", async () => {
     platform: "win32",
     exec,
     exists: () => true,
-    cpuOnly: true,
   })
   assert.equal(answer.state, "mismatch")
   assert.equal(answer.have, "0.0.1")
@@ -355,7 +369,6 @@ check("syncPythonToBundle：安装失败要带错误信息，不抛", async () =
     platform: "win32",
     exec,
     exists: () => true,
-    cpuOnly: true,
   })
   assert.equal(answer.state, "failed")
   assert.match(answer.error, /network unreachable/)

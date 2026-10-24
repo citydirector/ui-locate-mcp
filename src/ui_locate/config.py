@@ -17,7 +17,7 @@
   UI_LOCATE_HOST        服务监听地址，默认 127.0.0.1
   UI_LOCATE_PORT        服务端口，默认 7788
   UI_LOCATE_BASE        客户端连接的服务地址，默认 http://<host>:<port>
-  UI_LOCATE_PROVIDER     cuda / cpu / auto，默认 auto
+  UI_LOCATE_PROVIDER     cuda / dml / cpu / auto，默认 auto（cuda → dml → cpu）
 
 可调参数（都有默认值，一般不用改）：
   UI_LOCATE_MIN_EDGE     跳过空白块的边缘密度下限，默认 0.0008
@@ -38,7 +38,7 @@ MODEL_SOURCE = "https://huggingface.co/onnx-community/OmniParser-v2.0_icon_detec
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7788
-DEFAULT_PROVIDER = "cuda"
+DEFAULT_PROVIDER = "auto"
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
@@ -149,25 +149,74 @@ def base_url() -> str:
 
 
 def provider() -> str:
-    return os.environ.get("UI_LOCATE_PROVIDER", "auto")
+    return os.environ.get("UI_LOCATE_PROVIDER", DEFAULT_PROVIDER)
 
 
 def resolve_provider(want: str | None = None) -> str:
-    """把 ``auto`` 解析成真正能用的 provider。
+    """把 ``auto`` 解析成真正能用的 provider，返回 ``cuda`` / ``dml`` / ``cpu``。
 
-    判定依据是「ONNX Runtime 是否真的列出 CUDAExecutionProvider」，
-    而不是猜显卡型号 —— 装了 CUDA 版 ORT 但驱动/库不全时，provider
-    列表里就不会有它，这时硬上 CUDA 只会得到一个含义模糊的加载错误。
+    判定依据是「ONNX Runtime 是否真的列出那个 ExecutionProvider」，而不是猜
+    显卡型号 —— 装了 GPU 版 ORT 但驱动/库不全时，provider 列表里就不会有它，
+    这时硬上只会得到一个含义模糊的加载错误。
+
+    ``auto`` 的偏好顺序是 **cuda → dml → cpu**：
+
+    * CUDA 最快，但只有 NVIDIA 卡能用，且要带 1.8 GB 的 cudnn/cublas。
+    * DirectML 走 D3D12，AMD / Intel / NVIDIA 通吃，实测速度与 CUDA 基本
+      持平（10.26 ms vs 10.80 ms），依赖只有 24 MB。没有 NVIDIA 卡时它是最
+      划算的选择。
+    * CPU 兜底。
+
+    注意 DirectML 的模型兼容性坑：它不支持 opset 14 的 ``allowzero`` 属性，
+    遇到时 ONNX Runtime **不抛异常而是静默回退 CPU**，看起来「能跑只是慢」。
+    ``Detector`` 会在建会话前把该属性改掉（见 ``dml_fix``），所以这里不用管。
     """
     want = (want or provider()).lower()
-    if want in ("cpu", "cuda"):
+    if want in ("cpu", "cuda", "dml"):
         return want
     try:
         import onnxruntime as ort
 
-        return "cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+        available = ort.get_available_providers()
     except Exception:
         return "cpu"
+    if "CUDAExecutionProvider" in available:
+        return "cuda"
+    if "DmlExecutionProvider" in available:
+        return "dml"
+    return "cpu"
+
+
+def provider_chain(name: str) -> list:
+    """把一个 provider 名翻成 ONNX Runtime 认的 providers 列表（含 CPU 兜底）。
+
+    显式列出 ``CPUExecutionProvider`` 是必须的：不列的话 ORT 在 GPU provider
+    不可用时会直接报错，而不是降级。
+    """
+    if name == "cuda":
+        return [("CUDAExecutionProvider", dict(CUDA_OPTS)), "CPUExecutionProvider"]
+    if name == "dml":
+        # device_id 不指定时 ORT 按「高性能」偏好自选适配器 —— 在多显卡机器上
+        # 这会选到独显而不是核显，正是我们想要的行为。
+        return [("DmlExecutionProvider", dict(DML_OPTS)), "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+# cuDNN 调优参数（实测数据，见 README 的性能章节）：
+#   EXHAUSTIVE + max_workspace=1 → 首次 34306ms（8GB 显存放不下 workspace 表，反复重算）
+#   EXHAUSTIVE + max_workspace=0 → 首次  1035ms，稳态 10.80ms  ← 采用
+#   HEURISTIC  + max_workspace=1 → 首次  1014ms，稳态 11.71ms
+# 根因：max_workspace=1 时 cuDNN 尝试为每层保留最大工作区，8GB 卡上大量层
+# 回退到 Fallback 模式（"May be extremely slow"），首帧反复试算。
+CUDA_OPTS = {
+    "cudnn_conv_algo_search": "EXHAUSTIVE",
+    "cudnn_conv_use_max_workspace": "0",
+    "do_copy_in_default_stream": "1",
+}
+
+# DirectML 没有对应 cuDNN 的调优项。enable_mem_pattern 默认为真，保持不动；
+# 这里留一个空字典是为了让两边的写法对称，将来要加参数也有地方放。
+DML_OPTS: dict = {}
 
 
 def min_edge_ratio() -> float:

@@ -17,7 +17,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ui_locate import config, cuda_dlls
+from ui_locate import config, cuda_dlls, dml_fix
 
 cuda_dlls.register()
 
@@ -116,17 +116,9 @@ def decode(
 class Detector:
     """常驻检测器：一次加载模型，反复检测。"""
 
-    # cuDNN 调优参数（实测数据，见 scripts/bench_cudnn.py）：
-    #   EXHAUSTIVE + max_workspace=1 → 首次 34306ms（8GB 显存放不下 workspace 表，反复重算）
-    #   EXHAUSTIVE + max_workspace=0 → 首次  1035ms，稳态 10.80ms  ← 采用
-    #   HEURISTIC  + max_workspace=1 → 首次  1014ms，稳态 11.71ms
-    # 根因：max_workspace=1 时 cuDNN 尝试为每层保留最大工作区，8GB 卡上
-    # 大量层回退到 Fallback 模式（"May be extremely slow"），首帧反复试算。
-    CUDA_OPTS = {
-        "cudnn_conv_algo_search": "EXHAUSTIVE",
-        "cudnn_conv_use_max_workspace": "0",
-        "do_copy_in_default_stream": "1",
-    }
+    # 调优参数放在 config 里，因为它们和 provider 选型是一回事，
+    # 散落在两个模块里迟早会不同步。
+    CUDA_OPTS = config.CUDA_OPTS
 
     def __init__(self, model: Path | None = None, provider: str = "auto") -> None:
         model = Path(model) if model is not None else default_model()
@@ -134,12 +126,21 @@ class Detector:
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         so.log_severity_level = 3
-        if provider == "cuda":
-            providers: list = [("CUDAExecutionProvider", dict(self.CUDA_OPTS))]
-            providers.append("CPUExecutionProvider")
-        else:
-            providers = ["CPUExecutionProvider"]
-        self.sess = ort.InferenceSession(str(model), so, providers=providers)
+
+        providers = config.provider_chain(provider)
+
+        # DirectML 不支持 opset 14 的 allowzero 属性，遇到时 ORT 会静默回退
+        # CPU（不抛异常），表现为「能跑但慢十几倍」。建会话前把属性改成 0。
+        # 只有 dml 需要，cuda/cpu 就不必付这 100ms 的代价。
+        self.patched_attrs = 0
+        source: str | bytes = str(model)
+        if provider == "dml":
+            raw, changed = dml_fix.load_patched(model)
+            if changed:
+                source = raw
+                self.patched_attrs = changed
+
+        self.sess = ort.InferenceSession(source, so, providers=providers)
         self.active = self.sess.get_providers()[0]
         self.iname = self.sess.get_inputs()[0].name
         self.onames = [o.name for o in self.sess.get_outputs()]
@@ -183,7 +184,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", type=Path, required=True)
     ap.add_argument("--model", type=Path, default=None, help="模型文件；缺省按 ui_locate.config 规则查找")
-    ap.add_argument("--provider", choices=["auto", "cuda", "cpu"], default=config.provider())
+    ap.add_argument(
+        "--provider", choices=["auto", "cuda", "dml", "cpu"], default=config.provider()
+    )
     ap.add_argument("--conf", type=float, default=0.3)
     ap.add_argument("--iou", type=float, default=0.5)
     ap.add_argument("--tiled", action="store_true", help="大图分块检测，找回小元素")
