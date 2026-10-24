@@ -22,6 +22,7 @@ def probe(mode: str, monitor: str, conf: float) -> None:
         f"{BASE}/detect",
         json={"monitor": monitor, "conf": conf, "text_mode": mode, "smart": True},
         timeout=180.0,
+        trust_env=False,
     )
     r.raise_for_status()
     res = r.json()

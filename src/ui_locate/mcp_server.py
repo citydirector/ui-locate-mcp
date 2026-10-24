@@ -47,16 +47,22 @@ def _http() -> httpx.Client:
     global _client
     if _client is None:
         # 超时给足：全屏 full 模式 OCR 要两秒多，首次拉起还要等预热
-        _client = httpx.Client(base_url=DEFAULT_BASE, timeout=180.0)
+        #
+        # `trust_env=False` 不是可选项。默认 httpx 会读 `HTTP_PROXY` /
+        # `ALL_PROXY` 这些环境变量，于是访问 `127.0.0.1:7788` 的请求会被送去
+        # 本机代理——探活永远看不到自己的服务，而且代理可能回 503 或干脆挂住。
+        # 本机服务不该走代理，这一条与「系统设了代理」无关。
+        _client = httpx.Client(base_url=DEFAULT_BASE, timeout=180.0, trust_env=False)
     return _client
 
 
 def _probe() -> dict[str, Any] | None:
     """服务活着就返回 /health，否则 None。短超时，不要卡住。"""
     try:
-        r = httpx.get(f"{DEFAULT_BASE}/health", timeout=3.0)
-        if r.status_code == 200:
-            return r.json()
+        with httpx.Client(timeout=3.0, trust_env=False) as client:
+            r = client.get(f"{DEFAULT_BASE}/health")
+            if r.status_code == 200:
+                return r.json()
     except Exception:
         pass
     return None
@@ -78,7 +84,7 @@ def _console_free_python() -> str:
     return str(cand if cand.exists() else exe)
 
 
-def _spawn_server() -> None:
+def _spawn_server() -> subprocess.Popen | None:
     """在后台拉起常驻服务（独立进程，本进程退出也不受影响）。
 
     用 DETACHED_PROCESS 让它脱离 MCP 进程的生命周期：宿主重启 MCP 时
@@ -88,6 +94,11 @@ def _spawn_server() -> None:
       1. 用 pythonw.exe（Windows 子系统，不分配控制台）；
       2. CREATE_NO_WINDOW（双保险，也给退回 python.exe 时兜底）；
       3. 三路 stdio 一律 DEVNULL —— 只要有可继承的句柄，就还有可能挂上控制台。
+
+    日志写不进去时**不能因此拉不起服务**。曾经就是这里直接 `open()`，在只读
+    的运行目录里抛 `PermissionError`，而错误信息只提了一个日志文件名，看起来
+    像权限问题而不是「服务没起来」。现在失败就退回 DEVNULL：没有日志总比没有
+    定位能力强。
     """
     creationflags = 0
     if sys.platform == "win32":
@@ -97,14 +108,26 @@ def _spawn_server() -> None:
             | 0x08000000  # CREATE_NO_WINDOW
         )
 
-    log_dir = ROOT
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(ROOT)
+    out = err = subprocess.DEVNULL
+    opened: list[Any] = []
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out = open(log_dir / "server.log", "ab")
+        opened.append(out)
+        err = open(log_dir / "server.err.log", "ab")
+        opened.append(err)
+    except OSError:
+        for handle in opened:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        out = err = subprocess.DEVNULL
 
     cmd = [_console_free_python(), "-m", SERVER_MODULE]
-    with open(log_dir / "server.log", "ab") as out, open(
-        log_dir / "server.err.log", "ab"
-    ) as err:
-        subprocess.Popen(  # noqa: S603
+    try:
+        return subprocess.Popen(  # noqa: S603
             cmd,
             cwd=str(ROOT),
             stdout=out,
@@ -113,6 +136,23 @@ def _spawn_server() -> None:
             creationflags=creationflags,
             close_fds=True,
         )
+    except OSError:
+        return None
+    finally:
+        for handle in opened:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def _log_tail(name: str, limit: int = 800) -> str:
+    """读日志尾部；读不到就返回空串。"""
+    try:
+        text = (Path(ROOT) / name).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-limit:].strip()
 
 
 def ensure_ready(wait_s: float = 120.0) -> dict[str, Any]:
@@ -121,7 +161,7 @@ def ensure_ready(wait_s: float = 120.0) -> dict[str, Any]:
     if h and h.get("ready"):
         return h
 
-    _spawn_server()
+    child = _spawn_server()
 
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
@@ -129,6 +169,15 @@ def ensure_ready(wait_s: float = 120.0) -> dict[str, Any]:
         h = _probe()
         if h and h.get("ready"):
             return h
+
+        # 进程已经退出就别再等到超时了——多等 120 秒只会让人以为在预热。
+        # 典型死因：端口被占、模型路径不对、venv 里缺包。
+        if child is not None and child.poll() is not None:
+            tail = _log_tail("server.err.log") or _log_tail("server.log")
+            raise RuntimeError(
+                f"ui-locate 服务启动后退出了（exit={child.returncode}）。"
+                + (f"日志尾部：{tail}" if tail else f"日志在 {ROOT / 'server.err.log'}。")
+            )
 
     raise RuntimeError(
         f"ui-locate 服务在 {wait_s:.0f}s 内没有就绪（{DEFAULT_BASE}）。"
@@ -242,7 +291,7 @@ def list_monitors() -> str:
               primary,x,y,w,h}]}
       index 可直接作为其它工具的 monitor 参数（"0"、"1"）。
     """
-    r = httpx.get(f"{DEFAULT_BASE}/monitors", timeout=10.0)
+    r = _http().get("/monitors")
     if r.status_code != 200:
         raise RuntimeError(f"/monitors 返回 {r.status_code}: {r.text[:300]}")
     return json.dumps(r.json(), ensure_ascii=False)
