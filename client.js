@@ -23,7 +23,11 @@
  * 所有颜色取自主题变量，换配色方案时这页跟着变。
  */
 window.__ModuleLoader__.load({
-  id: 'ui-locate',
+  // 必须是包名，不是插件的短名。client-modules 的 `arrive()` 拿着包名去查
+  // 已经注册的 factory（`if (this.factories.has(id))`），名字对不上就一路
+  // 抛 `loaded without registering "ui-locate-mcp"`，而那条错误只进浏览器
+  // 控制台——宿主那头毫无异样，设置页里就是干脆没有这一栏。
+  id: 'ui-locate-mcp',
   factory: require => {
     const module = { exports: {} }
     const exports = module.exports
@@ -432,7 +436,7 @@ window.__ModuleLoader__.load({
 
       ctx.effect(() => {
         const style = document.createElement('style')
-        style.setAttribute('data-plugin', 'ui-locate')
+        style.setAttribute('data-plugin', 'ui-locate-mcp')
         style.textContent = CSS
         document.head.appendChild(style)
         return () => style.remove()
@@ -459,7 +463,7 @@ window.__ModuleLoader__.load({
 
     exports.apply = apply
     exports.inject = inject
-    exports.name = 'ui-locate'
+    exports.name = 'ui-locate-mcp'
     exports.__test = { human, DICT }
     return module.exports
   },
