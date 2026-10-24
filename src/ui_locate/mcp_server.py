@@ -310,6 +310,12 @@ def list_monitors() -> str:
               primary,x,y,w,h}]}
       index 可直接作为其它工具的 monitor 参数（"0"、"1"）。
     """
+    # 必须显式 ensure_ready：`health` 之外，这里是唯一走 GET 的工具，以前
+    # 直接 `_http().get(...)`，于是成了唯一不会自动拉起服务的工具。表现很
+    # 像「服务坏了」——第一次调用它的人（包括我自己）看到的是
+    # `[WinError 10061] 连接被拒`，而紧接着别的工具却都正常。
+    # 看状态不该有副作用，所以 `health` 仍然只用 _probe()。
+    ensure_ready()
     r = _http().get("/monitors")
     if r.status_code != 200:
         raise RuntimeError(f"/monitors 返回 {r.status_code}: {r.text[:300]}")
