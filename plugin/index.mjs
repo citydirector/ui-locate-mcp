@@ -64,6 +64,7 @@ import {
   inspectRuntime,
   runtimePlan,
   writeRuntimeSettings,
+  readRuntimeSettings,
 } from "./runtime.mjs"
 import { createApi } from "./api.mjs"
 
@@ -104,9 +105,11 @@ export const Config = z.object({
     .description("检测模型的存放目录。留空则跟随运行目录下的 models/。已有模型可以指过来，省一次 77MB 下载。"),
   backend: z
     .string()
-    .default(DEFAULT_BACKEND)
+    .default("")
     .volatile()
-    .description("推理后端：directml（默认，通用）或 cuda（仅 NVIDIA，快一点但多 1.7GB）或 cpu。"),
+    .description(
+      "推理后端：directml（默认，通用）或 cuda（仅 NVIDIA，快一点但多 1.7GB）或 cpu。留空则沿用设置页里选过的那个。",
+    ),
 })
 
 /**
@@ -164,15 +167,25 @@ export function apply(ctx, config) {
    */
   function plan(override = {}) {
     const defaults = stateDir()
+    // 优先级：本次显式传入 → 插件配置 → 上次写下的 runtime.json → 默认值。
+    //
+    // 之所以要读回 runtime.json：这个文件的用途是「告诉 Python 侧用哪个目录」，
+    // 而它同时也是**用户上次在这里选过什么**的唯一记录。不读回来的话，界面
+    // 永远按默认目录渲染，而 Python 按文件里的目录找模型，两边各说一套——
+    // 用户明明把模型指到了现成的那一份，界面却说「模型缺失」，点一下又重新
+    // 下载 77MB。
+    const remembered = readRuntimeSettings(defaults)
     const resolved = runtimePlan({
       home: override.home ?? current?.runtimeDir ?? "",
-      modelDir: override.modelDir ?? current?.modelDir ?? "",
+      // 这里必须用 `||` 而不是 `??`：插件配置的两个字段默认值是**空串**，
+      // 而 `"" ?? x` 得到的是 `""`——`??` 只在 null/undefined 时才让位。
+      modelDir: override.modelDir || current?.modelDir || remembered.modelDir || "",
       defaultHome: defaults,
       defaultModelDir: join(defaults, "models"),
     })
     return {
       ...resolved,
-      backend: override.backend ?? current?.backend ?? DEFAULT_BACKEND,
+      backend: override.backend || current?.backend || remembered.backend || DEFAULT_BACKEND,
       defaultHome: defaults,
       defaultModelDir: join(defaults, "models"),
       venvPython: resolved.python,
