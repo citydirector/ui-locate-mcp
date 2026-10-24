@@ -125,57 +125,69 @@ cua_driver_native__click(scope="desktop", x=128, y=20)  →  菜单精确展开
 
 1. **插件** → **发现** → **添加索引源**，填索引 JSON 的 https 地址。
 2. 列表里出现「屏幕定位 (ui-locate)」，点安装。
-3. 装完后先跑一次环境准备（venv + 依赖 + 模型，一次性）：
+3. 重启 DSH（`restart-required` 是 bundle 生效的正常状态）。
+4. **设置 → 运行环境**，点「准备环境」。
 
-```powershell
-pwsh -File <插件目录>\scripts\bootstrap.ps1
-```
+第 4 步是这个版本新增的，也是大多数人会卡住的那一步。装插件只把**代码和配置**
+拉下来，跑起来还需要一个带 ONNX Runtime 的 Python 环境和一个 77 MB 的检测模型。
+这份活由插件自己的 Host 半身干：它会用 DSH 自带的 Python 建 venv、装依赖、
+下模型，全程在设置页里显示进度，不需要开终端，也不需要事先装 uv。
 
-这一步会往**用户级目录**写东西，不在插件目录里，因为 bundle 装在
-`node_modules` 深处、换版本时整目录会被替换。位置由下面几条决定（先命中者胜）：
+**为什么要单独一步**：环境约 130 MB（DirectML 后端）到 1.8 GB（CUDA），
+模型 77 MB。随包下发意味着每次装插件都得拖一份，所以「装插件」和「准备环境」
+刻意分成两步 —— 而且第二步可以重来，不用重装插件。
 
 | 东西 | 大小 | 位置 | 怎么改 |
 |------|------|------|--------|
-| 代码 + 补丁 | 约 500 KB | profile 的 `node_modules/ui-locate-mcp/` | DSH 管，别动 |
-| venv + 依赖 | **DirectML 约 130 MB / CUDA 约 1.8 GB / 纯 CPU 约 60 MB** | `$UI_LOCATE_HOME/venv` | `UI_LOCATE_HOME` 或 `-HomeDir` |
-| 检测模型 | 77 MB | `$UI_LOCATE_MODEL_DIR` | `UI_LOCATE_MODEL_DIR` 或 `-ModelDir` |
+| 代码 + 配置 | 约 200 KB | profile 的 `node_modules/ui-locate-mcp/` | DSH 管，别动 |
+| venv + 依赖 | **DirectML 约 130 MB / CUDA 约 1.8 GB / 纯 CPU 约 60 MB** | `$UI_LOCATE_HOME/venv` | 设置页里填，或 `UI_LOCATE_HOME` |
+| 检测模型 | 77 MB | `$UI_LOCATE_MODEL_DIR` | 设置页里填，或 `UI_LOCATE_MODEL_DIR` |
 | 日志 | 几十 KB | `$UI_LOCATE_HOME/` | 同上 |
 
-**不要塞进包里**：venv 光 CUDA 运行库就有 1.5 GB，随包下发意味着每次装插件
-都得拖一份 GB 级的东西。所以「装插件」和「准备环境」是两步。
+路径留空就跟随 DSH 的数据目录：`UI_LOCATE_HOME` → `$DSH_HOME/ui-locate` →
+`%LOCALAPPDATA%\ui-locate`。便携版落在 `data/ui-locate`，不会往 C 盘写。
 
-**默认装的是 DirectML 后端**（`onnxruntime-directml` 一个 wheel 24 MB，自带
-`DirectML.dll`，不依赖系统里装没装 DirectML）。要 CUDA 就加 `-Cuda`，要纯
-CPU 就加 `-CpuOnly`。两个都别加就是 DirectML。
+**已经有模型的话别下第二份**：在设置页把「模型目录」指过去（或设
+`UI_LOCATE_MODEL_DIR`），准备时会直接认下现成的那个文件。
 
-⚠ 三个 ORT wheel（`onnxruntime` / `onnxruntime-directml` / `onnxruntime-gpu`）
-**都提供同一个 `onnxruntime` 顶层包**，装两个就互相覆盖 —— 后装的赢，而且不报错。
-所以换后端别在现有 venv 上叠着装，删掉 venv 重跑 `bootstrap.ps1`。
+**想换后端**：设置页的下拉里选 `DirectML（默认，通用）/ CUDA（仅 NVIDIA）/
+纯 CPU`，然后点「重新安装」。三个 ORT wheel（`onnxruntime` /
+`onnxruntime-directml` / `onnxruntime-gpu`）**都提供同一个 `onnxruntime`
+顶层包**，叠着装会互相覆盖而且不报错，所以换后端必须重装而不是加装 ——
+「重新安装」按钮做的就是这件事（删掉 venv 重来）。
 
-```powershell
-pwsh -File <插件目录>\scriptsootstrap.ps1 -Cuda      # NVIDIA 卡，约 1.8 GB
-pwsh -File <插件目录>\scriptsootstrap.ps1 -CpuOnly   # 没有独显 / 只想省空间
-```
+#### 没有界面时（纯命令行，可选）
 
-**已经有模型的话别下第二份**。脚本按「先找现成的、找不到才下」走：
+设置页只是把同一段逻辑包了一层，脚本仍然在，适合 CI 或远程机器：
 
 ```powershell
-# 指向已有的模型目录（或直接给文件的绝对路径用 UI_LOCATE_MODEL）
+pwsh -File <插件目录>\scripts\bootstrap.ps1              # DirectML，约 130 MB
+pwsh -File <插件目录>\scripts\bootstrap.ps1 -Cuda        # NVIDIA 卡，约 1.8 GB
+pwsh -File <插件目录>\scripts\bootstrap.ps1 -CpuOnly     # 没有独显 / 只想省空间
 pwsh -File <插件目录>\scripts\bootstrap.ps1 -ModelDir D:\myLocalModels\ui-locate
+pwsh -File <插件目录>\scripts\bootstrap.ps1 -Status       # 只看现状，什么都不动
 ```
+
+`bootstrap.ps1` 需要系统里有 uv 或 python；**设置页里那条路不需要**，它直接用
+DSH 自带的 Python，也绕开了「PATH 里那个 python 是 Microsoft Store 存根」这类麻烦。
 
 模型查找顺序是 `UI_LOCATE_MODEL` → `UI_LOCATE_MODEL_DIR` → 状态目录 `models/`
 → 包内 `models/` → `~/myLocalModels/ui-locate` → 当前目录 `models/`。
-`bootstrap.ps1 -Status` 会把实际用的 `home` / `models` / `venv` / `model` 全打出来。
 
-   实际路径取决于插件被装到哪里；也可以直接 `cd` 到插件目录后跑
-   `pwsh -File .\scripts\bootstrap.ps1`。
+#### Agent 也能自己修环境
 
-4. 重启 DSH（`restart-required` 是 bundle 生效的正常状态）。
+两个工具直接挂在工具目录里，不经过界面：
 
-**为什么索引里写的是 npm、而实际要跑 bootstrap**：索引只描述「怎么把包拉下来」，
-拉下来的是**源码 + patch**；模型和 CUDA 依赖体积大、与平台强相关，不适合塞进 npm 包，
-所以交给 `bootstrap.ps1` 按需准备。这是刻意分工，不是遗漏。
+| 工具 | 用途 |
+|------|------|
+| `ui_locate_update` | `action=check` 查新版本；`action=apply` 装新版本 |
+| `ui_locate_setup` | 准备运行环境；`force=true` 删掉重装；可传 `home` / `modelDir` / `backend` |
+
+所以「装完插件环境没起来」这件事，Agent 自己就能查、能修，不需要人来点。
+
+**为什么索引里写的是 git、而环境要另外准备**：索引只描述「怎么把包拉下来」，
+拉下来的是**源码 + patch**；Python 依赖与模型体积大、与平台强相关，不适合塞进
+包体，所以交给 Host 半身按需准备。这是刻意分工，不是遗漏。
 
 ### 方式二：手写进 profile（本地开发用）
 
@@ -236,6 +248,10 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 | `UI_LOCATE_OCR_CUDA` | `1` 让 OCR 也走 GPU | 关 |
 | `DSH_UI_LOCATE_UPDATE_API` | 换掉查版本的 GitHub API 地址（自建镜像 / 离线测试） | `https://api.github.com` |
 | `DSH_UI_LOCATE_UPDATE_DELAY_MS` | 启动后隔多久查第一次 | `8000` |
+| `UI_LOCATE_PYTHON` | 准备环境时用哪个解释器 | DSH 自带的那个 |
+
+设置页里填的目录会覆盖上表里 `UI_LOCATE_HOME` / `UI_LOCATE_MODEL_DIR` 的默认值，
+但不改动环境变量本身 —— 它存在 profile 的插件配置里，换 DSH 版本不会丢。
 
 ## 自动更新
 
@@ -282,14 +298,38 @@ Python 包**——而那才是真正会改进的部分（算法、模型、OCR �
 git tag v0.2.1 && git push gh main --tags
 ```
 
-### 两个开关
+### 五个配置项
 
-在插件页的配置里：
+在插件页的配置里（都在设置页能看到、能改，改完立刻生效）：
 
-| 开关 | 默认 | 作用 |
+| 配置 | 默认 | 作用 |
 |------|------|------|
-| `updateCheck` | 开 | 启动几秒后查一次，之后每 12 小时一次 |
-| `pythonSync` | 开 | 发现 venv 版本与包内声明不一致时自动重装 |
+| `updateCheck` | 开 | 启动几秒后查一次版本，之后每 12 小时一次。只查不装 |
+| `pythonSync` | 开 | 发现 venv 版本与包内声明不一致时自动重装 Python 侧 |
+| `runtimeDir` | 空 | Python 环境与日志放哪；空则跟随 DSH 数据目录 |
+| `modelDir` | 空 | 检测模型放哪；空则跟随运行目录下的 `models/` |
+| `backend` | `directml` | `directml` / `cuda` / `cpu`，只在下一次准备环境时生效 |
+
+### 设置页怎么接上的
+
+Host 半身挂在 `/api/ui-locate` 前缀下，客户端半身（`client.js`）往
+`settings.section` 这个 slot 里注册一页。两者靠四条路由通信：
+
+| 路由 | 用途 |
+|------|------|
+| `GET /defaults` | 路径的默认值，给输入框当 placeholder |
+| `GET /status` | 现状：venv 在不在、模型多大、装了什么版本、能用哪些后端 |
+| `POST /setup` | 开始准备（立刻返回 jobId，长任务不占着请求） |
+| `GET /progress` | 轮询进度 |
+
+**为什么 `POST /setup` 不一直等到装完**：首次要下 200 MB，一个 HTTP 请求挂十几
+分钟很容易被中间层掐断。改成「立刻返回 + 轮询」以后，界面刷新、DSH 重启都不会
+让已经下载的东西白费（`.part` 文件还在，下次续上）。
+
+**为什么信任检查要自己做一遍**：`/api/ui-locate` 比内核自己的 `/api` 前缀长，
+而 `webServer` 是「最长前缀优先」——这意味着这些请求**绕过了内核的准入检查**。
+所以 `plugin/trust.mjs` 里自己过一遍：只认 loopback Host、拒 cross-site、
+Origin/Referer 必须同源；桌面壳转发过来的 `dsh-app://app` 单独放行。
 
 ### 自检
 
@@ -300,9 +340,12 @@ python tests\check_bundle.py
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 更新插件的行为测试（48 例，纯逻辑 + 接线层）
+# 插件行为测试（60 例：纯逻辑、接线层、JSON Schema 硬规则）
 node --test tests/
 ```
+
+跑测试用真 node，别用 bun —— WSL 里 `node` 是 bun 的符号链接，`node --test tests/`
+会被当成「找这个模块」而不是「跑这个目录」。用 `/usr/bin/node`。
 
 `smoke_mcp.py` 的解释器优先级：`UI_LOCATE_PYTHON` 环境变量 → 包内 `.venv` → 当前解释器。
 
@@ -504,15 +547,56 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     HMR 只重载被它管理的行，不会重载自己。所以修完 bug 再 apply，那次返回的
     还是旧代码算出来的结果 —— 要重启 DSH 才能看到修复生效。
 
+22. **DSH 没有「装完插件就跑钩子」这回事**。`dsh.bundle` 的 schema 只有一个
+    `patch` 字段；`dsh-plugin.json` 的 manifest 只有 `facets` / `requires` /
+    `permissions` / `contributes` / `subscriptions`。所以「装完自动建 venv」
+    不可能靠 npm 的 `postinstall` 实现（而且整机所有插件都不走那条路）。
+
+    结论：环境准备必须**由插件自己的 Host 代码在运行期做**，或者暴露成一个
+    Agent 能调的工具。本包两条都做了（`ui_locate_setup` + 设置页）。
+
+23. **`python -m venv` 在受限环境里会因为 ensurepip 而失败**。报错是
+    `Error: [WinError 5] 拒绝访问`，看起来像路径权限问题，实际是 ensurepip
+    往 `Scripts/` 写的时候被拦。加 `--without-pip` 就干净了，然后自己把 pip
+    补上：
+
+    ```
+    python -m venv --without-pip <dir>
+    <dir>/Scripts/python.exe -m zipfile -e <pip-26.2.2-py3-none-any.whl> <dir>/Lib/site-packages
+    ```
+
+    pip 的 wheel 就是个 zip，用它自带的 `zipfile` 模块解开即可，不需要
+    `get-pip.py`（那个要往临时目录写 `pip.zip`，同样是权限问题，连把
+    `TEMP` 指到可写目录都绕不过 —— 实测两次都失败）。
+
+24. **`pip install` 失败时第一件事是看 `TEMP` 指到哪**。受限环境里的典型报错是
+    `ERROR: Could not install packages due to an OSError: [Errno 13] Permission
+    denied: '...\pip-unpack-xxxx\xxx.whl.metadata'` —— 路径里带 `pip-unpack`
+    就说明是解包目录写不进去，不是网络问题。把 `TEMP` / `TMP` / `TMPDIR`
+    指到运行目录再试（`runtime.mjs` 里就是这么做的）。
+
+25. **`/api/<插件名>` 比内核的 `/api` 长，会绕过内核准入检查**。`webServer`
+    按最长前缀匹配，所以挂在 `/api/ui-locate` 下的路由**不走**内核那套鉴权。
+    插件必须自己过一遍栅栏（`plugin/trust.mjs`）：只认 loopback 的 Host、
+    拒 `sec-fetch-site: cross-site`、Origin/Referer 必须同源；桌面壳转发的
+    `dsh-app://app` 单独放行。
+
+    别指望「反正是本地服务」。浏览器里任何一个网页都能往 `127.0.0.1` 发请求，
+    而这条路由能删 venv、能下文件。
+
 ## 文件
 
 | 文件 | 作用 |
 |------|------|
-| `package.json` | **bundle 声明**：`dsh.bundle.patch` 指向 `cordis.patch.yml`，`exports` 暴露 locale 与图标 |
+| `package.json` | **bundle 声明**：`dsh.bundle.patch` 指向 `cordis.patch.yml`，`dsh.client` 声明客户端半身 |
 | `cordis.patch.yml` | bundle 的 patch：`insert` 一个 `@deepseek-ai/dsh-mcp-client` 连接项 + 一个本包 Host 插件行 |
-| `plugin/index.mjs` | **Host 插件**：版本检查、安装新版本、把 venv 里的 Python 包同步过去 |
+| `plugin/index.mjs` | **Host 插件**：版本检查、安装新版本、准备运行环境、挂设置页接口 |
 | `plugin/tool.mjs` | 本仓库自带的 `defineTool`：宿主那几条会让插件起不来的硬规则都在这里 |
-| `plugin/core.mjs` | 上者的纯逻辑（版本比较、发布源、venv 同步、状态机），不依赖 Cordis，可直接用 node 测 |
+| `plugin/core.mjs` | 纯逻辑（版本比较、发布源、venv 同步、状态机），不依赖 Cordis，可直接用 node 测 |
+| `plugin/runtime.mjs` | **环境准备**：建 venv、装依赖、下模型；外部世界全注入，所以能测 |
+| `plugin/api.mjs` | 设置页的四条 HTTP 路由（状态 / 默认值 / 开始准备 / 轮询进度） |
+| `plugin/trust.mjs` | 自建的信任栅栏：插件前缀绕过内核准入，得自己判一遍 |
+| `client.js` | **客户端半身**：往 `settings.section` 注册「运行环境」一页 |
 | `market-index.json` | 插件市场索引（format 1），在线导入的入口 |
 | `locale/{en,zh}.json` | 插件列表里显示的标题与描述 |
 | `icon.svg` | 插件图标（≤256 KiB，必须留在包内） |
@@ -534,7 +618,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `scripts/serve.ps1` | 手动起停常驻服务 / 查状态 |
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
-| `tests/update-plugin.test.mjs` | 更新插件的行为测试（48 例，`node --test tests/`） |
+| `tests/update-plugin.test.mjs` | 插件行为测试（60 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
 

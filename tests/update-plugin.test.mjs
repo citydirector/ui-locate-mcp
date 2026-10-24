@@ -695,7 +695,9 @@ check("index：apply 挂了 pluginManager 的按需注入与 volatile-update 监
   const ctx = fakeCtx()
   plugin.apply(ctx, plugin.Config({}))
   try {
-    assert.deepEqual(ctx._injected[0], ["pluginManager"])
+    const wanted = ctx._injected.map((row) => row.join(","))
+    assert.ok(wanted.includes("pluginManager"), `pluginManager 要按需注入，实际 ${JSON.stringify(wanted)}`)
+    assert.ok(wanted.includes("webServer"), `webServer 要按需注入，实际 ${JSON.stringify(wanted)}`)
     assert.ok(ctx._handlers.get("loader/volatile-update")?.length, "配置热改要能被接住")
     assert.ok(ctx._effects.includes("ui-locate: update timers"))
     assert.ok(ctx._effects.includes("ui-locate: plugin manager"))
@@ -891,6 +893,76 @@ check("index：installBundle 报告 application=failed 时不能说成功", asyn
     ctx._disposeAll()
   } finally {
     globalThis.fetch = realFetch
+  }
+})
+
+check("index：ui_locate_setup 的参数按类型校验，且工具定义能被宿主接受", async () => {
+  const plugin = await import("../plugin/index.mjs")
+  const ctx = fakeCtx()
+  plugin.apply(ctx, plugin.Config({ updateCheck: false, pythonSync: false }))
+  try {
+    const tool = ctx._tools.find((item) => item.name === "ui_locate_setup")
+    assert.ok(tool, "第二个工具必须注册")
+    // 长任务：超时给足，否则下 200MB 的时候会被判死。
+    assert.ok(tool.timeoutMs >= 600_000, `timeoutMs 太小：${tool.timeoutMs}`)
+
+    // force 声明成 boolean，给字符串就必须当场拒——这是 defineTool 包的
+    // 那一层校验，裸 ctx.tools.register 没有。这里走的是真 apply 路径，
+    // 所以断言的是「用户传错参数不会静默变成一次错误的安装」。
+    await assert.rejects(
+      () => tool.execute({ force: "yes" }),
+      (error) => {
+        assert.equal(error.name, "ToolArgsError")
+        assert.ok(error.violations.some((line) => line.includes('"force"')), JSON.stringify(error.violations))
+        return true
+      },
+    )
+    await assert.rejects(
+      () => tool.execute({ backend: 1 }),
+      (error) => {
+        assert.equal(error.name, "ToolArgsError")
+        assert.ok(error.violations.some((line) => line.includes('"backend"')), JSON.stringify(error.violations))
+        return true
+      },
+    )
+    // 多出来的键不拒（JSON Schema 默认如此），但也不该把它当参数用。
+    assert.equal(tool.parameters.additionalProperties, false)
+    // 输出里每个 object 节点都要显式 additionalProperties，否则宿主拒整份。
+    for (const [field, spec] of Object.entries(tool.output.schema.properties)) {
+      if (spec.type === "object") {
+        assert.equal(typeof spec.additionalProperties, "boolean", `${field} 缺 additionalProperties`)
+      }
+    }
+    assert.deepEqual(tool.output.schema.required, ["ok", "home", "modelDir", "backend"])
+    ctx._disposeAll()
+  } finally {
+    ctx._disposeAll()
+  }
+})
+
+check("index：准备环境失败时返回 ok:false 而不是抛异常", async () => {
+  const plugin = await import("../plugin/index.mjs")
+  const ctx = fakeCtx()
+  plugin.apply(ctx, plugin.Config({ updateCheck: false, pythonSync: false }))
+  const realPython = process.env.UI_LOCATE_PYTHON
+  // 指到一个不存在的解释器，逼 pickPython 回落到自动探测；若自动探测也
+  // 找不到，就应该给一句人话，而不是把栈甩出去。
+  process.env.UI_LOCATE_PYTHON = "/nonexistent/python"
+  try {
+    const tool = ctx._tools.find((item) => item.name === "ui_locate_setup")
+    const value = await tool.execute({ home: "/tmp/ui-locate-test-home", modelDir: "/tmp/ui-locate-test-models" })
+    // 两种结局都合法：找到宿主自带的 Python 就真去建（这边会失败但也是
+    // ok:false），找不到就直接报错。共同点是**一定有 ok 与一句交代**。
+    assert.equal(typeof value.ok, "boolean")
+    assert.equal(typeof value.home, "string")
+    assert.equal(typeof value.modelDir, "string")
+    assert.equal(typeof value.backend, "string")
+    if (value.ok === false) assert.equal(typeof value.error, "string")
+    ctx._disposeAll()
+  } finally {
+    if (realPython === undefined) delete process.env.UI_LOCATE_PYTHON
+    else process.env.UI_LOCATE_PYTHON = realPython
+    ctx._disposeAll()
   }
 })
 

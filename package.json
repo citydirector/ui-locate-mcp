@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "ui-locate-mcp",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "description": "Lightweight local visual grounding engine exposed as agent tools",
@@ -11,15 +11,20 @@
   },
   "exports": {
     ".": "./plugin/index.mjs",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "cordis.patch.yml",
+    "client.js",
     "plugin/index.mjs",
     "plugin/core.mjs",
     "plugin/tool.mjs",
+    "plugin/runtime.mjs",
+    "plugin/api.mjs",
+    "plugin/trust.mjs",
     "locale/*.json",
     "icon.svg",
     "pyproject.toml",
@@ -33,6 +38,11 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": []
     }
   },
   "dependencies": {
