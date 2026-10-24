@@ -1,14 +1,20 @@
 # 一次性环境准备：建 venv、装依赖、下模型。
 #
 # 为什么需要这一步
-#   插件包本身只有代码，模型有 80MB、依赖里有 CUDA 运行库，都不适合塞进
+#   插件包本身只有代码，模型有 77MB、依赖有一两万个文件，都不适合塞进
 #   一个 npm 包里。所以「安装插件」和「准备运行环境」分成两步：
 #   DSH 负责装插件（node_modules 里的 JS/YAML 部分），本脚本负责 Python 侧。
 #
 # 它会做什么
 #   1. 在 <HomeDir>\venv 建一个独立 venv（不污染系统 Python）
-#   2. 装本插件（含 cuda 可选依赖）
+#   2. 装本插件（默认 DirectML 后端，约 130MB；-Cuda 换成 CUDA，约 1.8GB）
 #   3. 若模型目录下没有模型，自动下载
+#
+# 推理后端怎么选
+#   默认 DirectML：走 D3D12，NVIDIA / AMD / Intel 的显卡都能用，实测检测
+#   速度与 CUDA 基本持平，依赖体积只有后者的 1/13。
+#   传 -Cuda 换成 CUDA：快几个百分点，但只有 NVIDIA 卡能用。
+#   传 -CpuOnly 只装纯 CPU 版：没有显卡或只想试一下时用。
 #
 # 模型目录怎么定（与 src/ui_locate/config.py 的查找顺序一致）：
 #   1. -ModelDir 参数
@@ -29,12 +35,14 @@
 # 用法（在插件根目录或任意位置都行）：
 #   pwsh -File scripts/bootstrap.ps1
 #   pwsh -File scripts/bootstrap.ps1 -SkipModel      # 已有模型，跳过下载
-#   pwsh -File scripts/bootstrap.ps1 -CpuOnly        # 不装 CUDA 运行库
+#   pwsh -File scripts/bootstrap.ps1 -Cuda           # 换成 CUDA 后端
+#   pwsh -File scripts/bootstrap.ps1 -CpuOnly        # 只装纯 CPU 版
 #   pwsh -File scripts/bootstrap.ps1 -Editable       # 可编辑安装（改源码即生效）
 #   pwsh -File scripts/bootstrap.ps1 -Status         # 只看现状，不动手
 
 param(
     [switch]$SkipModel,
+    [switch]$Cuda,
     [switch]$CpuOnly,
     [switch]$Editable,
     [switch]$Status,
@@ -79,8 +87,16 @@ function Show-Status {
             } else { "缺失  $modelFile" }))
     if (Test-Path $py) {
         try {
-            $prov = & $py -c "from ui_locate import config; print(config.resolve_provider())" 2>&1
-            Write-Output "provider: $prov"
+            # 一次子进程里问三件事：解析出的 provider、ORT 版本、它到底认哪些后端
+            $script = 'from ui_locate import config; import onnxruntime as o; ' +
+                      'print(config.resolve_provider()); print(o.__version__); ' +
+                      'print(",".join(o.get_available_providers()))'
+            $out = & $py -c $script 2>&1
+            if ($LASTEXITCODE -eq 0 -and $out.Count -ge 3) {
+                Write-Output "provider: $($out[0])  (onnxruntime $($out[1]))"
+                Write-Output "backend : $($out[2])"
+            }
+            else { Write-Output "provider: 查询失败 $out" }
         }
         catch { Write-Output "provider: 查询失败（插件可能没装进 venv）" }
     }
@@ -108,23 +124,54 @@ if (-not (Test-Path $py)) {
 }
 
 # ── 2. 装依赖 ───────────────────────────────────────────────────────────────
-$extras = if ($CpuOnly) { '' } else { '[cuda]' }
-$target = "$pkgRoot$extras"
-Write-Output "安装依赖: $target$(if ($Editable) { '  (editable)' })"
-
-# 参数数组而不是拼一个空字符串 —— 空字符串会作为一个真实参数传给 pip，
-# 被当成"要安装的包名"而报错。
-$installArgs = @('pip', 'install')
-if ($Editable) { $installArgs += '--editable' }
-$installArgs += $target
+# 三种后端的装法不一样，因为 ORT 的三个 wheel 都提供 `onnxruntime` 这个
+# 顶层包，装两个就会互相覆盖 —— 后装的赢，而且不报错。所以：
+#
+#   DirectML  直接装本包，让 pyproject 的默认依赖决定拉哪个 ORT。
+#   CUDA/CPU  先 --no-deps 只装代码，再显式装依赖，避免默认的 DirectML
+#             那一份一起进来打架（CUDA 版尤其要命：1.8GB 白下）。
+if ($Cuda -and $CpuOnly) {
+    Write-Output '-Cuda 与 -CpuOnly 不能同时用。'
+    exit 1
+}
 
 $uv2 = Get-Command uv -ErrorAction SilentlyContinue
-if ($uv2) {
-    & uv @installArgs --python $py
+$useUv = [bool]$uv2
+
+function Invoke-Pip([string[]]$Arguments) {
+    if ($useUv) { & uv pip @Arguments --python $py }
+    else { & $py -m pip @Arguments }
+}
+
+# 除了 ORT 之外，pyproject 里声明的运行时依赖。改动 pyproject 时这里要同步。
+$commonDeps = @(
+    'mcp>=1.10,<2', 'numpy>=2.0', 'opencv-python-headless',
+    'pillow', 'rapidocr>=3.0', 'httpx'
+)
+
+if ($Cuda) {
+    Write-Output "安装依赖: $pkgRoot  (CUDA 后端，约 1.8GB)"
+    $codeArgs = @('install', '--no-deps')
+    if ($Editable) { $codeArgs += '--editable' }
+    $codeArgs += $pkgRoot
+    Invoke-Pip $codeArgs
+    Invoke-Pip (@('install', 'onnxruntime-gpu>=1.23,<1.24', 'nvidia-cudnn-cu12>=9,<10',
+            'nvidia-cublas-cu12', 'nvidia-cufft-cu12', 'nvidia-cuda-runtime-cu12') + $commonDeps)
+}
+elseif ($CpuOnly) {
+    Write-Output "安装依赖: $pkgRoot  (纯 CPU)"
+    $codeArgs = @('install', '--no-deps')
+    if ($Editable) { $codeArgs += '--editable' }
+    $codeArgs += $pkgRoot
+    Invoke-Pip $codeArgs
+    Invoke-Pip (@('install', 'onnxruntime>=1.24,<1.25') + $commonDeps)
 }
 else {
-    & $py -m pip install --upgrade pip
-    & $py -m @installArgs
+    Write-Output "安装依赖: $pkgRoot  (DirectML 后端，约 130MB)$(if ($Editable) { '  (editable)' })"
+    $codeArgs = @('install')
+    if ($Editable) { $codeArgs += '--editable' }
+    $codeArgs += $pkgRoot
+    Invoke-Pip $codeArgs
 }
 
 # ── 3. 模型 ─────────────────────────────────────────────────────────────────

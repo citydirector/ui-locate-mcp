@@ -195,11 +195,11 @@ export function installedPythonVersion(python, { exec = execFile, exists = exist
  * 没有 `uv` 就退回 venv 自己的 `python -m pip`。
  *
  * @param python - venv 解释器绝对路径。
- * @param target - 要安装的路径，可带 extras。
- * @param options - `{ exec }` 注入点，测试用。
+ * @param target - 要安装的路径。
+ * @param options - `{ exec, noDeps }` 注入点，测试用。
  * @returns 成功时 undefined，失败时抛错。
  */
-export function installIntoVenv(python, target, { exec = execFile } = {}) {
+export function installIntoVenv(python, target, { exec = execFile, noDeps = false } = {}) {
   const run = (command, args) =>
     new Promise((resolve, reject) => {
       exec(
@@ -212,10 +212,11 @@ export function installIntoVenv(python, target, { exec = execFile } = {}) {
         },
       )
     })
-  return run("uv", ["pip", "install", "--python", python, target]).catch((error) => {
+  const extra = noDeps ? ["--no-deps"] : []
+  return run("uv", ["pip", "install", "--python", python, ...extra, target]).catch((error) => {
     // uv 不在 PATH 时退回 pip。别把「没有 uv」当成「装不上」：很多机器上就是没装。
     if (/\bENOENT\b|not found|not recognized/i.test(String(error?.message ?? ""))) {
-      return run(python, ["-m", "pip", "install", "--upgrade", target])
+      return run(python, ["-m", "pip", "install", "--upgrade", ...extra, target])
     }
     return Promise.reject(error)
   })
@@ -227,10 +228,15 @@ export function installIntoVenv(python, target, { exec = execFile } = {}) {
  * 触发条件是「两边版本不一致」，不是「刚更新过」——所以它天然自愈：上一次
  * 失败留下的不一致，下一次启动还会被发现。
  *
- * venv 不存在时什么都不做并说明原因。建 venv 要下 80MB 模型，那是
+ * venv 不存在时什么都不做并说明原因。建 venv 要下 77MB 模型，那是
  * `scripts/bootstrap.ps1` 的职责，不该在插件启动时悄悄做。
  *
- * @param options - `{ root, home, platform, exec, exists, cpuOnly }`，测试用。
+ * **只换代码，不动后端。** 用 `--no-deps` 装本包：运行时依赖（含 ORT 的哪
+ * 一个 wheel）是 bootstrap 时按用户选的，同步版本时不该擅自把它们换掉 ——
+ * 三个 ORT wheel 都提供同一个 `onnxruntime` 顶层包，重装一次就可能把用户的
+ * CUDA 换成 DirectML，或者反过来，而且不报错。
+ *
+ * @param options - `{ root, home, platform, exec, exists }`，测试用。
  * @returns `{ state, ... }`，state ∈ missing | unknown | current | updated | mismatch | failed
  */
 export async function syncPythonToBundle({
@@ -239,7 +245,6 @@ export async function syncPythonToBundle({
   platform = process.platform,
   exec = execFile,
   exists = existsSync,
-  cpuOnly = process.env.UI_LOCATE_CPU_ONLY === "1",
 } = {}) {
   const python = venvPython(home, platform)
   const wanted = bundledPythonVersion(root)
@@ -247,11 +252,9 @@ export async function syncPythonToBundle({
   if (wanted === undefined) return { state: "unknown", reason: "pyproject.toml unreadable" }
   const have = await installedPythonVersion(python, { exec, exists })
   if (have === wanted) return { state: "current", version: have }
-  // 装的是本包目录（含 pyproject.toml）。extras 按 GPU 可用性选：直接重装成
-  // [cuda] 在没有 NVIDIA 卡的机器上会白拉几百 MB。
-  const target = `${root.replace(/[\\/]+$/, "")}${cpuOnly ? "" : "[cuda]"}`
+  const target = root.replace(/[\\/]+$/, "")
   try {
-    await installIntoVenv(python, target, { exec })
+    await installIntoVenv(python, target, { exec, noDeps: true })
     const after = await installedPythonVersion(python, { exec, exists })
     return after === wanted ? { state: "updated", version: after } : { state: "mismatch", have: after, wanted }
   } catch (error) {

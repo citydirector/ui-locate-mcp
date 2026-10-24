@@ -119,7 +119,7 @@ def main() -> None:
     ap.add_argument("--image", type=Path, default=None, help="不给则抓当前屏幕")
     ap.add_argument("--model", type=Path, default=None, help="模型文件；缺省按 ui_locate.config 规则查找")
     ap.add_argument(
-        "--provider", choices=["auto", "cuda", "cpu"], default=config.provider()
+        "--provider", choices=["auto", "cuda", "dml", "cpu"], default=config.provider()
     )
     ap.add_argument("--conf", type=float, default=0.3)
     ap.add_argument("--iou", type=float, default=0.5)

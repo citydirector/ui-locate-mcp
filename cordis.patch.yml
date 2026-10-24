@@ -37,7 +37,7 @@
         env:
           # 同一个目录，传给 Python 侧（模型 / 日志落这里）
           UI_LOCATE_HOME: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}`'
-        # 首次调用要等常驻服务预热（CUDA 首次建会话较慢）+ 一次整页 OCR
+        # 首次调用要等常驻服务预热（CUDA 约 35 秒 / DirectML 约 2 秒）+ 一次整页 OCR
         toolCallTimeoutMs: 180000
     # 更新器。名字用**包名**而不是 ./plugin/index.mjs：DSH 会把相对名解析成
     # 绝对 file URL，配置编辑器首次保存就把那个绝对路径写进用户 patch，便携版

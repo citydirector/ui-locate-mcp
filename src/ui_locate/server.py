@@ -1,10 +1,13 @@
-"""常驻视觉定位服务：启动时付一次 CUDA 预热代价，之后每次请求只要十几毫秒。
+"""常驻视觉定位服务：启动时付一次预热代价，之后每次请求只要十几毫秒。
 
 为什么必须常驻：
-  实测每个**新进程**的首次 CUDA Conv 都要 35 秒（cuDNN 要为 113 个卷积层
-  逐一枚举算法，8GB 卡上无法跳过；EXHAUSTIVE/HEURISTIC、workspace 开关
-  都不影响这个数字）。同一进程内第二次建 session 只花 ~1 秒，因为 cuDNN
-  的算法选择结果在进程级缓存。所以把预热做一次、进程常驻，是唯一可行路线。
+  CUDA 后端下，每个**新进程**的首次 Conv 都要约 35 秒（cuDNN 要为 113 个
+  卷积层逐一枚举算法，8GB 卡上无法跳过；EXHAUSTIVE/HEURISTIC、workspace
+  开关都不影响这个数字）。同一进程内第二次建 session 只花约 1 秒，因为
+  cuDNN 的算法选择结果在进程级缓存。
+  DirectML 后端没有这个问题（建会话 1.5 秒，首次推理直接就是稳态速度），
+  但常驻的结构照旧 —— 换后端不该改架构，而且常驻还顺带省掉了每次调用重新
+  读 77MB 模型的 IO。
 
 端点（全部 JSON）：
   GET  /health                     存活与预热状态
@@ -473,14 +476,14 @@ def main() -> None:
     ap.add_argument("--model", type=Path, default=None, help="模型文件；缺省按 ui_locate.config 规则查找")
     ap.add_argument(
         "--provider",
-        choices=["auto", "cuda", "cpu"],
+        choices=["auto", "cuda", "dml", "cpu"],
         default=config.provider(),
-        help="auto 会检测 ONNX Runtime 实际可用的 provider",
+        help="auto 按 cuda → dml → cpu 的顺序取第一个可用的 provider",
     )
     ap.add_argument("--no-ocr", action="store_true")
     args = ap.parse_args()
 
-    print(f"[ui-locate] 加载模型并预热（CUDA 首次约需 35 秒，请稍候）…", flush=True)
+    print(f"[ui-locate] 加载模型并预热（CUDA 首次约 35 秒；DirectML 约 2 秒）…", flush=True)
     ENGINE = Engine(args.model, config.resolve_provider(args.provider), not args.no_ocr)
     print(f"[ui-locate] 就绪，预热耗时 {ENGINE.warmup_ms / 1000:.1f}s，"
           f"provider={ENGINE.det.active}", flush=True)

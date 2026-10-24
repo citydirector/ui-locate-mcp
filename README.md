@@ -60,13 +60,17 @@ cua_driver_native__click(scope="desktop", x=-1087, y=-909)  →  点中了
 宿主 ──stdio──> mcp_server.py ──HTTP──> 127.0.0.1:7788 (常驻服务，跑模型)
 ```
 
-**为什么不在 MCP 进程里直接跑模型**：实测每个新进程的首次 CUDA 卷积固定要
+**为什么不在 MCP 进程里直接跑模型**：CUDA 后端下，每个新进程的首次卷积固定要
 **~35 秒**（cuDNN 要为 113 个卷积层逐一枚举算法，8GB 卡上换 `EXHAUSTIVE` /
 `HEURISTIC`、开关 `cudnn_conv_use_max_workspace` 都绕不过）。宿主会反复拉起
 MCP 进程，每次都吃半分钟，工具调用的超时都撑不到。
 
 所以推理在常驻服务里做一次、一直活着；MCP 进程只管转发，启动是毫秒级。
-服务没起来时 MCP 会自动把它拉起来（首次约 35 秒预热），之后就都是几十到几百毫秒。
+服务没起来时 MCP 会自动把它拉起来（CUDA 首次约 35 秒、DirectML 约 2 秒），
+之后就都是几十到几百毫秒。
+
+DirectML 后端没有那个 35 秒问题（建会话 1.5 秒、首次推理直接就是稳态速度），
+但常驻的结构照旧 —— 换后端不该动架构，而且常驻还省掉了每次调用重读 77MB 模型的 IO。
 
 常驻服务用 `DETACHED_PROCESS` 启动，**独立于 MCP 进程的生命周期**：宿主重启
 MCP 不会杀掉预热好的服务，下次直接可用。
@@ -98,15 +102,18 @@ cua_driver_native__click(scope="desktop", x=128, y=20)  →  菜单精确展开
 
 不需要改任何源码来适配机器——下面这些都由 `src/ui_locate/config.py` 在运行时探测：
 
-- **GPU**：装了 CUDA 版 ONNX Runtime 就自动用 `CUDAExecutionProvider`，
-  否则退回 CPU（`UI_LOCATE_PROVIDER=cpu` 可强制）。
+- **推理后端**：按 `UI_LOCATE_PROVIDER` 走，默认 `auto` —— 装的是 CUDA 版
+  ONNX Runtime 就用 `CUDAExecutionProvider`，否则有 `DmlExecutionProvider`
+  就用它（Windows 默认安装走这条，AMD / Intel 显卡都能用），再没有就退回 CPU。
+  想固定可以设成 `cuda` / `dml` / `cpu`。
 - **检测模型**：默认文件名 `omniparser_icon_detect_yolo11m.onnx`（80.3 MB，YOLO11-medium），
   按 `UI_LOCATE_MODEL` → `UI_LOCATE_MODEL_DIR` → 状态目录 `models/` → 几个常见位置
   的顺序查找；全都没有时报错并给出下载地址。
 - **OCR**：RapidOCR 3.x，模型随包，**固定走 CPU**（GPU 上反而慢 5 倍，见性能章节）。
 - **Python**：3.12。`onnxruntime-gpu` 的 wheel 只发到 cp313，3.14 装不上。
 
-参考实测机器（8GB 显存的笔记本独显）：单块检测 11 ms，整屏定位 0.5~2 秒。
+参考实测（8GB 显存的笔记本独显）：单块检测 **DirectML 10.1 ms / CUDA 10.8 ms / CPU 176 ms**，
+整屏定位 0.5~2 秒。
 
 ## 安装
 
@@ -130,12 +137,25 @@ pwsh -File <插件目录>\scripts\bootstrap.ps1
 | 东西 | 大小 | 位置 | 怎么改 |
 |------|------|------|--------|
 | 代码 + 补丁 | 约 500 KB | profile 的 `node_modules/ui-locate-mcp/` | DSH 管，别动 |
-| venv + 依赖 | **CPU 档约 0.3 GB / CUDA 档约 1.8 GB** | `$UI_LOCATE_HOME/venv` | `UI_LOCATE_HOME` 或 `-HomeDir` |
+| venv + 依赖 | **DirectML 约 130 MB / CUDA 约 1.8 GB / 纯 CPU 约 60 MB** | `$UI_LOCATE_HOME/venv` | `UI_LOCATE_HOME` 或 `-HomeDir` |
 | 检测模型 | 77 MB | `$UI_LOCATE_MODEL_DIR` | `UI_LOCATE_MODEL_DIR` 或 `-ModelDir` |
 | 日志 | 几十 KB | `$UI_LOCATE_HOME/` | 同上 |
 
 **不要塞进包里**：venv 光 CUDA 运行库就有 1.5 GB，随包下发意味着每次装插件
 都得拖一份 GB 级的东西。所以「装插件」和「准备环境」是两步。
+
+**默认装的是 DirectML 后端**（`onnxruntime-directml` 一个 wheel 24 MB，自带
+`DirectML.dll`，不依赖系统里装没装 DirectML）。要 CUDA 就加 `-Cuda`，要纯
+CPU 就加 `-CpuOnly`。两个都别加就是 DirectML。
+
+⚠ 三个 ORT wheel（`onnxruntime` / `onnxruntime-directml` / `onnxruntime-gpu`）
+**都提供同一个 `onnxruntime` 顶层包**，装两个就互相覆盖 —— 后装的赢，而且不报错。
+所以换后端别在现有 venv 上叠着装，删掉 venv 重跑 `bootstrap.ps1`。
+
+```powershell
+pwsh -File <插件目录>\scriptsootstrap.ps1 -Cuda      # NVIDIA 卡，约 1.8 GB
+pwsh -File <插件目录>\scriptsootstrap.ps1 -CpuOnly   # 没有独显 / 只想省空间
+```
 
 **已经有模型的话别下第二份**。脚本按「先找现成的、找不到才下」走：
 
@@ -210,11 +230,10 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 | `UI_LOCATE_HOME` | 状态目录（模型 / 日志） | `$DSH_HOME/ui-locate`，再退回 `%LOCALAPPDATA%\ui-locate` |
 | `UI_LOCATE_HOST` / `UI_LOCATE_PORT` | 服务监听 | `127.0.0.1` / `7788` |
 | `UI_LOCATE_BASE` | 客户端连接的地址 | `http://<host>:<port>` |
-| `UI_LOCATE_PROVIDER` | `auto` / `cuda` / `cpu` | `auto` |
+| `UI_LOCATE_PROVIDER` | `auto` / `cuda` / `dml` / `cpu` | `auto` |
 | `UI_LOCATE_MIN_EDGE` | 跳过空白块的边缘密度下限 | `0.0008` |
 | `UI_LOCATE_MAX_SIDE` | 分块时每块长边 | `960` |
 | `UI_LOCATE_OCR_CUDA` | `1` 让 OCR 也走 GPU | 关 |
-| `UI_LOCATE_CPU_ONLY` | `1` 装 Python 侧时不带 `[cuda]` extras | 关 |
 | `DSH_UI_LOCATE_UPDATE_API` | 换掉查版本的 GitHub API 地址（自建镜像 / 离线测试） | `https://api.github.com` |
 | `DSH_UI_LOCATE_UPDATE_DELAY_MS` | 启动后隔多久查第一次 | `8000` |
 
@@ -322,6 +341,16 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 
 ## 实测性能（8GB 显存笔记本独显，1567×881 截图）
 
+三种后端跑同一个 640×640 检测（20 次取中位）：
+
+| 后端 | 中位 | 建会话 | 备注 |
+|------|------|--------|------|
+| **DirectML** | **10.1 ms** | 1.5 s | 走独显；AMD / Intel 显卡同样可用 |
+| CUDA | 10.8 ms | 35 s（首次） | 需要 `-Cuda` 安装，1.8 GB |
+| CPU | 176 ms | 0.2 s | 兜底 |
+
+DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽略。
+
 | 模式 | 检测 | OCR | 合计 |
 |------|------|-----|------|
 | 单块 + OCR | 15.8 ms | 424 ms | **440 ms** |
@@ -343,7 +372,7 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | 副屏 1920×1080 | 6 | 145 ms | 60 |
 | 合计（`monitor=all`） | 18 | 468 ms | 86~112 |
 
-- 单块检测 15.8 ms 是纯 GPU 极限（模型输入 640×640）。
+- 单块检测 15.8 ms 是纯 GPU 极限（模型输入 640×640）；DirectML 上同样输入是 10.1 ms。
 - 分块模式把小图标找回（单块检出 21 个，分块检出 23 个），代价约 45 ms。
 - OCR 是瓶颈且**必须走 CPU**：PP-OCR 模型太小，CUDA 上小图搬运开销
   反而慢 5 倍（2135 ms vs 442 ms）。
@@ -365,9 +394,10 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 
 ## 必须知道的坑
 
-1. **每个新进程的首次 CUDA 推理约 35 秒**。cuDNN 要为 113 个卷积层逐一枚举算法，
+1. **CUDA 下每个新进程的首次推理约 35 秒**。cuDNN 要为 113 个卷积层逐一枚举算法，
    换 `EXHAUSTIVE` / `HEURISTIC`、开关 `cudnn_conv_use_max_workspace` 都绕不过。
-   唯一解法是**常驻服务**：预热一次，进程活着就一直快。
+   唯一解法是**常驻服务**：预热一次，进程活着就一直快。DirectML 没有这个问题
+   （建会话约 1.5 秒），所以默认后端选 DirectML 的机器上手体验更好。
 2. **必须同时设 `os.add_dll_directory()` 和 `os.environ["PATH"]`**。ORT 的
    provider bridge 用 ALTERED_SEARCH_PATH 加载 CUDA dll，只加前者找不到依赖。
 3. **`rapidocr-onnxruntime` 会把 `onnxruntime-gpu` 换成 CPU 版**。装完要
@@ -424,6 +454,23 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
     包的 `node_modules` 里，报错正是这句）。要用工具就用自带的 `plugin/tool.mjs`，
     或者像 `dsh-ops` 那样直接 `ctx.tools.register()`。
 
+20. **DirectML 会因为 `allowzero=1` 整图编译失败，然后静默回退 CPU**。
+    Ultralytics 导出的 YOLO 里 8 个 `Reshape` 节点都带 `allowzero = 1`，而
+    DirectML EP 不支持这个 opset 14 属性。表现极具迷惑性：Python 侧只看到
+    `EP Error 'utf-8' codec can't decode byte 0xb2 ...`（真实错误是 UTF-16LE
+    的 `80070057 参数错误` 被当 UTF-8 读），而且**不抛异常**，只是
+    `get_providers()` 悄悄变成 `CPUExecutionProvider`。
+    所以判断 DML 有没有生效**只能看 `sess.get_providers()[0]`**，看有没有报错是不够的。
+
+    修法在 `src/ui_locate/dml_fix.py`：直接改模型字节，把 `allowzero = 1` 换成
+    `0`。该模型所有 shape 常量都不含 `0`，两种语义完全等价，所以改是安全的
+    （代码里会先检查，含 `0` 就抛 `UnsafeModel` 拒绝改）。补丁在**内存里**完成，
+    不落盘，也不引入 `onnx` 依赖（手写最小 protobuf 遍历）。
+
+    验证：改完 `实跑 provider = DmlExecutionProvider`，中位 10.1 ms；与 CPU 相比
+    最大绝对误差 5.8e-4（值域 0~654）。三个 ORT 版本（1.22 / 1.23 / 1.24）都有
+    这个问题，不是版本回归。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -441,6 +488,7 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | `src/ui_locate/server.py` | 常驻 HTTP 服务，跑模型 |
 | `src/ui_locate/screen.py` | **屏幕几何层**：DPI 感知、枚举显示器、按屏抓屏（唯一坐标权威） |
 | `src/ui_locate/detect.py` | 单块检测核心，letterbox + NMS + 反变换 |
+| `src/ui_locate/dml_fix.py` | **DirectML 兼容层**：改写导出模型里的 `allowzero`（详见坑 20） |
 | `src/ui_locate/tiled.py` | 分块检测（含智能分割：切缝对齐 + 跳空白块） |
 | `src/ui_locate/ocr_match.py` | 整页 OCR 与检测框做空间匹配、按文字查找、图标噪声剥离 |
 | `src/ui_locate/mosaic.py` | 裁片拼图 OCR（快 4 倍的路线） |
