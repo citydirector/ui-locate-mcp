@@ -6,9 +6,10 @@
 模型路径解析顺序（先命中者胜）：
   1. 环境变量 ``UI_LOCATE_MODEL``        —— 直接给 onnx 文件的绝对路径
   2. 环境变量 ``UI_LOCATE_MODEL_DIR``    —— 给目录，拼上默认文件名
-  3. 包目录下的 ``models/``
-  4. 几个常见模型根目录（见 ``_default_model_dirs``）
-  5. 都没有 → ``ModelNotFound``，附带下载指引
+  3. ``<状态目录>/runtime.json`` 里的 ``modelDir``  —— 设置页选的位置
+  4. 包目录下的 ``models/``
+  5. 几个常见模型根目录（见 ``_default_model_dirs``）
+  6. 都没有 → ``ModelNotFound``，附带下载指引
 
 环境变量一览：
   UI_LOCATE_HOME        状态目录根（模型 / 日志），见 ``state_dir``
@@ -23,10 +24,25 @@
   UI_LOCATE_MIN_EDGE     跳过空白块的边缘密度下限，默认 0.0008
   UI_LOCATE_MAX_SIDE     分块时每块长边，默认 960
   UI_LOCATE_OCR_CUDA     "1" 让 OCR 也走 GPU（多数情况更慢，见 README）
+
+关于 ``runtime.json``
+--------------------
+DSH 里，设置页是 **Host 侧插件**画的，而选定的目录最终要交给 **MCP 子进程**
+里的 Python 用。两边之间只有一条通路：MCP 客户端的 ``config.env``，而那段
+``!!js`` 是**启动时求值一次**的，改设置不会重新求值。
+
+所以插件在准备完环境后，把选择写进 ``<状态目录>/runtime.json``：
+
+    {"modelDir": "...", "backend": "directml", "home": "..."}
+
+Python 侧在解析模型目录和 provider 时会读它，放在环境变量之后、默认推导
+之前 —— 环境变量是「这一次手动覆盖」，runtime.json 是「上次在界面上选的」，
+后者不该压过前者。
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -76,12 +92,41 @@ class ModelNotFound(RuntimeError):
     """模型文件找不到时抛出，信息里带能照着做的指引。"""
 
 
+RUNTIME_FILE = "runtime.json"
+
+
+def runtime_settings() -> dict:
+    """读 `<状态目录>/runtime.json`；没有、坏了、不是对象都返回空字典。
+
+    这个文件由 DSH 插件的设置页写。读失败一律当成「没设过」——配置读不出来的
+    时候，退回默认推导比抛异常好得多，用户至少还能跑起来。
+    """
+    try:
+        raw = (state_dir() / RUNTIME_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _setting(name: str) -> str | None:
+    """取一个字符串型的设置；空串与其它类型都当没设。"""
+    value = runtime_settings().get(name)
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _default_model_dirs() -> list[Path]:
     """常见的模型存放位置。顺序即优先级，全部不存在也不报错。"""
     cands: list[Path] = []
     env_dir = os.environ.get("UI_LOCATE_MODEL_DIR")
     if env_dir:
         cands.append(Path(env_dir).expanduser())
+    chosen = _setting("modelDir")
+    if chosen:
+        cands.append(Path(chosen).expanduser())
     cands.extend(
         [
             state_dir() / "models",
@@ -149,7 +194,16 @@ def base_url() -> str:
 
 
 def provider() -> str:
-    return os.environ.get("UI_LOCATE_PROVIDER", DEFAULT_PROVIDER)
+    """这次用哪个后端。环境变量优先，其次 ``runtime.json`` 里选的。
+
+    设置页给的名字是 ``directml``（那是 pip 包名的后缀，用户看得懂），而
+    ONNX Runtime 那边叫 ``DmlExecutionProvider`` / ``dml``。这里做一次归一，
+    免得同一个后端有两个名字在代码里流窜。
+    """
+    env = os.environ.get("UI_LOCATE_PROVIDER")
+    raw = env if env else (_setting("backend") or DEFAULT_PROVIDER)
+    alias = {"directml": "dml", "dml": "dml", "cuda": "cuda", "cpu": "cpu", "auto": "auto"}
+    return alias.get(raw.strip().lower(), raw)
 
 
 def resolve_provider(want: str | None = None) -> str:

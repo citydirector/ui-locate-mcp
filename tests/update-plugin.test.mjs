@@ -19,7 +19,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -963,6 +963,51 @@ check("index：准备环境失败时返回 ok:false 而不是抛异常", async (
     if (realPython === undefined) delete process.env.UI_LOCATE_PYTHON
     else process.env.UI_LOCATE_PYTHON = realPython
     ctx._disposeAll()
+  }
+})
+
+// ── runtime.json：Host 与 Python 之间那一条唯一的路 ─────────────────────────
+//
+// 设置页是 Host 画的，模型目录却要交给 MCP 子进程里的 Python 用。中间只有
+// MCP 客户端的 `config.env`，而那段 `!!js` **只在启动时求值一次**——改了设置
+// 不重启子进程就读不到。所以插件把选择写进 `<状态目录>/runtime.json`，Python
+// 每次解析路径时现读。
+
+test("runtime：writeRuntimeSettings 写出的键与 Python 侧读的键一致", async () => {
+  const { writeRuntimeSettings } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    const ok = await writeRuntimeSettings(dir, { modelDir: "E:/models/x", backend: "directml" })
+    assert.equal(ok, true)
+    const parsed = JSON.parse(readFileSync(join(dir, "runtime.json"), "utf8"))
+    assert.deepEqual(parsed, { modelDir: "E:/models/x", backend: "directml" })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("runtime：空值不写进文件，免得 Python 把空串当成有效目录", async () => {
+  const { writeRuntimeSettings } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    await writeRuntimeSettings(dir, { modelDir: "", backend: "cpu" })
+    const parsed = JSON.parse(readFileSync(join(dir, "runtime.json"), "utf8"))
+    assert.deepEqual(parsed, { backend: "cpu" })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("runtime：目录建不出来时返回 false，不抛", async () => {
+  const { writeRuntimeSettings } = await import("../plugin/runtime.mjs")
+  // 拿一个已存在的**文件**当目录用，mkdir 必然失败。
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  const file = join(dir, "blocker")
+  writeFileSync(file, "x")
+  try {
+    assert.equal(await writeRuntimeSettings(file, { backend: "cpu" }), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 

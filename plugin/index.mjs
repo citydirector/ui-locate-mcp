@@ -57,7 +57,14 @@ import {
   syncPythonToBundle,
   venvPython,
 } from "./core.mjs"
-import { DEFAULT_BACKEND, bundledPythonCandidates, ensureRuntime, inspectRuntime, runtimePlan } from "./runtime.mjs"
+import {
+  DEFAULT_BACKEND,
+  bundledPythonCandidates,
+  ensureRuntime,
+  inspectRuntime,
+  runtimePlan,
+  writeRuntimeSettings,
+} from "./runtime.mjs"
 import { createApi } from "./api.mjs"
 
 export const name = "ui-locate-update"
@@ -274,6 +281,11 @@ export function apply(ctx, config) {
       },
       log: (line) => log(line),
     })
+    // 让 Python 侧也知道这次选在哪。MCP 子进程读不到设置页的配置（那段
+    // `!!js` 只在启动时求值一次），只能靠这个文件传话。
+    if (result.ok) {
+      await writeRuntimeSettings(target.home, { modelDir: target.modelDir, backend: target.backend })
+    }
     return { ...result, plan: target }
   }
 
