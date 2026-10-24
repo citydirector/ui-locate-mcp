@@ -31,7 +31,7 @@
 
 import { existsSync } from "node:fs"
 import z from "@deepseek-ai/schemastery"
-import { defineTool } from "@deepseek-ai/dsh-tools"
+import { defineTool } from "./tool.mjs"
 import {
   UPDATE_REPOSITORY,
   bundledPythonVersion,
@@ -216,25 +216,31 @@ export function apply(ctx, config) {
       description:
         "检查或安装 ui-locate 插件的新版本。action=check 只读 GitHub 的发布标签并报告版本差异；action=apply 会让 DSH 的插件管理器安装最新标签，并在新实例启动时同步 venv 里的 Python 包。apply 会改动本机已安装的插件。",
       parameters: {
-        action: {
-          type: "string",
-          description: "check（只检查，默认）或 apply（安装最新版本）",
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          action: {
+            type: "string",
+            description: "check（只检查，默认）或 apply（安装最新版本）",
+          },
         },
       },
       output: {
+        // 标准 JSON Schema：必填写在对象层的 required 数组里，不是属性层。
+        // 每个 object 节点都要显式 additionalProperties，否则宿主编译器
+        // 拒掉整份定义（见 README「必须知道的坑」第 16 条）。
         schema: {
           type: "object",
           additionalProperties: true,
           properties: {
-            version: { type: "string", required: true },
-            repository: { type: "string", required: true },
-            home: { type: "string", required: true },
-            // 每个 object 节点都必须显式写 additionalProperties，否则
-            // defineTool 的 schema 编译器会直接拒掉整份定义。
-            update: { type: "object", additionalProperties: true, required: true },
-            python: { type: "object", additionalProperties: true, required: true },
+            version: { type: "string" },
+            repository: { type: "string" },
+            home: { type: "string" },
+            update: { type: "object", additionalProperties: true },
+            python: { type: "object", additionalProperties: true },
             result: { type: "object", additionalProperties: true },
           },
+          required: ["version", "repository", "home", "update", "python"],
         },
         render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
       },

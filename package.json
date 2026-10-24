@@ -19,6 +19,7 @@
     "cordis.patch.yml",
     "plugin/index.mjs",
     "plugin/core.mjs",
+    "plugin/tool.mjs",
     "locale/*.json",
     "icon.svg",
     "pyproject.toml",

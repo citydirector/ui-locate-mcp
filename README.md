@@ -393,6 +393,12 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
     最小桩（`tests/stubs.mjs`），它能验证自己写的逻辑，但**验不了 DSH 的 schema
     规则**——真 `defineTool` 有几十行约束是桩复刻不出来的。想验真实约束，从
     `app.asar` 里解出真包再跑（见 `experiments/`）。
+19. **插件里不要 import `@deepseek-ai/dsh-tools`**。这个包在宿主自己的 `app.asar`
+    里，而 DSH 只往 `profiles/<名字>/node_modules/@deepseek-ai/` 下放 `cosmokit`
+    与 `schemastery` 两个包。插件里写这句 import，装上那一刻就
+    `ERR_MODULE_NOT_FOUND`，整个插件起不来（实测：把同一份文件放进一个只有这两个
+    包的 `node_modules` 里，报错正是这句）。要用工具就用自带的 `plugin/tool.mjs`，
+    或者像 `dsh-ops` 那样直接 `ctx.tools.register()`。
 
 ## 文件
 
@@ -401,6 +407,7 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | `package.json` | **bundle 声明**：`dsh.bundle.patch` 指向 `cordis.patch.yml`，`exports` 暴露 locale 与图标 |
 | `cordis.patch.yml` | bundle 的 patch：`insert` 一个 `@deepseek-ai/dsh-mcp-client` 连接项 + 一个本包 Host 插件行 |
 | `plugin/index.mjs` | **Host 插件**：版本检查、安装新版本、把 venv 里的 Python 包同步过去 |
+| `plugin/tool.mjs` | 本仓库自带的 `defineTool`：宿主那几条会让插件起不来的硬规则都在这里 |
 | `plugin/core.mjs` | 上者的纯逻辑（版本比较、发布源、venv 同步、状态机），不依赖 Cordis，可直接用 node 测 |
 | `market-index.json` | 插件市场索引（format 1），在线导入的入口 |
 | `locale/{en,zh}.json` | 插件列表里显示的标题与描述 |

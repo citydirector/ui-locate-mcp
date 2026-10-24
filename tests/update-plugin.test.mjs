@@ -6,10 +6,12 @@
  * 覆盖两层：
  *  - `plugin/core.mjs`：纯逻辑，外部世界（fetch / exec / 时钟）全部注入，
  *    所以这里能测到失败路径、超时、以及「uv 不存在时退回 pip」这类分支。
- *  - `plugin/index.mjs`：接线层。用最小桩顶替 `@deepseek-ai/dsh-tools` 与
- *    `@deepseek-ai/schemastery`（见 `node_modules/` 下那两个桩），然后拿一个
- *    假 ctx 去跑 `apply()`，确认工具真的注册了、inject 声明对了、开关真的
- *    会停掉 timer。
+ *  - `plugin/index.mjs`：接线层。只用最小桩顶替 `@deepseek-ai/schemastery`
+ *    （见 `node_modules/` 下那个桩），然后拿一个假 ctx 去跑 `apply()`，确认
+ *    工具真的注册了、inject 声明对了、开关真的会停掉 timer。
+ *  - `plugin/tool.mjs`：本仓库自己的 `defineTool`。它把宿主那几条硬规则
+ *    （`additionalProperties` 必须显式、实参要校验）搬了进来，所以这里直接
+ *    测——不需要桩，也就不存在「桩抄漏一条」的风险。
  *
  * 一条纪律：**任何测试都不许打真实网络**。默认的 `fetch` 已经被
  * `DSH_UI_LOCATE_UPDATE_API` 指到 `127.0.0.1:9`，所有检查都被显式传
@@ -658,7 +660,13 @@ check("index：apply 注册了 ui_locate_update 并声明输出形状", async ()
     for (const field of ["version", "repository", "home", "update", "python"]) {
       assert.ok(schema.properties[field], `输出必须有 ${field}`)
     }
-    assert.deepEqual(schema.properties.version.required, true)
+    // 标准 JSON Schema：必填写在对象层的 required 数组里。
+    assert.deepEqual(schema.required, ["version", "repository", "home", "update", "python"])
+    // 每个 object 节点都要显式 additionalProperties，宿主那边漏写会直接拒掉。
+    for (const field of ["update", "python"]) {
+      assert.equal(schema.properties[field].additionalProperties, true, `${field} 缺 additionalProperties`)
+    }
+    assert.equal(schema.additionalProperties, true)
     // presentCall 要给得出东西，否则 UI 会空
     const presented = tool.presentCall({ action: "check" })
     assert.equal(presented.title, "ui_locate_update")
@@ -827,4 +835,132 @@ check("index：apply 在拿到 pluginManager 后会把 spec 交出去", async ()
 test("全部用例已跑完", () => {
   assert.equal(failed, 0, `失败 ${failed} 条`)
   assert.ok(passed > 0, "一条都没跑起来")
+})
+
+// ── 自带的 defineTool ───────────────────────────────────────────────────────
+//
+// 这组测试的对象是 `plugin/tool.mjs`，不是 DSH 的实现。它存在的理由：官方
+// `defineTool` 在 `@deepseek-ai/dsh-tools` 里，而那个包**不在插件能解析到的
+// 位置**（profile 的 `node_modules/@deepseek-ai/` 下只有 cosmokit 与
+// schemastery），插件里 import 它会在装上那一刻 ERR_MODULE_NOT_FOUND。所以
+// 本仓库自己实现一份，并把宿主那几条会让插件起不来的硬规则一起搬进来。
+
+test("tool：漏写 additionalProperties 的 object 当场报错", async () => {
+  const { defineTool } = await import("../plugin/tool.mjs")
+  assert.throws(
+    () =>
+      defineTool({
+        name: "x",
+        parameters: { type: "object", additionalProperties: false, properties: {} },
+        // 顶层写全、只有嵌套那个漏写，这样报错里只会出现一个位置。
+        output: {
+          schema: {
+            type: "object",
+            additionalProperties: true,
+            properties: { a: { type: "object" } },
+          },
+          render: () => [],
+        },
+        execute: async () => ({}),
+      }),
+    /^TypeError: unsupported JSON schema: schema\.properties\.a\.additionalProperties must be explicitly true or false$/,
+  )
+})
+
+test("tool：嵌套 object 也要求 additionalProperties", async () => {
+  const { defineTool } = await import("../plugin/tool.mjs")
+  assert.throws(
+    () =>
+      defineTool({
+        name: "x",
+        parameters: { type: "object", additionalProperties: false, properties: {} },
+        output: {
+          schema: {
+            type: "object",
+            additionalProperties: true,
+            properties: { outer: { type: "object", additionalProperties: true, properties: { inner: { type: "object" } } } },
+          },
+          render: () => [],
+        },
+        execute: async () => ({}),
+      }),
+    /schema\.properties\.outer\.properties\.inner\.additionalProperties/,
+  )
+})
+
+test("tool：output 缺 render 报错", async () => {
+  const { defineTool } = await import("../plugin/tool.mjs")
+  assert.throws(
+    () =>
+      defineTool({
+        name: "x",
+        parameters: { type: "object", additionalProperties: false, properties: {} },
+        output: { schema: { type: "object", additionalProperties: true } },
+        execute: async () => ({}),
+      }),
+    /must declare output \{ schema, render \}/,
+  )
+})
+
+test("tool：timeoutMs 必须是正有限数", async () => {
+  const { defineTool } = await import("../plugin/tool.mjs")
+  const make = (timeoutMs) =>
+    defineTool({
+      name: "x",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      output: { schema: { type: "object", additionalProperties: true }, render: () => [] },
+      timeoutMs,
+      execute: async () => ({}),
+    })
+  assert.throws(() => make(0), /timeoutMs must be a positive finite number/)
+  assert.throws(() => make(-1), /timeoutMs must be a positive finite number/)
+  assert.throws(() => make(Number.NaN), /timeoutMs must be a positive finite number/)
+  assert.equal(make(1000).timeoutMs, 1000)
+})
+
+test("tool：execute 之前按 parameters 校验实参", async () => {
+  const { defineTool, ToolArgsError } = await import("../plugin/tool.mjs")
+  const tool = defineTool({
+    name: "x",
+    description: "d",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: { action: { type: "string" } },
+      required: ["action"],
+    },
+    output: { schema: { type: "object", additionalProperties: true }, render: () => [] },
+    async execute(args) {
+      return { got: args.action }
+    },
+  })
+  // 正常路径
+  assert.deepEqual(await tool.execute({ action: "check" }), { got: "check" })
+  // 类型错
+  await assert.rejects(() => tool.execute({ action: 1 }), (error) => {
+    assert.ok(error instanceof ToolArgsError)
+    assert.match(error.message, /"action" must be a string/)
+    return true
+  })
+  // 必填缺失
+  await assert.rejects(() => tool.execute({}), /"action" is required/)
+  // 传了非对象
+  await assert.rejects(() => tool.execute("nope"), /arguments must be an object/)
+})
+
+test("tool：返回的定义只有宿主认得的字段", async () => {
+  const { defineTool } = await import("../plugin/tool.mjs")
+  const tool = defineTool({
+    name: "x",
+    description: "d",
+    parameters: { type: "object", additionalProperties: false, properties: {} },
+    output: { schema: { type: "object", additionalProperties: true }, render: () => [] },
+    presentCall: () => ({ card: "generic" }),
+    execute: async () => ({}),
+  })
+  // 多一个 __tool 之类的字段宿主不管，但这里刻意不带——带了就说明是桩的残留。
+  assert.deepEqual(
+    Object.keys(tool).sort(),
+    ["description", "execute", "name", "output", "parameters", "presentCall"],
+  )
 })
