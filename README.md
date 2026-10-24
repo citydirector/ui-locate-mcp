@@ -171,8 +171,9 @@ pwsh -File <插件目录>\scripts\bootstrap.ps1 -Status       # 只看现状，�
 `bootstrap.ps1` 需要系统里有 uv 或 python；**设置页里那条路不需要**，它直接用
 DSH 自带的 Python，也绕开了「PATH 里那个 python 是 Microsoft Store 存根」这类麻烦。
 
-模型查找顺序是 `UI_LOCATE_MODEL` → `UI_LOCATE_MODEL_DIR` → 状态目录 `models/`
-→ 包内 `models/` → `~/myLocalModels/ui-locate` → 当前目录 `models/`。
+模型查找顺序是 `UI_LOCATE_MODEL` → `UI_LOCATE_MODEL_DIR` → 设置页里选的目录
+→ 状态目录 `models/` → 包内 `models/` → `~/myLocalModels/ui-locate` → 当前目录
+`models/`。
 
 #### Agent 也能自己修环境
 
@@ -252,6 +253,26 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 
 设置页里填的目录会覆盖上表里 `UI_LOCATE_HOME` / `UI_LOCATE_MODEL_DIR` 的默认值，
 但不改动环境变量本身 —— 它存在 profile 的插件配置里，换 DSH 版本不会丢。
+
+设置页那三个值（运行目录 / 模型目录 / 后端）在准备环境成功后会同时写进
+`<运行目录>/runtime.json`：
+
+```json
+{
+  "modelDir": "D:\\myLocalModels\\ui-locate",
+  "backend": "directml"
+}
+```
+
+**为什么要多这一份文件。** 设置页是 Host 侧插件画的，而目录最终要给 MCP
+子进程里的 Python 用。中间唯一的通路是 MCP 客户端的 `config.env`，可那段
+`!!js` **只在启动时求值一次** —— 改完设置不重启子进程，Python 永远读不到。
+文件没有这个问题：Python 每次解析路径都现读，所以改完点「准备环境」，下一次
+工具调用就生效。
+
+**优先级仍然是环境变量在前**，所以「临时指定一下」和「在界面上选定」互不干扰：
+想覆盖文件，就把 `UI_LOCATE_MODEL_DIR` / `UI_LOCATE_PROVIDER` 设上。文件坏了
+或者内容不是对象，一律当成没设过。
 
 ## 自动更新
 
@@ -340,7 +361,7 @@ python tests\check_bundle.py
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 插件行为测试（60 例：纯逻辑、接线层、JSON Schema 硬规则）
+# 插件行为测试（63 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json）
 node --test tests/
 ```
 
@@ -602,6 +623,20 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     `curl` 则要 `--noproxy '*'`。**别拿「这台机器没设代理」当理由省掉这个参数**
     ——换个环境、或者用户开了 Clash/系统代理，这条就会以完全不同的面貌回来。
 
+27. **设置页选的东西传不到 MCP 子进程，除非你落个文件**。
+
+    `cordis.patch.yml` 里给 MCP 客户端写的 `env` 是 `!!js` 表达式，而它**只在
+    启动时求值一次**。用户在设置页把模型目录从 A 改成 B，子进程不会重启，于是
+    它一辈子都按 A 找，报 `ModelNotFound`，而界面上明明显示 B。这类「界面说
+    一套、进程做一套」的问题最难查——两边各自看起来都是对的。
+
+    解法不是想办法重启子进程，而是**别把配置放在只在启动时读一次的地方**：
+    插件准备完环境后写 `<运行目录>/runtime.json`，Python 每次解析路径时现读
+    （`config.runtime_settings()`）。环境变量仍然优先，所以临时覆盖照样好使；
+    文件坏了或者内容不是对象，一律当成没设过。
+
+    写失败不影响功能，只是退回默认推导——也就是没设过时的行为。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -619,7 +654,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `locale/{en,zh}.json` | 插件列表里显示的标题与描述 |
 | `icon.svg` | 插件图标（≤256 KiB，必须留在包内） |
 | `src/ui_locate/mcp_server.py` | **MCP 入口**（FastMCP + stdio），薄客户端 + 自动拉起服务 |
-| `src/ui_locate/config.py` | **运行期配置层**：模型路径、端口、provider、各类阈值的唯一来源 |
+| `src/ui_locate/config.py` | **运行期配置层**：模型路径、端口、provider、各类阈值的唯一来源；`runtime.json` 也在这里读（见坑 27） |
 | `src/ui_locate/server.py` | 常驻 HTTP 服务，跑模型 |
 | `src/ui_locate/screen.py` | **屏幕几何层**：DPI 感知、枚举显示器、按屏抓屏（唯一坐标权威） |
 | `src/ui_locate/detect.py` | 单块检测核心，letterbox + NMS + 反变换 |

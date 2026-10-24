@@ -425,6 +425,44 @@ export async function ensureRuntime({
   return { ok: true, steps, plan }
 }
 
+/** 这个文件叫这个名字，Python 侧的 `config.RUNTIME_FILE` 必须一致。 */
+export const RUNTIME_FILE = "runtime.json"
+
+/**
+ * 把这次的选择写进 `<状态目录>/runtime.json`，让 Python 侧也能看见。
+ *
+ * ## 为什么需要这个文件
+ *
+ * DSH 里，设置页是 **Host 侧插件**画的，而目录最终要交给 **MCP 子进程**里的
+ * Python 用。两边之间唯一的通路是 MCP 客户端的 `config.env`，但那段 `!!js`
+ * 是**启动时求值一次**的 —— 用户在设置页改了模型目录，MCP 子进程不会重启，
+ * 也就永远读不到新值。结果就是：设置页显示模型在 A，Python 却在默认位置找
+ * 不到，报 `ModelNotFound`。
+ *
+ * 写文件没有这个问题：Python 每次解析路径时现读。环境变量仍然优先，所以
+ * 「临时指定一下」和「在界面上选定」互不干扰。
+ *
+ * 写失败不算失败：最坏情况只是 Python 退回默认推导，而那正是没设过时的行为。
+ *
+ * @param home - 状态目录。
+ * @param values - `{ modelDir, backend }`。
+ * @returns 写成功与否，只用于日志。
+ */
+export async function writeRuntimeSettings(home, { modelDir, backend } = {}) {
+  if (typeof home !== "string" || home === "") return false
+  const payload = {}
+  if (typeof modelDir === "string" && modelDir !== "") payload.modelDir = modelDir
+  if (typeof backend === "string" && backend !== "") payload.backend = backend
+  try {
+    const { mkdir, writeFile } = await import("node:fs/promises")
+    await mkdir(home, { recursive: true })
+    await writeFile(join(home, RUNTIME_FILE), `${JSON.stringify(payload, null, 2)}\n`, "utf8")
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * 只读地看一眼现状，不动任何东西。设置页打开时先调这个。
  *
