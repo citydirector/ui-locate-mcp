@@ -19,7 +19,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -1006,6 +1006,49 @@ test("runtime：目录建不出来时返回 false，不抛", async () => {
   writeFileSync(file, "x")
   try {
     assert.equal(await writeRuntimeSettings(file, { backend: "cpu" }), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("runtime：ensureRuntime 在 pip 已可用时扫掉遗留的 pip wheel", async () => {
+  // 老版本会在状态目录里留下 pip-<版本>.whl，已经装好环境的人不会重走
+  // bootstrapPip，所以清理必须挂在「pip 已可用」这条分支上。这里用注入的
+  // exec 造一个「venv 与 pip 都在」的假环境，只为验证那个文件被删掉。
+  const { ensureRuntime, venvPython } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    const home = join(dir, "home")
+    // 用包自己那套路径规则，测试在哪跑都成立。
+    const python = venvPython(home)
+    mkdirSync(join(python, ".."), { recursive: true })
+    writeFileSync(python, "")
+    writeFileSync(join(home, "pip-26.2.2.whl"), "fake")
+    writeFileSync(join(home, "keep-me.txt"), "user file")
+
+    // 假 exec：三件事要回话——版本号（建完 venv 后问一次）、pip 版本、
+    // 其余一律成功。execFile 的回调是 (error, stdout, stderr)，给的是字符串
+    // 不是对象。venv 已存在，所以不会真的去跑 `python -m venv`。
+    const exec = (file, args, options, callback) => {
+      const done = typeof options === "function" ? options : callback
+      let text = ""
+      if (args.includes("--version")) text = "pip 26.2.2\n"
+      else if (args.join(" ").includes("sys.version")) text = "3.12.13\n"
+      setTimeout(() => done(null, text, ""), 0)
+    }
+    const result = await ensureRuntime({
+      home,
+      modelDir: join(dir, "models"),
+      pythonExe: python,
+      packageRoot: dir,
+      backend: "cpu",
+      exec,
+      // venv 的解释器和模型都当作已存在：前者跳过建 venv，后者跳过下载。
+      exists: (path) => path === python || path.endsWith(".onnx"),
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(existsSync(join(home, "pip-26.2.2.whl")), false, "遗留的 wheel 应该被删掉")
+    assert.equal(existsSync(join(home, "keep-me.txt")), true, "别的文件不能碰")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
