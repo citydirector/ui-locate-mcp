@@ -171,6 +171,25 @@ else:
                 bad("客户端入口没有走 window.__ModuleLoader__.load，DSH 载入不到")
             else:
                 ok("走 __ModuleLoader__.load 注册")
+            # 注册 id 必须等于包名。client-modules 的 arrive() 拿包名去查
+            # `this.factories.has(id)`，对不上就抛 `loaded without registering
+            # "<包名>"`；那条错误只出现在浏览器控制台，宿主侧一切正常，设置页
+            # 里就是干脆没有这一栏——极难查，所以在这里卡住。
+            m = re.search(
+                r"__ModuleLoader__\s*\.\s*load\s*\(\s*\{[^}]*?\bid\s*:\s*['\"]([^'\"]+)['\"]",
+                text,
+                re.S,
+            )
+            if m is None:
+                bad("没能从 __ModuleLoader__.load({...}) 里读出 id")
+            elif m.group(1) != pkg["name"]:
+                bad(
+                    f"__ModuleLoader__.load 的 id 是 {m.group(1)!r}，"
+                    f"但包名是 {pkg['name']!r}——两者必须完全一致，"
+                    "否则客户端模块永远注册不上，设置页不会出现"
+                )
+            else:
+                ok(f"注册 id 与包名一致（{pkg['name']}）")
             for field in ("exports.apply", "exports.inject"):
                 if field.split(".")[1] not in text:
                     warn(f"客户端入口没出现 {field}，确认是否由别处赋值")

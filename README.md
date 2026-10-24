@@ -637,6 +637,26 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 
     写失败不影响功能，只是退回默认推导——也就是没设过时的行为。
 
+28. **`__ModuleLoader__.load({id})` 的 id 必须等于包名，不是插件短名**。
+
+    `client.js` 里我把 `id` 写成 `'ui-locate'`（顺手、也符合直觉），而包名是
+    `ui-locate-mcp`。宿主侧一切正常：Host 半身跑起来了、工具都在、`/api/ui-locate/*`
+    也回 200，只有设置里**那一栏从头到尾没出现过**。
+
+    机制在 `@deepseek-ai/dsh-client-modules` 的 `arrive()`：它拿着**包名**去查
+
+    ```js
+    if (this.factories.has(id)) return "registered"
+    failures.push(`${url}: loaded without registering "${id}" via __ModuleLoader__.load`)
+    ```
+
+    名字对不上 → 每个 URL 都试一遍 → 抛 `could not load "ui-locate-mcp"`。而这条
+    错误**只进浏览器控制台**，宿主日志里一个字都没有。所以「设置页不出现」这个
+    症状，在宿主侧查多久都查不出来。
+
+    教训：**界面那一半出了问题，先看浏览器控制台，不要只看宿主日志。**
+    `tests/check_bundle.py` 的 `[4c]` 现在会直接比对这个 id 与包名。
+
 ## 文件
 
 | 文件 | 作用 |
