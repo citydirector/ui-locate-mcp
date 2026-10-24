@@ -61,7 +61,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/citydirector/ui-locate-mcp",
-            "commit": "1dec5494a39544cf22ed0336d712d9d6e2d3140e"
+            "commit": "8ce8aeab64356de87ba98e2f08579461166eba1b"
           }
         }
       ]
