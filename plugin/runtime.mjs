@@ -28,7 +28,7 @@
  * 真建 venv，也不需要网络。
  */
 
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 
 /** 检测模型在 HuggingFace 上的地址与落盘名。 */
@@ -483,6 +483,36 @@ export async function writeRuntimeSettings(home, { modelDir, backend } = {}) {
     return true
   } catch {
     return false
+  }
+}
+
+/**
+ * 读回上次写下的选择。
+ *
+ * 写出去却读不回来，是这条通路最容易漏的一半：界面按配置里的默认值渲染，
+ * 而 Python 按 `runtime.json` 里的值找模型，两边各说一套。用户上次明明把
+ * 模型指到了 `D:\myLocalModels\ui-locate`（那里已经有 77MB 的现成模型），
+ * 界面却显示默认目录并说「模型缺失」，点一下又重新下一份。
+ *
+ * 容错口径与 Python 侧一致：文件不在、不是 JSON、不是对象、字段不是非空
+ * 字符串，一律当没设过。
+ *
+ * @param home - 状态目录。
+ * @returns `{ modelDir?, backend? }`，读不到就是空对象。
+ */
+export function readRuntimeSettings(home) {
+  if (typeof home !== "string" || home === "") return {}
+  try {
+    const parsed = JSON.parse(readFileSync(join(home, RUNTIME_FILE), "utf8"))
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {}
+    const out = {}
+    for (const field of ["modelDir", "backend"]) {
+      const value = parsed[field]
+      if (typeof value === "string" && value !== "") out[field] = value
+    }
+    return out
+  } catch {
+    return {}
   }
 }
 

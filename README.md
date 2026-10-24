@@ -361,7 +361,7 @@ python tests\check_bundle.py
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 插件行为测试（64 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json）
+# 插件行为测试（66 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json 的写与读）
 node --test tests/
 ```
 
@@ -657,6 +657,24 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     教训：**界面那一半出了问题，先看浏览器控制台，不要只看宿主日志。**
     `tests/check_bundle.py` 的 `[4c]` 现在会直接比对这个 id 与包名。
 
+29. **写出去的东西要读回来，否则界面和进程各说一套**。
+
+    坑 27 讲了为什么要把设置页的选择写进 `runtime.json`。但只写不读，等于
+    把同一个问题换个方向又犯一次：`plan()` 从插件配置与默认值算路径，而
+    `runtime.json` 里躺着用户上次选的真实位置——两边不一致时，界面显示
+    「模型缺失」、「准备环境」按钮亮着，而 `D:\myLocalModels\ui-locate`
+    里那份 77MB 的现成模型被完全忽略，点一下就是重新下一份。
+
+    `readRuntimeSettings()` 把文件读回 `plan()` 的优先级链：
+
+    ```
+    本次显式传入 > 插件配置 > runtime.json > 默认值
+    ```
+
+    这里还有一个 `??` 与 `||` 的陷阱：插件配置的字段默认值是**空串**，
+    而 `"" ?? x` 得到的是 `""`——`??` 只在 `null`/`undefined` 时让位。
+    所以这条链必须用 `||`。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -691,7 +709,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `scripts/serve.ps1` | 手动起停常驻服务 / 查状态 |
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
-| `tests/update-plugin.test.mjs` | 插件行为测试（64 例，`node --test tests/`） |
+| `tests/update-plugin.test.mjs` | 插件行为测试（66 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
 

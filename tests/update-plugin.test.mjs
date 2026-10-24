@@ -1011,6 +1011,47 @@ test("runtime：目录建不出来时返回 false，不抛", async () => {
   }
 })
 
+// 写出去却读不回来，是这条通路最容易漏的一半：界面按默认值渲染、Python 按
+// 文件里的值找模型，两边各说一套——用户明明把模型指到现成的那一份，界面却
+// 说「模型缺失」，点一下又重新下载 77MB。
+
+test("runtime：readRuntimeSettings 读回写出去的键", async () => {
+  const { readRuntimeSettings, writeRuntimeSettings } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    await writeRuntimeSettings(dir, { modelDir: "D:/myLocalModels/ui-locate", backend: "directml" })
+    assert.deepEqual(readRuntimeSettings(dir), {
+      modelDir: "D:/myLocalModels/ui-locate",
+      backend: "directml",
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("runtime：readRuntimeSettings 对缺失 / 坏文件 / 错类型一律当没设过", async () => {
+  const { readRuntimeSettings } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    assert.deepEqual(readRuntimeSettings(dir), {})
+    assert.deepEqual(readRuntimeSettings(""), {})
+
+    writeFileSync(join(dir, "runtime.json"), "{ 不是 json")
+    assert.deepEqual(readRuntimeSettings(dir), {})
+
+    writeFileSync(join(dir, "runtime.json"), "[1,2,3]")
+    assert.deepEqual(readRuntimeSettings(dir), {})
+
+    writeFileSync(join(dir, "runtime.json"), JSON.stringify({ modelDir: 42, backend: "cpu" }))
+    assert.deepEqual(readRuntimeSettings(dir), { backend: "cpu" })
+
+    writeFileSync(join(dir, "runtime.json"), JSON.stringify({ modelDir: "", backend: "" }))
+    assert.deepEqual(readRuntimeSettings(dir), {})
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("runtime：ensureRuntime 在 pip 已可用时扫掉遗留的 pip wheel", async () => {
   // 老版本会在状态目录里留下 pip-<版本>.whl，已经装好环境的人不会重走
   // bootstrapPip，所以清理必须挂在「pip 已可用」这条分支上。这里用注入的
