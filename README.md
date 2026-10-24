@@ -717,6 +717,47 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     而 `"" ?? x` 得到的是 `""`——`??` 只在 `null`/`undefined` 时让位。
     所以这条链必须用 `||`。
 
+30. **回包前不读请求体，会把 keep-alive 连接毒化**。
+
+    `Handler` 里 `protocol_version = "HTTP/1.1"`，响应又带 `Content-Length`，
+    于是连接会被复用。只要有一条请求的 body 没读完，那些字节就留在 socket
+    里，**下一条请求的请求行从它们中间开始解析**。
+
+    实测形态非常迷惑：同一条连接上先 `POST /nope`（body `{}`）拿到 404，
+    再 `POST /act` 收到
+
+    ```
+    501 Unsupported method ('{}POST')
+    ```
+
+    方法名里混着上一条请求的 body。httpx 默认复用连接，所以任何客户端都会
+    踩到，不是边角情况。修法是把「读干净」放在回包出口（`_send` 里调
+    `_drain()`），而不是散在十几个分支里——「记得每个分支都要读」这种事
+    迟早会漏，而漏一次就让连接坏掉。
+
+    顺带补上 `Transfer-Encoding: chunked`：只看 `Content-Length` 的话，
+    分块编码的请求体会被当成「没有 body」，这是同一种污染，只是入口不同。
+
+31. **挂在 `self` 上的请求体缓存必须按请求重置**。
+
+    坑 30 修完之后立刻冒出这个：`BaseHTTPRequestHandler` 在 keep-alive
+    连接上**复用同一个实例**跑 `handle_one_request()` 的循环，所以
+    `self._body_cache` 会跨请求活着。不清就会读到上一条请求的体。
+
+    表现比坑 30 更难推：同一条连接上 `POST /nope {"a":1}` 之后再
+    `POST /act {"action":"wait"}`，后者报
+
+    ```
+    需要 text（按文字找）或 x 与 y（直接给坐标）
+    ```
+
+    ——连接没坏、状态码也正常（400 而非 501），只有内容对不上，看着像业务
+    校验出错。修法是覆写 `handle_one_request()`，在 `super()` 之前把缓存
+    清掉：这是**唯一**保证每条请求都经过、且在所有 `do_*` 之前的入口。
+
+    这两个坑都有回归检查：`tests/check_http.py`（5 项），需要真起服务、
+    真复用一条 TCP 连接，所以不能并进纯逻辑的 `test_act.py`。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -754,6 +795,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
 | `tests/test_act.py` | 动作编排测试（62 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
+| `tests/check_http.py` | HTTP 层回归检查（5 项）—— keep-alive 复用与 chunked 请求体（详见坑 30、31） |
 | `tests/update-plugin.test.mjs` | 插件行为测试（66 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |

@@ -253,7 +253,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:  # 静默访问日志
         pass
 
+    def handle_one_request(self) -> None:
+        """每条请求开始时清掉上一条读到的 body。
+
+        `BaseHTTPRequestHandler` 在 keep-alive 连接上**复用同一个实例**跑
+        `handle_one_request()` 的循环，所以挂在 `self` 上的 `_body_cache`
+        会跨请求活着。不清就会拿到上一条请求的体：实测形态是同一条连接上
+        `POST /nope {"a":1}` 之后再 `POST /act {"action":"wait"}`，后者报
+        「需要 text（按文字找）或 x 与 y（直接给坐标）」—— 它读到的是
+        `{"a": 1}`。
+
+        这类 bug 很难从表象推回去：连接没坏、状态码也正常（400 而非 501），
+        只有内容对不上。放在这里重置，是因为这是**唯一**保证每条请求都经过
+        且在所有 `do_*` 之前的入口。
+        """
+        self._body_done = False
+        self._body_cache = b""
+        super().handle_one_request()
+
     def _send(self, code: int, obj: dict) -> None:
+        # 回包前一律把请求体读干净。放在出口上而不是各个分支里，是因为
+        # 「记得每个分支都要读」这种事迟早会漏 —— 而漏一次就让连接坏掉。
+        # 已经读过的话 _body() 直接返回缓存，不会二次读流，代价为零。
+        # 细节与实测形态见 _drain()。
+        self._drain()
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -431,8 +454,69 @@ class Handler(BaseHTTPRequestHandler):
         return act_mod.act(data, **common)
 
     def _body(self) -> bytes:
-        n = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(n) if n else b""
+        """读请求体。**必须读干净**，理由见 `_drain` 的注释。
+
+        支持 `Transfer-Encoding: chunked`：只看 `Content-Length` 的话，分块
+        编码的请求体会被当成「没有 body」，于是 `json.loads(b"")` 抛
+        JSONDecodeError、同时那些 chunk 字节全留在 socket 里 —— 与 404 分支
+        不读 body 是同一种污染，只是入口不同。
+
+        读到的东西缓存住：`_send` 会再看一眼有没有读完，而 `rfile` 是流，
+        第二次 `read(n)` 会一直等到下一条请求的数据才返回。
+        """
+        if getattr(self, "_body_done", False):
+            return getattr(self, "_body_cache", b"")
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            data = self._read_chunked()
+        else:
+            n = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(n) if n > 0 else b""
+        self._body_done = True
+        self._body_cache = data
+        return data
+
+    def _read_chunked(self) -> bytes:
+        """按 chunked 编码逐块读到 0 长度块为止。"""
+        out: list[bytes] = []
+        while True:
+            line = self.rfile.readline(65537)
+            if not line:
+                break
+            size_text = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_text, 16)
+            except ValueError:
+                break
+            if size == 0:
+                # 吃掉 trailer（如果有）直到空行
+                while True:
+                    tail = self.rfile.readline(65537)
+                    if tail in (b"\r\n", b"\n", b""):
+                        break
+                break
+            out.append(self.rfile.read(size))
+            self.rfile.read(2)  # 每块后面跟一个 CRLF
+        return b"".join(out)
+
+    def _drain(self) -> None:
+        """把请求体读掉再回包。
+
+        为什么非做不可：本类 `protocol_version = "HTTP/1.1"`，响应带
+        `Content-Length`，于是连接会被 keep-alive 复用。只要有一条请求的
+        body 没读完，那些字节就留在 socket 里，**下一条请求的请求行会从它们
+        中间开始**。
+
+        实测形态非常迷惑：同一条连接上先 `POST /nope`（带 body `{}`）拿到
+        404，再 `POST /act` 就会收到
+        `501 Unsupported method ('{}POST')` —— 方法名里混着上一条的 body。
+        httpx 默认复用连接，所以这不是边角情况，任何客户端都会踩到。
+
+        代价是 404 分支会多读几个字节；换来的是连接可以安全复用。
+        """
+        try:
+            self._body()
+        except Exception:  # noqa: BLE001 - 读不干净也不能把回包挡住
+            self.close_connection = True
 
     def _image_from(self, raw: bytes) -> np.ndarray:
         """从 JSON {"path"} 或原始图片字节取图。"""

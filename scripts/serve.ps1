@@ -25,9 +25,26 @@ $ErrorActionPreference = 'Stop'
 
 # 插件根目录 = 本脚本上一级。不写死路径，插件放到哪都能用。
 $root = Split-Path -Parent $PSScriptRoot
-$logDir = Join-Path $root '.cache'
-$pyw = Join-Path $root '.venv\Scripts\pythonw.exe'
-$py  = Join-Path $root '.venv\Scripts\python.exe'
+
+# venv 在哪？**不在这里**。venv 跟着状态目录走（跟 bootstrap.ps1 严格同序），
+# 因为便携版 DSH 不希望把几百 MB 的依赖堆在 C 盘、也不希望它躺在插件包里
+# （插件更新会整个替换 node_modules，venv 放里面每次都得重装）。
+#   1. $env:UI_LOCATE_HOME
+#   2. $env:DSH_HOME\ui-locate
+#   3. %LOCALAPPDATA%\ui-locate
+#   4. $HOME/.local/share/ui-locate
+# 以前这里写死 $root\.venv，装了插件再跑本脚本就报 missing —— 实际环境早就
+# 建在状态目录里了。
+$home2 = $env:UI_LOCATE_HOME
+if (-not $home2 -and $env:DSH_HOME) { $home2 = Join-Path $env:DSH_HOME 'ui-locate' }
+if (-not $home2) {
+    $home2 = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'ui-locate' }
+             else { Join-Path $HOME '.local/share/ui-locate' }
+}
+$venv = Join-Path $home2 'venv'
+$logDir = $home2                       # 日志也进状态目录，别在插件包里留 .cache
+$pyw = Join-Path $venv 'Scripts\pythonw.exe'
+$py  = Join-Path $venv 'Scripts\python.exe'
 
 # 端口优先级：命令行 -Port > 环境变量 UI_LOCATE_PORT > 默认 7788
 if ($Port -le 0) {
