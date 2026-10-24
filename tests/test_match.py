@@ -107,6 +107,76 @@ class RankingTests(unittest.TestCase):
         self.assertEqual([h["text"] for h in hits], ["插件"])
 
 
+class ProbeHitTests(unittest.TestCase):
+    """`server._probe_hit` 的两条防线（动手路径专用）。
+
+    这两条是互补的，缺一条都会重现那次事故：
+      - mosaic 漏框 → 那段文字根本没进 OCR → 只能往下降档；
+      - 降档后若不拒绝 contains，就会点到别的窗口上去。
+
+    所以这里既验「回退」，也验「拒绝」，还验「不该回退的时候别白跑」。
+    不加载模型、不抓屏：把 detect_monitors 换成假函数，只观察调用序列。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from ui_locate import server  # noqa: F401
+        except Exception as exc:              # pragma: no cover - 环境缺依赖时跳过
+            raise unittest.SkipTest(f"server 层依赖不全，跳过：{exc}")
+
+    def setUp(self):
+        from ui_locate import server as S
+        self.S = S
+        self.calls = []
+        self.items = {"mosaic": [], "full": []}
+        self._saved = S.detect_monitors
+
+        def fake(monitor, conf, iou, tiled, max_side, overlap, text, text_mode, smart):
+            self.calls.append(text_mode)
+            return self.items[text_mode], {"monitors": [], "total_ms": 0.0}
+
+        S.detect_monitors = fake
+
+        class Bare(S.Handler):
+            def __init__(self):
+                pass
+
+        self.handler = Bare()
+
+    def tearDown(self):
+        self.S.detect_monitors = self._saved
+
+    def test_mosaic_miss_falls_back_to_full(self):
+        self.items["mosaic"] = [item("视觉定位MCP插件开发", cx=1153, cy=1056, conf=0.55)]
+        self.items["full"] = [item("插件", cx=434, cy=256, conf=0.54)]
+        hit = self.handler._probe_hit("插件", {"text_mode": "mosaic"})
+        self.assertEqual(self.calls, ["mosaic", "full"])
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["cx"], 434)
+        self.assertEqual(hit["match_tier"], "exact")
+
+    def test_contains_only_is_refused_on_both_passes(self):
+        loose = [item("视觉定位MCP插件开发", cx=1153, cy=1056, conf=0.55)]
+        self.items["mosaic"] = list(loose)
+        self.items["full"] = list(loose)
+        hit = self.handler._probe_hit("插件", {"text_mode": "mosaic"})
+        self.assertEqual(self.calls, ["mosaic", "full"])
+        self.assertIsNone(hit, "只剩 contains 档时必须返回 None，宁可不点")
+
+    def test_direct_hit_does_not_pay_for_full(self):
+        self.items["mosaic"] = [item("插件", cx=434, cy=256, conf=0.44)]
+        hit = self.handler._probe_hit("插件", {"text_mode": "mosaic"})
+        self.assertEqual(self.calls, ["mosaic"], "已经找到就别再多跑一次 full")
+        self.assertEqual(hit["cx"], 434)
+
+    def test_explicit_full_is_not_repeated(self):
+        self.items["full"] = [item("视觉定位MCP插件开发", cx=1153, cy=1056)]
+        hit = self.handler._probe_hit("插件", {"text_mode": "full"})
+        self.assertEqual(self.calls, ["full"], "已经用 full 找过，不该再跑第二遍")
+        self.assertIsNone(hit)
+
+
 class PurityTests(unittest.TestCase):
     """`find` 不该改调用方的数据 —— 调用方常常要拿同一份 elements 反复查。"""
 
