@@ -124,6 +124,30 @@ cua_driver_native__click(scope="desktop", x=128, y=20)  →  菜单精确展开
 pwsh -File <插件目录>\scripts\bootstrap.ps1
 ```
 
+这一步会往**用户级目录**写东西，不在插件目录里，因为 bundle 装在
+`node_modules` 深处、换版本时整目录会被替换。位置由下面几条决定（先命中者胜）：
+
+| 东西 | 大小 | 位置 | 怎么改 |
+|------|------|------|--------|
+| 代码 + 补丁 | 约 500 KB | profile 的 `node_modules/ui-locate-mcp/` | DSH 管，别动 |
+| venv + 依赖 | **CPU 档约 0.3 GB / CUDA 档约 1.8 GB** | `$UI_LOCATE_HOME/venv` | `UI_LOCATE_HOME` 或 `-HomeDir` |
+| 检测模型 | 77 MB | `$UI_LOCATE_MODEL_DIR` | `UI_LOCATE_MODEL_DIR` 或 `-ModelDir` |
+| 日志 | 几十 KB | `$UI_LOCATE_HOME/` | 同上 |
+
+**不要塞进包里**：venv 光 CUDA 运行库就有 1.5 GB，随包下发意味着每次装插件
+都得拖一份 GB 级的东西。所以「装插件」和「准备环境」是两步。
+
+**已经有模型的话别下第二份**。脚本按「先找现成的、找不到才下」走：
+
+```powershell
+# 指向已有的模型目录（或直接给文件的绝对路径用 UI_LOCATE_MODEL）
+pwsh -File <插件目录>\scripts\bootstrap.ps1 -ModelDir D:\myLocalModels\ui-locate
+```
+
+模型查找顺序是 `UI_LOCATE_MODEL` → `UI_LOCATE_MODEL_DIR` → 状态目录 `models/`
+→ 包内 `models/` → `~/myLocalModels/ui-locate` → 当前目录 `models/`。
+`bootstrap.ps1 -Status` 会把实际用的 `home` / `models` / `venv` / `model` 全打出来。
+
    实际路径取决于插件被装到哪里；也可以直接 `cd` 到插件目录后跑
    `pwsh -File .\scripts\bootstrap.ps1`。
 
@@ -182,7 +206,7 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 | 变量 | 作用 | 默认 |
 |------|------|------|
 | `UI_LOCATE_MODEL` | 模型 onnx 绝对路径 | 自动查找 |
-| `UI_LOCATE_MODEL_DIR` | 模型目录 | 自动查找 |
+| `UI_LOCATE_MODEL_DIR` | 模型目录（`bootstrap.ps1 -ModelDir` 对应它） | 状态目录 `models/` |
 | `UI_LOCATE_HOME` | 状态目录（模型 / 日志） | `$DSH_HOME/ui-locate`，再退回 `%LOCALAPPDATA%\ui-locate` |
 | `UI_LOCATE_HOST` / `UI_LOCATE_PORT` | 服务监听 | `127.0.0.1` / `7788` |
 | `UI_LOCATE_BASE` | 客户端连接的地址 | `http://<host>:<port>` |
