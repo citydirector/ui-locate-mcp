@@ -361,7 +361,7 @@ python tests\check_bundle.py
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 插件行为测试（63 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json）
+# 插件行为测试（64 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json）
 node --test tests/
 ```
 
@@ -671,7 +671,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `scripts/serve.ps1` | 手动起停常驻服务 / 查状态 |
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
-| `tests/update-plugin.test.mjs` | 插件行为测试（60 例，`node --test tests/`） |
+| `tests/update-plugin.test.mjs` | 插件行为测试（64 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
 

@@ -284,6 +284,26 @@ export async function bootstrapPip(python, home, version, {
   return { ok: true, pip: check.stdout.trim().split("\n")[0] }
 }
 
+/**
+ * 扫掉运行目录里遗留的 pip wheel。
+ *
+ * 早期版本的 `bootstrapPip` 装完 pip 不删这个文件，于是 1.8 MB 的
+ * `pip-26.2.2.whl` 就永久躺在用户的状态目录里。已经装过环境的人不会重走
+ * `bootstrapPip`，所以清理要单独挂在「pip 已可用」这条分支上。
+ *
+ * 只认 `pip-<数字>.whl` 这个形状，别的文件一概不碰——这是用户目录。
+ */
+async function dropStaleWheels(home) {
+  try {
+    const { readdir, rm } = await import("node:fs/promises")
+    for (const name of await readdir(home)) {
+      if (/^pip-\d+(\.\d+)*\.whl$/.test(name)) await rm(join(home, name), { force: true })
+    }
+  } catch {
+    /* 删不掉就算了，不影响功能 */
+  }
+}
+
 /** 读 venv 里 Python 的版本号；拿不到就返回 undefined，不抛。 */
 async function pythonVersion(exec, python) {
   const result = await run(exec, python, ["-c", "import sys;print(sys.version.split()[0])"])
@@ -371,6 +391,9 @@ export async function ensureRuntime({
   // ── 2. pip ─────────────────────────────────────────────────────────────────
   const hasPip = await run(exec, python, ["-m", "pip", "--version"])
   if (hasPip.ok) {
+    // 老版本装 pip 时会把 wheel 留在运行目录里（那时还没有下面那句清理）。
+    // 走到这里说明 pip 可用，那个文件纯属垃圾，顺手扫掉。
+    await dropStaleWheels(plan.home)
     done("pip", { ok: true, reused: true, version: hasPip.stdout.trim().split("\n")[0] })
   } else {
     const bootstrapped = await bootstrapPip(python, plan.home, version, {
