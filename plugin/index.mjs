@@ -113,6 +113,32 @@ export function apply(ctx, config) {
     current = values
   }
 
+  /**
+   * 递归去掉值为 `undefined` 的键。
+   *
+   * 工具返回值要过 `validateJsonSchemaValue` 的「无损 JSON」检查，而
+   * `undefined` 不是合法 JSON 值——只要有一处漏出来，整个返回值就被判成
+   * `INVALID_TOOL_OUTPUT`，工具调用直接失败。而这个返回值里到处是「可能
+   * 读不到」的东西：版本号、venv 里的包版本、上次查到的最新标签、安装
+   * 结果里的 `application` 与 `restartReason`。所以与其在每个赋值处记得
+   * 判断，不如在出口统一扫一遍。
+   *
+   * 数组里的元素保留位置（`undefined` 变成 `null`），因为数组的下标是有
+   * 意义的；对象里的键直接删掉，让字段自然缺席。
+   *
+   * @param value - 任意 JSON 形状的值。
+   * @returns 不含 `undefined` 的同构值。
+   */
+  function lossless(value) {
+    if (Array.isArray(value)) return value.map((item) => (item === undefined ? null : lossless(item)))
+    if (value === null || typeof value !== "object") return value
+    const out = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (item !== undefined) out[key] = lossless(item)
+    }
+    return out
+  }
+
   /** venv 里 Python 侧的三项事实，给状态文档用。 */
   async function pythonFacts() {
     const home = stateDir()
@@ -203,9 +229,11 @@ export function apply(ctx, config) {
             version: { type: "string", required: true },
             repository: { type: "string", required: true },
             home: { type: "string", required: true },
-            update: { type: "object", required: true },
-            python: { type: "object", required: true },
-            result: { type: "object" },
+            // 每个 object 节点都必须显式写 additionalProperties，否则
+            // defineTool 的 schema 编译器会直接拒掉整份定义。
+            update: { type: "object", additionalProperties: true, required: true },
+            python: { type: "object", additionalProperties: true, required: true },
+            result: { type: "object", additionalProperties: true },
           },
         },
         render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
@@ -213,14 +241,20 @@ export function apply(ctx, config) {
       async execute(args) {
         const action = String(args?.action ?? "check")
         if (action !== "check" && action !== "apply") {
-          return { ...(await statusDocument()), result: { ok: false, error: `unknown action: ${action}` } }
+          return lossless({
+            ...(await statusDocument()),
+            result: { ok: false, error: `unknown action: ${action}` },
+          })
         }
         if (action === "check") {
           if (current?.updateCheck !== false) await tracker.check()
-          return { ...(await statusDocument()), result: { ok: true, action } }
+          return lossless({ ...(await statusDocument()), result: { ok: true, action } })
         }
         const installed = await installLatest()
-        return { ...(await statusDocument()), result: { ok: installed.ok !== false, action, ...installed } }
+        return lossless({
+          ...(await statusDocument()),
+          result: { ok: installed.ok !== false, action, ...installed },
+        })
       },
       presentCall: (args) => ({ card: "generic", title: "ui_locate_update", rawInput: args }),
     }),

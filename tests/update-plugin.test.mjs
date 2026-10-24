@@ -733,6 +733,49 @@ check("index：apply 时 python 一栏反映真实 venv 状态", async () => {
   }
 })
 
+/**
+ * 递归找值为 `undefined` 的键。
+ *
+ * DSH 按「无损 JSON」校验工具返回值，`undefined` 不是合法 JSON 值：只要有一处
+ * 漏出来，整个返回值就被判成 `INVALID_TOOL_OUTPUT`，调用直接失败。这个断言就是
+ * 把那条规则搬进测试，免得又一次在装进 DSH 之后才发现。
+ */
+function undefinedPaths(value, path = "") {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) =>
+      item === undefined ? [`${path}[${index}]`] : undefinedPaths(item, `${path}[${index}]`),
+    )
+  }
+  if (value === null || typeof value !== "object") return []
+  const found = []
+  for (const [key, item] of Object.entries(value)) {
+    const here = path === "" ? key : `${path}.${key}`
+    if (item === undefined) found.push(here)
+    else found.push(...undefinedPaths(item, here))
+  }
+  return found
+}
+
+check("index：venv 没建时返回值里也不能有 undefined", async () => {
+  const plugin = await import("../plugin/index.mjs")
+  const ctx = fakeCtx()
+  // 指到一个不存在的目录，逼出「版本读不到」的路径——那正是 undefined 的来源。
+  const before = process.env.UI_LOCATE_HOME
+  process.env.UI_LOCATE_HOME = join(tmpdir(), "ui-locate-不存在-" + Date.now())
+  try {
+    plugin.apply(ctx, plugin.Config({ updateCheck: false, pythonSync: false }))
+    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
+    for (const action of ["check", "apply", "bogus"]) {
+      const value = await tool.execute({ action })
+      assert.deepEqual(undefinedPaths(value), [], `action=${action} 的返回值里有 undefined`)
+    }
+  } finally {
+    if (before === undefined) delete process.env.UI_LOCATE_HOME
+    else process.env.UI_LOCATE_HOME = before
+    ctx._disposeAll()
+  }
+})
+
 check("index：apply 在没有 pluginManager 时也能起来", async () => {
   const plugin = await import("../plugin/index.mjs")
   const ctx = fakeCtx()

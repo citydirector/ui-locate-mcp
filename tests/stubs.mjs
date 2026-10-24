@@ -83,21 +83,52 @@ const TOOLS_PKG = {
   exports: { ".": "./index.mjs" },
 }
 
-const TOOLS_SRC = `/**
- * dsh-tools 的最小桩。
- *
- * 真实现做两件事：校验 timeoutMs、把 parameters 规格翻成 JSON Schema，然后
- * 把整份 options 交回给注册方。测试要从外面拿到工具定义去调用 execute，所以
- * 这里直接返回 options，只保留 timeoutMs 那条校验。
- */
-
-export function defineTool(options) {
-  if (options.timeoutMs !== undefined && !(Number.isFinite(options.timeoutMs) && options.timeoutMs > 0)) {
-    throw new TypeError("timeoutMs must be a positive finite number")
-  }
-  return { ...options, __tool: true }
-}
-`
+// 桩源码用数组拼，避免在模板字符串里再嵌一层反引号与 ${}。
+const TOOLS_SRC =
+  [
+    "/**",
+    " * dsh-tools 的最小桩。",
+    " *",
+    " * 真实现会把 parameters / output.schema 编译成受约束的 JSON Schema，再包一层",
+    " * 参数与输出的校验。测试要从外面拿到工具定义去调用 execute，所以这里直接返回",
+    " * options —— 但**两条真实规则必须复刻**，否则本仓库会漏掉真实的失败：",
+    " *",
+    " *   1. 每个 object 节点都要显式写 additionalProperties（true 或 false），漏写",
+    " *      真实现直接抛错、整个插件起不来。",
+    " *   2. timeoutMs 必须是正有限数。",
+    " *",
+    " * 这两条都是实际踩到过的（见 README 的「必须知道的坑」），只靠最小桩会一路绿",
+    " * 到装进 DSH 才炸。",
+    " */",
+    "",
+    "/** 递归核对 schema 里每个 object 节点都写了 additionalProperties。 */",
+    "function checkSchema(node, path) {",
+    "  if (!node || typeof node !== \"object\" || Array.isArray(node)) return",
+    "  if (node.type === \"object\") {",
+    "    if (typeof node.additionalProperties !== \"boolean\") {",
+    "      throw new TypeError(",
+    "        `unsupported JSON schema: ${path}.additionalProperties must be explicitly true or false`,",
+    "      )",
+    "    }",
+    "    for (const [key, child] of Object.entries(node.properties ?? {})) {",
+    "      checkSchema(child, `${path}.properties.${key}`)",
+    "    }",
+    "  }",
+    "  if (node.type === \"array\" && node.items) checkSchema(node.items, `${path}.items`)",
+    "  for (const [index, branch] of (node.oneOf ?? []).entries()) {",
+    "    checkSchema(branch, `${path}.oneOf[${index}]`)",
+    "  }",
+    "}",
+    "",
+    "export function defineTool(options) {",
+    "  if (options.timeoutMs !== undefined && !(Number.isFinite(options.timeoutMs) && options.timeoutMs > 0)) {",
+    "    throw new TypeError(\"timeoutMs must be a positive finite number\")",
+    "  }",
+    "  checkSchema(options.output?.schema, \"schema\")",
+    "  return { ...options, __tool: true }",
+    "}",
+    "",
+  ].join("\n")
 
 /** 写一个桩包；已存在就不覆盖（免得每次跑测试都重写文件）。 */
 function install(root, name, pkg, source) {

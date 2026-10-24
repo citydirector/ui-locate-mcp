@@ -380,6 +380,19 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
     导致「完全相等」匹配永远不成立，精确查询降级成模糊查询就点偏了。
     `ocr_match._strip_icon_noise()` 在匹配前剥掉首尾噪声字符（只剥首尾不动中间，
     剥空则退回原串）。
+16. **工具返回的 object 必须显式写 `additionalProperties`**。DSH 的 schema 编译器
+    对每个 object 节点都要求 `additionalProperties: true` 或 `false`，漏写会抛
+    `unsupported JSON schema: ... must be explicitly true or false`，整个插件起不来。
+    顶层不例外，嵌套的 `update` / `python` 也一样。
+17. **工具返回值里不能有 `undefined`**。校验器按「无损 JSON」判，`undefined` 不是
+    合法 JSON 值——一处漏出来整个返回值就被判成 `INVALID_TOOL_OUTPUT`，调用直接
+    失败。而这个插件返回的到处是「可能读不到」的字段（版本号、venv 里的包版本、
+    上次查到的最新标签、安装结果里的 `application`）。出口统一过一遍
+    `lossless()`，别指望每处赋值都记得判断。
+18. **`node_modules` 里的 `@deepseek-ai` 桩不能当成真包**。本仓库测试用现场生成的
+    最小桩（`tests/stubs.mjs`），它能验证自己写的逻辑，但**验不了 DSH 的 schema
+    规则**——真 `defineTool` 有几十行约束是桩复刻不出来的。想验真实约束，从
+    `app.asar` 里解出真包再跑（见 `experiments/`）。
 
 ## 文件
 
