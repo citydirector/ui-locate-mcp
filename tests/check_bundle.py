@@ -151,6 +151,38 @@ else:
             else:
                 ok(f"{row_id}: exports['.'] -> {entry.relative_to(PKG)}")
 
+# ── 客户端半身（dsh.client）────────────────────────────────────────────────
+print("\n[4c] 客户端半身")
+client = (pkg.get("dsh") or {}).get("client")
+if client is None:
+    warn("没有 dsh.client：设置页那一半不会出现（Host 工具仍然可用）")
+else:
+    exports = pkg.get("exports") or {}
+    if "./client" not in exports:
+        bad("声明了 dsh.client，但 exports 里没有 './client'——DSH 会报 client-modules 错")
+    else:
+        entry = PKG / str(exports["./client"]).lstrip("./")
+        if not entry.is_file():
+            bad(f"exports['./client'] 指向的 {entry.relative_to(PKG)} 不存在")
+        else:
+            ok(f"exports['./client'] -> {entry.relative_to(PKG)}（{entry.stat().st_size} 字节）")
+            text = entry.read_text(encoding="utf-8")
+            if "__ModuleLoader__.load" not in text:
+                bad("客户端入口没有走 window.__ModuleLoader__.load，DSH 载入不到")
+            else:
+                ok("走 __ModuleLoader__.load 注册")
+            for field in ("exports.apply", "exports.inject"):
+                if field.split(".")[1] not in text:
+                    warn(f"客户端入口没出现 {field}，确认是否由别处赋值")
+    if client.get("platform") != "web":
+        bad(f"dsh.client.platform 必须是 'web'，现在是 {client.get('platform')!r}")
+    else:
+        ok("platform=web")
+    if "client.js" not in (pkg.get("files") or []):
+        bad("client.js 不在 files 白名单里，装出来会缺文件")
+    else:
+        ok("client.js 在 files 白名单里")
+
 # ── files 白名单里提到的文件是否都在 ────────────────────────────────────────
 print("\n[5] package.json 的 files 白名单")
 for pattern in pkg.get("files") or []:

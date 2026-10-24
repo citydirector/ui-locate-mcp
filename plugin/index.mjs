@@ -1,5 +1,5 @@
 /**
- * ui-locate 的 Host 侧插件：查新版本、装新版本、把 Python 侧同步过去。
+ * ui-locate 的 Host 侧插件：查新版本、装新版本、准备 Python 运行环境。
  *
  * ## 为什么 ui-locate 需要一个 Host 插件
  *
@@ -8,6 +8,15 @@
  * 管理器能装 JS/YAML 那部分，但**装不到 venv 里的 Python 包**——而那才是
  * 真正会改进的部分（算法、模型、OCR 参数）。所以需要一段 Host 代码同时
  * 管住两边。
+ *
+ * ## 三件事
+ *
+ * 1. **准备运行环境**（`runtime.mjs`）：venv、依赖、模型。用 DSH 自带的
+ *    Python，不要求用户先装 uv，也不需要终端。
+ * 2. **界面**（`api.mjs` + `client.js`）：设置里一页「运行环境」，能看见
+ *    装到哪一步、装在哪，并且能一键重来。
+ * 3. **自我更新**（`core.mjs`）：查 GitHub 的发布标签，装新版本，然后在
+ *    新一代实例启动时把 Python 侧同步过去。
  *
  * ## 更新是两段，顺序不能颠倒
  *
@@ -24,14 +33,18 @@
  * ## 只查不装
  *
  * `updateCheck` 默认开着，但检查本身**从不安装任何东西**——它只读 GitHub
- * 的 tag 列表并记下结论。安装必须由一次显式的工具调用触发。
+ * 的 tag 列表并记下结论。安装必须由一次显式的工具调用或界面上的按钮触发。
  *
- * 具体逻辑都在 `core.mjs`：那边一行 Cordis 都没有，可以直接用 node 测。
+ * 纯逻辑都在 `core.mjs` 与 `runtime.mjs`：那两个文件一行 Cordis 都没有，
+ * 可以直接用 node 测。
  */
 
-import { existsSync } from "node:fs"
+import { existsSync, statSync } from "node:fs"
+import { join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { execFile } from "node:child_process"
 import z from "@deepseek-ai/schemastery"
-import { defineTool } from "./tool.mjs"
+import { defineTool, ToolArgsError } from "./tool.mjs"
 import {
   UPDATE_REPOSITORY,
   bundledPythonVersion,
@@ -44,17 +57,22 @@ import {
   syncPythonToBundle,
   venvPython,
 } from "./core.mjs"
+import { DEFAULT_BACKEND, bundledPythonCandidates, ensureRuntime, inspectRuntime, runtimePlan } from "./runtime.mjs"
+import { createApi } from "./api.mjs"
 
 export const name = "ui-locate-update"
 
 /**
- * `tools` 必给：本插件要注册 `ui_locate_update`。
+ * `tools` 必给：本插件要注册两个工具。
  *
- * `pluginManager` **刻意不写进 inject**：它是可选能力，写进去会让整个插件
- * 在没有插件管理器的部署里直接起不来，连「查版本」都做不了。改为在 apply
- * 里用 `ctx.inject([...])` 按需拿。
+ * `pluginManager` 与 `webServer` **刻意不写进 inject**：都是可选能力，
+ * 写进去会让整个插件在没有它们的部署里直接起不来，连查版本都做不了。
+ * 改为在 apply 里用 `ctx.inject([...])` 按需拿。
  */
 export const inject = ["tools"]
+
+/** 包根目录：`plugin/` 的上一层，也就是被装进 node_modules 的那个目录。 */
+const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url))
 
 export const Config = z.object({
   updateCheck: z
@@ -67,12 +85,27 @@ export const Config = z.object({
     .default(true)
     .volatile()
     .description("发现 venv 里的 Python 包版本与包内 pyproject.toml 不一致时，自动重装到 venv。"),
+  runtimeDir: z
+    .string()
+    .default("")
+    .volatile()
+    .description("Python 环境与日志的存放目录。留空则跟随 DSH 数据目录（便携版在 data/ui-locate）。"),
+  modelDir: z
+    .string()
+    .default("")
+    .volatile()
+    .description("检测模型的存放目录。留空则跟随运行目录下的 models/。已有模型可以指过来，省一次 77MB 下载。"),
+  backend: z
+    .string()
+    .default(DEFAULT_BACKEND)
+    .volatile()
+    .description("推理后端：directml（默认，通用）或 cuda（仅 NVIDIA，快一点但多 1.7GB）或 cpu。"),
 })
 
 /**
- * 挂载更新检查，并注册一个让 Agent 能显式触发安装的工具。
+ * 挂载更新检查、运行环境准备与设置页接口。
  *
- * @param ctx - 插件上下文（`tools` 已注入；`pluginManager` 可选）。
+ * @param ctx - 插件上下文（`tools` 已注入）。
  * @param config - schema 解析后的 Config：每个字段一个 volatile 引用。
  */
 export function apply(ctx, config) {
@@ -80,6 +113,8 @@ export function apply(ctx, config) {
   let current
   /** 插件管理器，拿到之后才能安装；没有就只报告。 */
   let manager
+  /** webServer，拿到之后才有设置页接口；没有就只留工具。 */
+  let server
 
   const tracker = createUpdateTracker({
     // 测试与自建镜像都可以改这个地址；默认打公开的 GitHub。
@@ -106,11 +141,35 @@ export function apply(ctx, config) {
   function readConfig() {
     const parsed = config ?? Config({})
     const values = {}
-    for (const field of ["updateCheck", "pythonSync"]) {
+    for (const field of ["updateCheck", "pythonSync", "runtimeDir", "modelDir", "backend"]) {
       const ref = parsed[field]
       values[field] = ref !== undefined && typeof ref.get === "function" ? ref.get() : ref
     }
     current = values
+  }
+
+  /**
+   * 当前该用哪些位置。
+   *
+   * 每次现算而不是缓存：用户可能在设置页里刚改完就点安装，配置刷新是异步的。
+   * `defaultHome` 由 `stateDir()` 决定，也就是 `UI_LOCATE_HOME` →
+   * `DSH_HOME/ui-locate` → `LOCALAPPDATA/ui-locate` 那条链。
+   */
+  function plan(override = {}) {
+    const defaults = stateDir()
+    const resolved = runtimePlan({
+      home: override.home ?? current?.runtimeDir ?? "",
+      modelDir: override.modelDir ?? current?.modelDir ?? "",
+      defaultHome: defaults,
+      defaultModelDir: join(defaults, "models"),
+    })
+    return {
+      ...resolved,
+      backend: override.backend ?? current?.backend ?? DEFAULT_BACKEND,
+      defaultHome: defaults,
+      defaultModelDir: join(defaults, "models"),
+      venvPython: resolved.python,
+    }
   }
 
   /**
@@ -141,7 +200,7 @@ export function apply(ctx, config) {
 
   /** venv 里 Python 侧的三项事实，给状态文档用。 */
   async function pythonFacts() {
-    const home = stateDir()
+    const home = plan().home
     const python = venvPython(home)
     return {
       wanted: bundledPythonVersion(),
@@ -164,6 +223,67 @@ export function apply(ctx, config) {
       if (result.state !== "current" && result.state !== "missing") log(`python sync: ${JSON.stringify(result)}`)
       return result
     })
+  }
+
+  /** 只读地看一眼运行环境，给工具与设置页共用。 */
+  async function inspect(target = plan()) {
+    const facts = await inspectRuntime({
+      home: target.home,
+      modelDir: target.modelDir,
+      packageName: "ui-locate-mcp",
+      exec: execFile,
+      exists: existsSync,
+      statSize: (path) => {
+        try {
+          return statSync(path).size
+        } catch {
+          return undefined
+        }
+      },
+    })
+    return { ...facts, backend: facts.backend ?? undefined, wantedBackend: target.backend }
+  }
+
+  /**
+   * 真正去准备环境。设置页与工具都走这一条。
+   *
+   * @param target - `plan()` 的结果（可能带用户的覆盖）。
+   * @returns `ensureRuntime` 的结论，加上计划本身。
+   */
+  async function prepare(target, { force = false, onProgress } = {}) {
+    const report = (step, detail) => {
+      onProgress?.(step, detail)
+    }
+    report("查找 Python", "")
+    const pythonExe = pickPython()
+    if (pythonExe === undefined) {
+      return { ok: false, error: "找不到 DSH 自带的 Python 运行时", steps: [] }
+    }
+    report("准备中", "venv → 依赖 → 模型")
+    const result = await ensureRuntime({
+      home: target.home,
+      modelDir: target.modelDir,
+      pythonExe,
+      packageRoot: PACKAGE_ROOT,
+      backend: target.backend,
+      force,
+      exec: execFile,
+      onProgress: (written, total) => {
+        const mb = (written / (1 << 20)).toFixed(1)
+        report("下载模型", total > 0 ? `${mb} / ${(total / (1 << 20)).toFixed(1)} MB` : `${mb} MB`)
+      },
+      log: (line) => log(line),
+    })
+    return { ...result, plan: target }
+  }
+
+  /** DSH 自带的 Python。找不到就返回 undefined，让上层报一句人话。 */
+  function pickPython() {
+    const candidates = [process.env.UI_LOCATE_PYTHON, ...bundledPythonCandidates(process.execPath)]
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate !== "" && existsSync(candidate)) return candidate
+    }
+    return undefined
   }
 
   /**
@@ -279,6 +399,113 @@ export function apply(ctx, config) {
     }),
   )
 
+  /**
+   * 准备运行环境。装上插件就能调，不需要用户先开终端。
+   *
+   * 之所以做成工具而不只是界面上的按钮：Agent 自己也该能修好自己的环境。
+   * 首次调用要下 200MB 左右，所以超时给足。
+   */
+  ctx.tools.register(
+    defineTool({
+      name: "ui_locate_setup",
+      description:
+        "准备 ui-locate 的 Python 运行环境：建 venv、装依赖、下检测模型。首次约需下载 130MB 依赖与 77MB 模型。已就绪时直接返回现状；force=true 会删掉重装。会往磁盘写文件并启动 pip 子进程。",
+      timeoutMs: 1_800_000,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          force: { type: "boolean", description: "删掉现有的 venv 与模型重新装一遍，默认 false" },
+          home: { type: "string", description: "这次使用的运行目录，留空用配置里的值" },
+          modelDir: { type: "string", description: "这次使用的模型目录，留空用配置里的值" },
+          backend: { type: "string", description: "directml / cuda / cpu，留空用配置里的值" },
+        },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: true,
+          properties: {
+            ok: { type: "boolean" },
+            home: { type: "string" },
+            modelDir: { type: "string" },
+            backend: { type: "string" },
+            steps: { type: "array", items: { type: "object", additionalProperties: true } },
+            error: { type: "string" },
+            runtime: { type: "object", additionalProperties: true },
+          },
+          required: ["ok", "home", "modelDir", "backend"],
+        },
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
+      },
+      async execute(args) {
+        const target = plan({
+          home: typeof args?.home === "string" ? args.home : undefined,
+          modelDir: typeof args?.modelDir === "string" ? args.modelDir : undefined,
+          backend: typeof args?.backend === "string" ? args.backend : undefined,
+        })
+        const result = await prepare(target, { force: args?.force === true })
+        return lossless({
+          ok: result.ok === true,
+          home: target.home,
+          modelDir: target.modelDir,
+          backend: target.backend,
+          steps: result.steps ?? [],
+          error: result.error,
+          runtime: await inspect(target),
+        })
+      },
+      presentCall: (args) => ({ card: "generic", title: "ui_locate_setup", rawInput: args }),
+    }),
+  )
+
+  // ── 设置页接口 ────────────────────────────────────────────────────────────
+
+  const routing = createApi({
+    plan: () => plan(),
+    inspect: (target) => inspect(target),
+    setup: (target, { force, onProgress }) => prepare(target, { force, onProgress }),
+    logger: { warn: (line) => log(line) },
+  })
+
+  /**
+   * 把四条路由挂到 webServer 上。
+   *
+   * 前缀 `/api/ui-locate` 比内核自己的 `/api` 长，而 webServer 是「最长前缀
+   * 优先」，所以这些请求**绕过了内核的准入检查**——这就是为什么 `api.mjs`
+   * 里第一件事是自己过一遍信任栅栏，`connection` 服务每次请求现取。
+   *
+   * `webServer` 可能比本插件晚挂载，所以走 `ctx.inject` 而不是在 apply 时
+   * 读一次；读一次会永远拿到 `undefined`。
+   */
+  ctx.inject(["webServer"], (scoped) => {
+    server = scoped.webServer
+    scoped.effect(
+      () =>
+        server.register({
+          kind: "prefix",
+          path: "/api/ui-locate",
+          handler: (req, res) => routing(req, res, readConnection(scoped)),
+        }),
+      "ui-locate: settings routes",
+    )
+    scoped.effect(
+      () => () => {
+        server = undefined
+      },
+      "ui-locate: web server",
+    )
+  })
+
+  /** 每次请求现取 `connection`：它同样是晚挂载的，缓存会缓存到 undefined。 */
+  function readConnection(scoped) {
+    try {
+      return scoped.get("connection")
+    } catch {
+      return undefined
+    }
+  }
+
   // ── 挂载与生命周期 ────────────────────────────────────────────────────────
 
   // 插件管理器按需注入：没有它，检查照常，只是装不了。
@@ -316,3 +543,5 @@ export function apply(ctx, config) {
     "ui-locate: update timers",
   )
 }
+
+export { ToolArgsError }
