@@ -124,6 +124,33 @@ if "transport: stdio" in patch_text:
 else:
     warn("不是 stdio 传输，跳过 command 检查")
 
+# ── Host 插件行（可选，加了就必须合规）──────────────────────────────────────
+# 官方规则：patch 里插一行自己的插件时，`name` 要写**包名**，不能写 `./x.mjs`
+# 这样的相对路径。DSH 会把相对名解析成绝对 file URL，配置编辑器首次保存就
+# 把它写进用户 patch，便携版一搬目录就断。
+print("\n[4b] Host 插件行")
+rows = re.findall(r"-\s+id:\s*(\S+)\s*\n\s+name:\s*['\"]?([^'\"\n]+)['\"]?", patch_text)
+own_rows = [r for r in rows if r[1].strip() != "@deepseek-ai/dsh-mcp-client"]
+if not own_rows:
+    warn("patch 里没有自己的插件行（只有 MCP 客户端），自动更新不可用")
+else:
+    for row_id, row_name in own_rows:
+        row_name = row_name.strip()
+        if row_name.startswith(".") or "/" in row_name or "\\" in row_name:
+            bad(f"{row_id}: name 写成了路径 {row_name!r}，应当写包名")
+        elif row_name != pkg.get("name"):
+            warn(f"{row_id}: name={row_name!r} 与本包名 {pkg.get('name')!r} 不同，确认是独立包")
+        else:
+            ok(f"{row_id}: name={row_name}（包名，不是相对路径）")
+        if "." not in (pkg.get("exports") or {}):
+            bad(f"{row_id}: 用包名当插件名，但 exports 里没有 '.'，DSH 解析不到入口")
+        else:
+            entry = PKG / str(pkg["exports"]["."]).lstrip("./")
+            if not entry.is_file():
+                bad(f"{row_id}: exports['.'] 指向的 {entry.relative_to(PKG)} 不存在")
+            else:
+                ok(f"{row_id}: exports['.'] -> {entry.relative_to(PKG)}")
+
 # ── files 白名单里提到的文件是否都在 ────────────────────────────────────────
 print("\n[5] package.json 的 files 白名单")
 for pattern in pkg.get("files") or []:

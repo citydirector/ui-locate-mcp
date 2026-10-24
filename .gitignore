@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 venv/
 
+# Node
+# 测试用的 @deepseek-ai 桩由 tests/stubs.mjs 现场生成，不进版本控制。
+node_modules/
+
 # 运行时产物
 .cache/
 *.log

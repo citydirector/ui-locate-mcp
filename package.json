@@ -5,12 +5,20 @@
   "private": true,
   "type": "module",
   "description": "Lightweight local visual grounding engine exposed as agent tools",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/citydirector/ui-locate-mcp.git"
+  },
   "exports": {
+    ".": "./plugin/index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "cordis.patch.yml",
+    "plugin/index.mjs",
+    "plugin/core.mjs",
     "locale/*.json",
     "icon.svg",
     "pyproject.toml",
@@ -25,5 +33,9 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "main": "./plugin/index.mjs"
 }

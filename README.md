@@ -190,6 +190,63 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 | `UI_LOCATE_MIN_EDGE` | 跳过空白块的边缘密度下限 | `0.0008` |
 | `UI_LOCATE_MAX_SIDE` | 分块时每块长边 | `960` |
 | `UI_LOCATE_OCR_CUDA` | `1` 让 OCR 也走 GPU | 关 |
+| `UI_LOCATE_CPU_ONLY` | `1` 装 Python 侧时不带 `[cuda]` extras | 关 |
+| `DSH_UI_LOCATE_UPDATE_API` | 换掉查版本的 GitHub API 地址（自建镜像 / 离线测试） | `https://api.github.com` |
+| `DSH_UI_LOCATE_UPDATE_DELAY_MS` | 启动后隔多久查第一次 | `8000` |
+
+## 自动更新
+
+包内有一个 Host 插件（`plugin/index.mjs`），负责**查版本、装版本、同步 Python 侧**。
+它注册了工具 `ui_locate_update`：
+
+```
+ui_locate_update(action: "check")   # 只读发布标签，报版本差异
+ui_locate_update(action: "apply")   # 装最新版本（会改动本机插件）
+```
+
+### 为什么需要一段 Host 代码
+
+这个 bundle 的主体是一个 MCP 客户端行，它只声明「用什么命令起 Python 进程」，
+本身没有可执行代码。DSH 的插件管理器能装 JS/YAML 那部分，但**装不到 venv 里的
+Python 包**——而那才是真正会改进的部分（算法、模型、OCR 参数）。
+
+### 更新是两段，顺序不能颠倒
+
+1. **JS 侧**：`pluginManager.installBundle('git+<url>#vX.Y.Z')`，DSH 用它装官方
+   插件的方式装本包，落到 profile 的 `node_modules`，然后热替换本插件。
+2. **Python 侧**：新版本的源码这时才出现在 `node_modules` 里，所以只能在**换上
+   来之后**执行。它由「新实例启动时发现版本不一致」触发，不塞进 install 的同一
+   段流程——那样会拿旧路径去装新版本。
+
+这个顺序也给了容错：Python 侧失败不影响 JS 侧已经装好，下次启动会重新发现不一致
+并再试一次，不需要人干预。
+
+### 只查不装
+
+`updateCheck` 默认开着，但**检查本身从不安装任何东西**——它只读发布标签并记下
+结论。安装必须由一次显式的工具调用触发。
+
+### 发布新版本时要做什么
+
+两处版本号必须一起改，否则每次启动都会白装一次 Python 侧：
+
+- `package.json` 的 `version`
+- `pyproject.toml` 的 `[project] version`
+
+然后打一个 `vX.Y.Z` 标签（只认这三段，预发布标签会被忽略）+ 推上去：
+
+```bash
+git tag v0.2.1 && git push gh main --tags
+```
+
+### 两个开关
+
+在插件页的配置里：
+
+| 开关 | 默认 | 作用 |
+|------|------|------|
+| `updateCheck` | 开 | 启动几秒后查一次，之后每 12 小时一次 |
+| `pythonSync` | 开 | 发现 venv 版本与包内声明不一致时自动重装 |
 
 ### 自检
 
@@ -199,6 +256,9 @@ python tests\check_bundle.py
 
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
+
+# 更新插件的行为测试（48 例，纯逻辑 + 接线层）
+node --test tests/
 ```
 
 `smoke_mcp.py` 的解释器优先级：`UI_LOCATE_PYTHON` 环境变量 → 包内 `.venv` → 当前解释器。
@@ -326,7 +386,9 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | 文件 | 作用 |
 |------|------|
 | `package.json` | **bundle 声明**：`dsh.bundle.patch` 指向 `cordis.patch.yml`，`exports` 暴露 locale 与图标 |
-| `cordis.patch.yml` | bundle 的 patch：`insert` 一个 `@deepseek-ai/dsh-mcp-client` 连接项 |
+| `cordis.patch.yml` | bundle 的 patch：`insert` 一个 `@deepseek-ai/dsh-mcp-client` 连接项 + 一个本包 Host 插件行 |
+| `plugin/index.mjs` | **Host 插件**：版本检查、安装新版本、把 venv 里的 Python 包同步过去 |
+| `plugin/core.mjs` | 上者的纯逻辑（版本比较、发布源、venv 同步、状态机），不依赖 Cordis，可直接用 node 测 |
 | `market-index.json` | 插件市场索引（format 1），在线导入的入口 |
 | `locale/{en,zh}.json` | 插件列表里显示的标题与描述 |
 | `icon.svg` | 插件图标（≤256 KiB，必须留在包内） |
@@ -347,6 +409,8 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | `scripts/serve.ps1` | 手动起停常驻服务 / 查状态 |
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
+| `tests/update-plugin.test.mjs` | 更新插件的行为测试（48 例，`node --test tests/`） |
+| `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
 
 ## 多显示器与智能分割

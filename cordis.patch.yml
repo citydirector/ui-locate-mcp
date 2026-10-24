@@ -1,7 +1,11 @@
 # ui-locate 的 DSH 组合包补丁。
 #
-# 安装到 profile 后，本补丁向 Host 插入一个 MCP 客户端，从而把 ui-locate 的
-# 定位工具变成 agent 可调用的 mcp__ui-locate__* 工具。
+# 安装到 profile 后，本补丁向 Host 插入两行：
+#
+#   1. 一个 MCP 客户端，把 ui-locate 的定位工具变成 agent 可调用的
+#      mcp__ui-locate__* 工具。
+#   2. 一个 Host 插件（本包自己的 plugin/index.mjs），负责版本检查、安装新
+#      版本，以及把 venv 里的 Python 包同步过去。
 #
 # 关于路径：bundle 会被 pnpm 装进 node_modules 的深层目录，包内 .venv 的
 # 绝对路径无法在补丁里预先写死。所以运行环境统一落在**用户级固定目录**
@@ -35,3 +39,12 @@
           UI_LOCATE_HOME: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}`'
         # 首次调用要等常驻服务预热（CUDA 首次建会话较慢）+ 一次整页 OCR
         toolCallTimeoutMs: 180000
+    # 更新器。名字用**包名**而不是 ./plugin/index.mjs：DSH 会把相对名解析成
+    # 绝对 file URL，配置编辑器首次保存就把那个绝对路径写进用户 patch，便携版
+    # 一搬目录就断。包名则会走 package.json 的 exports["."]。
+    - id: ui-locate-update
+      name: ui-locate-mcp
+      config:
+        updateCheck: true
+        pythonSync: true
+
