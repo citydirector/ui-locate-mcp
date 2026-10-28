@@ -408,6 +408,37 @@ class CaptureFailureTests(unittest.TestCase):
         self.assertIsNone(out["verified"])
         self.assertIn("mid-flight", out["verify_unavailable"])
 
+    def test_act_failure_also_reports_capture_error(self):
+        """动作失败 + 抓屏失败同时发生：两件事都要说清楚。
+
+        只报「动作失败」会把人引去查目标窗口，而真相可能是本进程既抓不了屏、
+        也注入不了输入 —— 该查的方向完全相反。这一条守的就是早退路径别把
+        capture_error 吞掉。
+        """
+
+        def broken_capture(_monitor):
+            raise OSError("screen grab failed")
+
+        def broken_perform(_action, _params):
+            raise RuntimeError("SendInput 全部失败，last_error=5")
+
+        out = A.act(
+            {"text": "确定", "verify": "screen"},
+            probe=make_probe({"确定": hit()}),
+            capture=broken_capture,
+            perform=broken_perform,
+            compare=lambda *_a: 9.0,
+            sleep=lambda _s: None,
+            clock=FakeClock(),
+        )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["stage"], "act")
+        self.assertIn("SendInput", out["error"])
+        self.assertIn(
+            "screen grab failed", out.get("verify_unavailable", ""),
+            "动作早退时也必须带上抓屏失败的原因",
+        )
+
     def test_verify_none_has_no_capture_error_key(self):
         out = A.act(
             {"text": "确定", "verify": None},

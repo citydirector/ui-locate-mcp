@@ -51,6 +51,7 @@ cuda_dlls.register()
 
 from ui_locate import act as act_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
+from ui_locate import frames as frames_mod  # noqa: E402
 from ui_locate import screen  # noqa: E402
 from ui_locate.detect import Detector, default_model  # noqa: E402
 from ui_locate.locate import grab_screen  # noqa: E402
@@ -68,6 +69,10 @@ class Engine:
         self.use_ocr = use_ocr
         self.ready = False
         self.warmup_ms = 0.0
+
+        # 无损帧记忆。和检测器一样是常驻状态，但**不放同一把锁里** ——
+        # 存一帧只是内存操作（微秒级），不该排在几十毫秒的推理后面。
+        self.frames = frames_mod.FrameStore()
 
         t0 = time.perf_counter()
         self.det = Detector(model, provider)
@@ -404,8 +409,22 @@ class Handler(BaseHTTPRequestHandler):
         origin 必须跟着图走：验证阶段要在图里找「点击点周围那一小片」，
         而点击点是屏幕绝对坐标、图内坐标是相对坐标，副屏原点为负时差得
         很远。把它和图绑成一个不透明值传给 compare，act 层不必知道这件事。
+
+        **顺便存进帧记忆**。这一步是有意的副作用：抓屏本来就是 act 流程里
+        最贵的一环（2880x1800 一次 20~40ms），既然图已经在手上，扔掉就等于
+        下次要用时再抓一遍。存一帧是纯内存操作，微秒级，不会拖慢它。
         """
-        return screen.grab(monitor)
+        bgr, origin = screen.grab(monitor)
+        turn = getattr(self, "_turn", None)
+        if turn is not None:
+            # 回合内第 0 帧是「动作之前」、第 1 帧是「动作之后」—— 这是 act
+            # 流程的固定形状，标上省得调用方自己数。再往后只是「又抓了一张」
+            # （steps 里每步都可能抓），不再硬套 before/after 的名字。
+            seq = getattr(self, "_frame_seq", 0)
+            self._frame_seq = seq + 1
+            label = "before" if seq == 0 else "after" if seq == 1 else f"frame{seq}"
+            ENGINE.frames.put(turn, bgr, origin, label)
+        return bgr, origin
 
     def _perform(self, action_name: str, params: dict) -> dict:
         """把动作名分派到输入层（`ui_locate.actions`）。"""
@@ -472,16 +491,44 @@ class Handler(BaseHTTPRequestHandler):
         return float(np.abs(a - b).mean())
 
     def _act(self, data: dict) -> dict:
-        """跑一次 act / steps。两个端点共用，差别只在 spec 的形状。"""
+        """跑一次 act / steps。两个端点共用，差别只在 spec 的形状。
+
+        开一个回合：本次调用里抓到的每一帧都记到同一个 turn 下，结果里带回
+        `turn`。这样调用方之后想「回看刚才那一下到底发生了什么」，只要拿
+        turn 号去 `/frame` 取，不必自己保管截图 —— 它手里本来也没有。
+        """
         common = {
             "probe": self._probe_hit,
             "capture": self._capture,
             "perform": self._perform,
             "compare": self._compare,
         }
-        if "steps" in data:
-            return act_mod.run_steps(data["steps"], **common)
-        return act_mod.act(data, **common)
+        turn = ENGINE.frames.begin_turn()
+        self._turn = turn
+        self._frame_seq = 0
+        try:
+            if "steps" in data:
+                out = act_mod.run_steps(data["steps"], **common)
+            else:
+                out = act_mod.act(data, **common)
+        finally:
+            self._turn = None
+            self._frame_seq = 0
+
+        # 每个回合至少留一张牌：没有 verify:"screen" 的动作（纯 move、滚动、
+        # 纯按键）本来一帧都不会抓，于是「刚才那一下之后屏幕长什么样」事后
+        # 完全问不到 —— 而这正是 VISTA 那条经验里最值钱的部分：存帧，不存结论。
+        # 只在**这一回合确实一帧都没有**时才补抓一次，所以带验证的动作不会
+        # 多付一次抓屏开销。
+        if not ENGINE.frames.turns_of(turn):
+            try:
+                ENGINE.frames.put(
+                    turn, *self._capture(data.get("monitor")), label="after")
+            except Exception:  # noqa: BLE001 - 补抓失败不该把已完成的结果变成错误
+                pass
+
+        out["turn"] = turn
+        return out
 
     def _body(self) -> bytes:
         """读请求体。**必须读干净**，理由见 `_drain` 的注释。
@@ -594,6 +641,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, screen.describe())
             return
 
+        if u.path == "/frames":
+            # 只报「有哪些帧可取」，不报像素。模型得先知道有什么才能决定
+            # 取哪一帧，而这个摘要本身不该变成新的上下文负担。
+            self._send(200, {
+                "turns": ENGINE.frames.turns(limit=int((q.get("limit") or ["20"])[0])),
+                "stats": ENGINE.frames.stats(),
+            })
+            return
+
+        if u.path == "/frame":
+            code, meta, png = self._frame_bytes(q)
+            if png is None:
+                self._send(code, meta)
+                return
+            # 图片响应不能走 _send（那个只发 JSON）。但请求体还是要读干净，
+            # 否则 keep-alive 上会污染下一条请求。
+            self._drain()
+            self.send_response(code)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            # 元信息塞进响应头：客户端拿得到图，也就该拿得到「这块对应屏幕
+            # 哪一段、放大了几倍」，否则它没法把图里的位置换算回屏幕坐标。
+            self.send_header("X-Frame-Turn", str(meta.get("turn", "")))
+            self.send_header("X-Frame-Index", str(meta.get("frame", "")))
+            self.send_header("X-Frame-Box", ",".join(str(v) for v in meta.get("box", [])))
+            self.send_header("X-Frame-Scale", str(meta.get("scale", "")))
+            self.end_headers()
+            self.wfile.write(png)
+            return
+
         if u.path == "/find":
             text = (q.get("text") or [""])[0]
             if not text:
@@ -625,6 +702,65 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._send(404, {"error": "unknown path"})
+
+    def _frame_bytes(self, q: dict) -> tuple[int, dict, bytes | None]:
+        """按 query 取一帧或它的一块，返回 (状态码, 元信息, PNG 字节)。
+
+        单独抽出来是因为它有两套输出：正常情况回图片，出错时回 JSON。
+        `_send` 只会发 JSON，所以这里自己写响应。
+
+        参数检查放在查帧之前：`box=1,2,3` 这种写错的请求，不管那一帧存不存在
+        都是「请求本身有错」，该回 400 而不是 404。反过来先查帧，调用方就得先
+        猜对 turn 才能看到自己的参数写错了。
+        """
+        try:
+            turn = int((q.get("turn") or [str(ENGINE.frames.latest_turn())])[0])
+        except ValueError:
+            return 400, {"error": "turn 必须是整数"}, None
+
+        try:
+            frame_index = int((q.get("frame") or ["-1"])[0])
+        except ValueError:
+            return 400, {"error": "frame 必须是整数"}, None
+
+        box = None
+        raw_box = (q.get("box") or [""])[0]
+        if raw_box:
+            parts = [p for p in raw_box.replace(" ", "").split(",") if p]
+            if len(parts) != 4:
+                return 400, {"error": "box 需要四个数：x1,y1,x2,y2（屏幕绝对坐标）"}, None
+            try:
+                box = tuple(int(float(p)) for p in parts)  # type: ignore[assignment]
+            except ValueError:
+                return 400, {"error": "box 的四个值必须是数字"}, None
+
+        raw_scale = (q.get("scale") or [""])[0]
+        scale = None
+        if raw_scale:
+            try:
+                scale = float(raw_scale)
+            except ValueError:
+                return 400, {"error": "scale 必须是数字"}, None
+
+        frame = ENGINE.frames.get(turn, frame_index)
+        if frame is None:
+            return 404, {
+                "error": "没有这一帧",
+                "turn": turn,
+                "frame": frame_index,
+                "available": [t["turn"] for t in ENGINE.frames.turns(limit=50)],
+                "stats": ENGINE.frames.stats(),
+            }, None
+
+        piece, meta = ENGINE.frames.crop(frame, box=box, scale=scale)
+        if piece is None:
+            return 400, meta, None
+
+        ok, buf = cv2.imencode(".png", piece)
+        if not ok:
+            return 500, {"error": "PNG 编码失败"}, None
+        return 200, meta, buf.tobytes()
+
 
     def do_POST(self) -> None:
         assert ENGINE is not None

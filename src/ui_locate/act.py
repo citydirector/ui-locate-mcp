@@ -456,6 +456,13 @@ def act(
             "performed": None,
             "timings": timings,
         })
+        # 这条路径也必须带上 capture_error。抓屏失败与动作失败同时发生时，
+        # 只说「动作失败」等于把另一半真相扔掉：调用方会去查目标窗口，
+        # 而真正的问题可能是本进程根本没有抓屏/注入权限 —— 两件事该查的
+        # 方向完全相反。曾经就是这里早退，e2e 里只看到 stage:act 而不知道
+        # 连 before 图都没拿到。
+        if capture_error:
+            result["verify_unavailable"] = capture_error
         return result
     timings["act_ms"] = _ms(t0, clock)
     result["performed"] = performed
