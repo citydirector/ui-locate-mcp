@@ -537,6 +537,107 @@ def health() -> str:
     return json.dumps(h, ensure_ascii=False)
 
 
+@mcp.tool()
+def ui_locate_frames(limit: int = 10) -> str:
+    """列出帧记忆里还剩哪些回合，供 `ui_locate_frame` 取用。
+
+    每次 `ui_locate_act` / `ui_locate_steps` 算一个回合，回合里第 0 帧是
+    「动作之前」、第 1 帧是「动作之后」（再往后是 steps 中途多抓的）。
+    回合号单调递增、永不复用，所以「第 7 回合」永远指同一段画面。
+
+    为什么要先列一遍：服务只保留最近的若干回合（默认约 256MB，约 16 帧
+    2880x1800），更老的会被淘汰。拿一个已经被淘汰的回合号去取只会得到
+    「没有这一帧」，所以先看清楚有什么。
+
+    这里**只报摘要不报像素** —— 摘要本身不该变成新的上下文负担。
+
+    参数：
+      limit  最多列几个回合（从最新往回数），默认 10。
+
+    返回 {ok, turns: [{turn, frames: [{turn, frame, label, size, origin, age_s}], age_s, bytes}], stats}。
+    """
+    try:
+        r = _http().get("/frames", params={"limit": int(limit)})
+    except TypeError:
+        return json.dumps({"ok": False, "error": "limit 必须是整数"}, ensure_ascii=False)
+    if r.status_code != 200:
+        return json.dumps(
+            {"ok": False, "error": f"/frames 返回 {r.status_code}: {r.text[:300]}"},
+            ensure_ascii=False,
+        )
+    body = r.json()
+    return json.dumps({"ok": True, **body}, ensure_ascii=False)
+
+
+@mcp.tool()
+def ui_locate_frame(
+    turn: int = -1,
+    frame: int = -1,
+    box: str = "",
+    scale: float = 0.0,
+):
+    """从帧记忆里取一帧，或它的一块放大图 —— **直接返回图片**。
+
+    这是 VISTA 那套「无损视觉记忆 + 主动检查」在本地版的落地：
+      · **跨时间**：`turn` 指回任意一个还留着的回合，看那一刻的画面。
+        典型用法是「刚才点下去以后到底变成什么样了」，或者「三回合前那个
+        按钮在不在」。
+      · **跨空间**：`box` 指定一块矩形放大看细节。整屏缩略图里 10px 的字
+        根本认不出，放大 4 倍就清楚了 —— 但只在需要时才付这份 token。
+
+    为什么值得单独存在：检测/OCR 给的是**结论**（「按钮在 147,170」），
+    而结论在生成的那一刻就已经替未来的你判断过「哪些像素以后有用」了。
+    这里存的是**原始像素**，什么时候看、看哪一块，由你决定。
+
+    `box` 用**屏幕绝对坐标** x1,y1,x2,y2（副屏原点可能是负数，照样给绝
+    对值）。不给 box 就是整帧。自动缩放会把长边拉到 1600px 左右，最多放大
+    6 倍（再大只是插值出的糊图）。
+
+    参数：
+      turn   回合号。默认 -1 = 最新回合。
+      frame  回合内序号。默认 -1 = 该回合最后一帧。
+      box    "x1,y1,x2,y2"，屏幕绝对坐标。留空 = 整帧。
+      scale  放大倍数。0 = 自动（长边拉到 1600，最多 6 倍）。
+
+    返回：一张 PNG 图片 + 一段 JSON 元信息（含 `box`：这块裁剪在屏幕上的
+    位置，据此把图里的坐标换算回屏幕坐标）。
+    """
+    params: dict[str, Any] = {"turn": int(turn), "frame": int(frame)}
+    if box:
+        params["box"] = box
+    if scale and scale > 0:
+        params["scale"] = float(scale)
+
+    ensure_ready()
+    r = _http().get("/frame", params=params)
+    if r.status_code != 200:
+        try:
+            return json.dumps({"ok": False, **r.json()}, ensure_ascii=False)
+        except ValueError:
+            return json.dumps(
+                {"ok": False, "error": f"/frame 返回 {r.status_code}: {r.text[:300]}"},
+                ensure_ascii=False,
+            )
+
+    from mcp.server.fastmcp.utilities.types import Image
+
+    raw_box = r.headers.get("X-Frame-Box") or ""
+    meta = {
+        "ok": True,
+        "turn": r.headers.get("X-Frame-Turn"),
+        "frame": r.headers.get("X-Frame-Index"),
+        # 这块裁剪对应的屏幕范围。图里看到的相对位置必须加上它才能变成
+        # 能交给点击的绝对坐标。
+        "box": [int(float(v)) for v in raw_box.split(",") if v] if raw_box else [],
+        "scale": r.headers.get("X-Frame-Scale"),
+        "bytes": len(r.content),
+    }
+    return [
+        json.dumps(meta, ensure_ascii=False),
+        Image(data=r.content, format="png"),
+    ]
+
+
 def main() -> None:
     """stdio 传输入口。`python -m ui_locate.mcp_server` 与 console script 都走这里。"""
     mcp.run(transport="stdio")

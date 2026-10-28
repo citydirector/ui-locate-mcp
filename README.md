@@ -28,6 +28,8 @@ cua_driver_native__click(scope="desktop", x=1423, y=290)  →  点中了
 | `find_all(text, img_path, conf, text_mode, monitor, smart)` | 同名元素有多处时，看全部候选自己挑 |
 | `ui_locate_act(text, action, verify, ...)` | **定位 + 动作 + 验证，一次调用做完**。`action` 可以是 `click` / `double_click` / `right_click` / `hover` / `move` / `drag` / `scroll` / `type` / `press` / `hotkey` / `wait` |
 | `ui_locate_steps(steps)` | 串多步（最多 40 步），每步可带 `wait_before` 与 `on_fail`；失败时返回第几步 |
+| `ui_locate_frames(limit)` | 列出最近几个回合各留了哪些帧（**先列再取**，服务只保留最近若干回合） |
+| `ui_locate_frame(turn, frame, box, scale)` | 取回一帧原始像素，**连图一起返回**；给 `box` 就是放大那一块 |
 | `list_monitors()` | 有几块屏、各自尺寸与原点（副屏原点可能是负的） |
 | `health()` | 服务状态：是否就绪、哪个后端、预热多久 |
 
@@ -84,6 +86,40 @@ locate_text("插件", monitor="1")
 # → {"x": -1087, "y": -909}     副屏负坐标，直接可用
 cua_driver_native__click(scope="desktop", x=-1087, y=-909)  →  点中了
 ```
+
+## 帧记忆：存像素，不存结论
+
+每次动作都会留下画面。`ui_locate_act` / `ui_locate_steps` 的返回里带一个 `turn`
+号，事后拿它就能把「刚才那一下之后屏幕长什么样」原样取回来：
+
+```python
+ui_locate_frames()
+# → {"turns": [{"turn": 7, "frames": [
+#       {"frame": 0, "label": "before", "size": [1920, 1080], "turn": 7},
+#       {"frame": 1, "label": "after",  "size": [1920, 1080], "turn": 7}]}],
+#    "stats": {"turns": 3, "frames": 6, "bytes": 41000000, "max_bytes": 268435456}}
+
+ui_locate_frame(turn=7, frame=1)                       # 整帧，连图一起回来
+ui_locate_frame(turn=7, frame=1, box="1400,150,1700,260")   # 放大那一块
+ui_locate_frame()                                       # 不给 turn 就是最新一帧
+```
+
+**为什么不干脆把结论存起来。** 存「按钮在 (147,170)」这种结论，等于替未来的
+自己判断了「哪些像素以后会有用」——而做判断的那一刻根本不知道后面会问什么。
+所以要存原始像素，让「看哪儿」这件事推迟到真正需要的时候再决定。
+
+**为什么要 `box` 参数。** 一张 1920×1080 的整屏缩到能塞进上下文时，一个 10px
+高的字只剩几个像素。`box` 用**屏幕绝对坐标**裁一块再放大（最近邻，最多 6 倍），
+字就回到了能读清的大小 —— 这和「截小图再认一次」相比不用重新抓屏。
+
+**什么时候它会告诉你「没有」。** 服务只保留最近若干回合（默认 40 个回合、
+256MB，约 16 帧 2880×1800）。回合被淘汰之后就取不到了，此时 `/frame` 回 404
+并附上 `available` 列表 —— 所以取之前先 `ui_locate_frames()` 看一眼，别拿记忆
+里的旧回合号硬取。
+
+**没有验证的动作也会留帧。** 纯 `move`、滚动、纯按键本来一帧都不抓，但一个
+回合结束时如果确实没有任何帧，服务会补抓一张。这样「我刚才滚到哪了」始终
+有据可查。
 
 ## 架构：MCP 进程是薄客户端
 
@@ -398,7 +434,8 @@ Origin/Referer 必须同源；桌面壳转发过来的 `dsh-app://app` 单独放
 # 结构自检（不启动任何东西，纯静态核对 bundle 规范）
 python tests\check_bundle.py
 
-# 纯逻辑测试（80 例：匹配档位与排序、动手前防线、动作编排、HTTP 层、bundle 规则）
+# 纯逻辑与集成测试（106 例：匹配档位与排序、动手前防线、动作编排、帧记忆、
+# 进程内 HTTP 集成、bundle 规则）
 python -m unittest discover -s tests -p "test_*.py"
 
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
@@ -441,7 +478,15 @@ pwsh -File .\scripts\serve.ps1 -Status  # 看进程、内存、conhost、屏幕�
 | POST | `/locate` | body `{"text": "保存"}`，返回该元素中心坐标（**只给坐标，不点击**） |
 | POST | `/act` | body 为一条指令：`{"text": "保存", "action": "click", "verify": "screen"}` —— 定位 + 动作 + 验证一次做完 |
 | POST | `/steps` | body `{"steps": [...]}`，顺序跑多步，失败时返回 `failed_index` |
+| GET | `/frames` | 列出最近几个回合的帧摘要（`limit` 默认 20）；不返回像素 |
+| GET | `/frame` | 取一帧或它的一块，**回 `image/png`**；元信息在响应头 |
 | GET | `/find?text=保存` | 抓屏 + 检测 + 按文字查 |
+
+`/frame` 的参数：`turn`（默认最新）、`frame`（默认 `-1` 即该回合最后一帧，
+支持负索引）、`box`（`x1,y1,x2,y2`，**屏幕绝对坐标**）、`scale`（不给就自动缩放到长边
+1600，最多 6 倍）。响应头带 `X-Frame-Turn` / `X-Frame-Index` / `X-Frame-Box` /
+`X-Frame-Scale` —— 拿到图也就拿到「这块对应屏幕哪一段、放大了几倍」，
+否则没法把图里的位置换算回屏幕坐标。回合已淘汰时回 404 并附 `available` 列表。
 
 参数：`conf`（默认 0.3）、`iou`（0.5）、`tiled`（0/1）、`max_side`（960）、
 `text`（0/1，是否跑 OCR）、`text_mode`（`full` / `mosaic`）、
@@ -809,6 +854,18 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     排查提示：**Host 半身的工具消失、MCP 半身照常**，这个组合基本就指向
     `apply()` 里炸了一次。验证方法是用假 ctx 跑一遍 `apply`（不必真启动 DSH）。
 
+34. **`FrameStore.get(turn, 0) is None` 判不出「这个回合有没有帧」**。回合存在
+    但零帧、和回合已被淘汰，两种情况下 `get` 都返回 `None`，含义完全不同：
+    前者该补抓一张，后者什么都不该做（补也补不回被淘汰的回合）。要用
+    `turns_of(turn)` —— 它返回列表，空列表就是「存在但没帧」，被淘汰则是
+    空列表之外再加 `get() is None` 一起看。
+
+35. **抓屏失败和动作失败是两条独立的真相，不能只报一条**。`act()` 里动作抛
+    异常时走的是早退路径，曾经这条路径把 `capture_error` 丢掉了：调用方只
+    看到 `stage: "act"`，于是去查目标窗口对不对 —— 而真正的问题可能是这个
+    进程既抓不了屏也注入不了输入（`SendInput` 全部失败、`last_error=5`）。
+    这两件事该查的方向完全相反。现在早退分支也会带上 `verify_unavailable`。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -837,6 +894,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `src/ui_locate/annotate.py` | 把检出的元素裁片拼成带编号的总览图 |
 | `src/ui_locate/act.py` | **动作编排**：定位 → 动作 → 验证，含等待 / 重试 / 逐步记账。零外部依赖，外部世界全注入，所以能纯 Python 测 |
 | `src/ui_locate/actions.py` | **Win32 输入注入**：`SendInput` 与带坐标的 `PostMessage` 两条通道，键盘 / 鼠标 / 滚轮 / 拖拽 / 打字 |
+| `src/ui_locate/frames.py` | **帧记忆**：按回合存原始画面（不存结论），支持按矩形裁片放大；见「帧记忆」一节 |
 | `src/ui_locate/locate.py` | 抓屏包装 + OCR |
 | `src/ui_locate/client.py` | HTTP 客户端 + CLI |
 | `src/ui_locate/cuda_dlls.py` | 注册 nvidia 包里的 CUDA dll 目录 |
@@ -845,8 +903,10 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `scripts/serve.ps1` | 手动起停常驻服务 / 查状态 |
 | `tests/check_bundle.py` | bundle 结构静态自检（对照 DSH 的校验规则） |
 | `tests/smoke_mcp.py` | stdio 全链路冒烟测试（8 项） |
-| `tests/test_act.py` | 动作编排测试（62 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
+| `tests/test_act.py` | 动作编排测试（63 例，`python -m unittest`）—— 全用桩，不碰真屏幕 |
 | `tests/test_match.py` | 匹配档位、排序与动手前的两道防线（18 例）—— 守那次「掉到 contains 档点错窗口」的事故 |
+| `tests/test_frames.py` | 帧记忆测试（16 例）：回合编号、整回合淘汰、负原点裁片 |
+| `tests/test_integration.py` | **进程内集成测试**（10 例）：真 Handler + 真 HTTP，只把抓屏与输入换成桩 —— 真机 e2e 在受限进程里跑不动，靠这层守接线 |
 | `tests/check_http.py` | HTTP 层回归检查（5 项）—— keep-alive 复用与 chunked 请求体（详见坑 30、31） |
 | `tests/update-plugin.test.mjs` | 插件行为测试（69 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
