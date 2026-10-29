@@ -103,8 +103,23 @@ jobs:
       - name: Show what will be published
         run: npm pack --dry-run
 
+      # Re-running a workflow (after a flake, or to verify a trusted-publisher
+      # change) must not fail just because the version already landed. The
+      # registry refuses to publish over an existing version with E403, which is
+      # correct but indistinguishable in a log from a real authorization failure.
       - name: Publish
-        run: npm publish --provenance --access public
+        shell: bash
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version --json > published.json 2> registry-error.txt; then
+            echo "$name@$version is already published; nothing to do"
+          elif grep -q 'E404' registry-error.txt; then
+            npm publish --provenance --access public
+          else
+            cat registry-error.txt >&2
+            exit 1
+          fi
 
       - name: Report what landed
         run: |
