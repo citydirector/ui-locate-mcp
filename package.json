@@ -1,8 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "ui-locate-mcp",
-  "version": "0.4.0",
-  "private": true,
+  "version": "0.5.0",
   "type": "module",
   "description": "Lightweight local visual grounding engine exposed as agent tools",
   "repository": {
@@ -17,6 +16,7 @@
     "./icon": "./icon.svg"
   },
   "files": [
+    "LICENSE",
     "cordis.patch.yml",
     "client.js",
     "plugin/index.mjs",
@@ -48,5 +48,18 @@
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"
   },
-  "main": "./plugin/index.mjs"
+  "main": "./plugin/index.mjs",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "deepseek-harness",
+    "computer-use",
+    "screen",
+    "locate",
+    "ocr",
+    "gui-automation",
+    "vision"
+  ]
 }

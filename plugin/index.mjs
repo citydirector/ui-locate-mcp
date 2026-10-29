@@ -46,11 +46,11 @@ import { execFile } from "node:child_process"
 import z from "@deepseek-ai/schemastery"
 import { defineTool, ToolArgsError } from "./tool.mjs"
 import {
-  UPDATE_REPOSITORY,
+  NPM_PACKAGE,
   bundledPythonVersion,
   compareVersions,
   createUpdateTracker,
-  fetchReleaseTags,
+  fetchPublishedVersions,
   installedPythonVersion,
   packageVersion,
   stateDir,
@@ -128,8 +128,10 @@ export function apply(ctx, config) {
 
   const tracker = createUpdateTracker({
     // 测试与自建镜像都可以改这个地址；默认打公开的 GitHub。
-    fetchTags: ({ signal }) =>
-      fetchReleaseTags({ api: process.env.DSH_UI_LOCATE_UPDATE_API || "https://api.github.com", signal }),
+    // 读 npm registry 上的版本，不再读 GitHub 标签：DSH 的更新按钮只认
+    // registry 包，我们的更新器也必须跟着同一条源，否则它升一次就把依赖
+    // 写回 github: 形式，按钮又没了。
+    fetchTags: ({ signal }) => fetchPublishedVersions({ signal }),
     delayMs: readDelay(),
     log: (line) => log(line),
   })
@@ -341,7 +343,10 @@ export function apply(ctx, config) {
     if (running !== undefined && compareVersions(tag, running) <= 0) {
       return { ok: true, state: "current", version: running }
     }
-    const spec = `git+https://github.com/${UPDATE_REPOSITORY}.git#${tag}`
+    // registry 形式：`ui-locate-mcp@0.4.1`。
+    // 不能用 `git+https://...#vX.Y.Z` —— 那样装完依赖会变成 `github:...`，
+    // DSH 插件页的更新按钮随即消失（`updateRefusal()` 要求 kind === "registry"）。
+    const spec = `${NPM_PACKAGE}@${tag.replace(/^v/, "")}`
     log(`installing ${spec}`)
     const requestId = globalThis.crypto?.randomUUID?.() ?? `ui-locate-${Date.now()}`
     let answer

@@ -13,9 +13,9 @@
  *    （`additionalProperties` 必须显式、实参要校验）搬了进来，所以这里直接
  *    测——不需要桩，也就不存在「桩抄漏一条」的风险。
  *
- * 一条纪律：**任何测试都不许打真实网络**。默认的 `fetch` 已经被
- * `DSH_UI_LOCATE_UPDATE_API` 指到 `127.0.0.1:9`，所有检查都被显式传
- * `fetch` 参数接管。
+ * 一条纪律：**任何测试都不许打真实网络**。更新源已经换成 npm registry，
+ * 所以用 `UI_LOCATE_REGISTRY` 把它指到 `127.0.0.1:9`：任何漏接 `fetch`
+ * 的路径都会立刻连接被拒，而不是悄悄打到真的 registry 上。
  */
 
 import assert from "node:assert/strict"
@@ -26,7 +26,8 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 
 // 必须在 import plugin 之前设：index.mjs 在 apply 时读它。
-process.env.DSH_UI_LOCATE_UPDATE_API = "http://127.0.0.1:9"
+// 更新源是 registry，所以挡在 registry 这一层（以前挡的是 GitHub API）。
+process.env.UI_LOCATE_REGISTRY = "http://127.0.0.1:9"
 process.env.DSH_UI_LOCATE_UPDATE_DELAY_MS = "600000"
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url))
@@ -37,11 +38,13 @@ const { ensureStubs } = await import("./stubs.mjs")
 ensureStubs(ROOT)
 
 const {
+  DEFAULT_REGISTRY,
+  NPM_PACKAGE,
   UPDATE_REPOSITORY,
   bundledPythonVersion,
   compareVersions,
   createUpdateTracker,
-  fetchReleaseTags,
+  fetchPublishedVersions,
   installIntoVenv,
   installedPythonVersion,
   latestRelease,
@@ -472,38 +475,47 @@ check("syncPythonToBundle：安装失败要带错误信息，不抛", async () =
 
 // ── 发布源 ─────────────────────────────────────────────────────────────────
 
-check("fetchReleaseTags：读公开 tag 列表，不带凭据", async () => {
-  const fetch = mockFetch({ body: [{ name: "v1.0.0" }, { name: "v0.9.0" }, { notAName: true }] })
-  const tags = await fetchReleaseTags({ fetch })
-  assert.deepEqual(tags, ["v1.0.0", "v0.9.0"])
+check("fetchPublishedVersions：读 registry 的版本 map，只要正式版", async () => {
+  const fetch = mockFetch({
+    body: { versions: { "1.0.0": {}, "0.9.0": {}, "2.0.0-rc.1": {}, "nightly": {} } },
+  })
+  // 显式给 registry：整个测试进程把默认值指到了 127.0.0.1:9（见文件头），
+  // 而这条用例要验的是 URL 拼接规则本身。
+  const tags = await fetchPublishedVersions({ fetch, registry: DEFAULT_REGISTRY })
+  assert.deepEqual(tags.sort(), ["v0.9.0", "v1.0.0"], "预发布与非法版本都要滤掉")
   assert.equal(fetch.calls.length, 1)
-  assert.equal(fetch.calls[0].url, `https://api.github.com/repos/${UPDATE_REPOSITORY}/tags?per_page=100`)
+  assert.equal(fetch.calls[0].url, `${DEFAULT_REGISTRY}/${NPM_PACKAGE}`)
   const headers = fetch.calls[0].init.headers
-  assert.equal(headers.accept, "application/vnd.github+json")
-  assert.equal(headers["x-github-api-version"], "2022-11-28")
+  assert.equal(headers.accept, "application/json")
   assert.equal(headers.authorization, undefined, "这里绝不该带凭据")
 })
 
-check("fetchReleaseTags：限流与非 200 分开报", async () => {
+check("fetchPublishedVersions：404 说清楚是「还没发」", async () => {
   await assert.rejects(
-    () => fetchReleaseTags({ fetch: mockFetch({ status: 403, body: {} }) }),
-    /GitHub rate limit \(HTTP 403\)/,
+    () => fetchPublishedVersions({ fetch: mockFetch({ status: 404, body: { error: "Not found" } }) }),
+    /is not published on .* yet/,
   )
-  await assert.rejects(
-    () => fetchReleaseTags({ fetch: mockFetch({ status: 429, body: {} }) }),
-    /GitHub rate limit \(HTTP 429\)/,
-  )
-  await assert.rejects(() => fetchReleaseTags({ fetch: mockFetch({ status: 500, body: {} }) }), /HTTP 500/)
 })
 
-check("fetchReleaseTags：返回的不是数组就报错", async () => {
-  await assert.rejects(() => fetchReleaseTags({ fetch: mockFetch({ body: { message: "Not Found" } }) }), /tag list/)
+check("fetchPublishedVersions：限流与非 200 分开报", async () => {
+  await assert.rejects(
+    () => fetchPublishedVersions({ fetch: mockFetch({ status: 429, body: {} }) }),
+    /registry rate limit \(HTTP 429\)/,
+  )
+  await assert.rejects(() => fetchPublishedVersions({ fetch: mockFetch({ status: 500, body: {} }) }), /HTTP 500/)
 })
 
-check("fetchReleaseTags：可以指到自建镜像", async () => {
-  const fetch = mockFetch({ body: [] })
-  await fetchReleaseTags({ fetch, api: "http://mirror.local/api/", repository: "a/b" })
-  assert.equal(fetch.calls[0].url, "http://mirror.local/api/repos/a/b/tags?per_page=100")
+check("fetchPublishedVersions：返回的没有 versions map 就报错", async () => {
+  await assert.rejects(
+    () => fetchPublishedVersions({ fetch: mockFetch({ body: { message: "nope" } }) }),
+    /version map/,
+  )
+})
+
+check("fetchPublishedVersions：可以指到镜像，并正确编码带 scope 的包名", async () => {
+  const fetch = mockFetch({ body: { versions: {} } })
+  await fetchPublishedVersions({ fetch, registry: "http://mirror.local/npm/", name: "@scope/pkg" })
+  assert.equal(fetch.calls[0].url, "http://mirror.local/npm/%40scope%2Fpkg")
 })
 
 // ── 更新状态机 ─────────────────────────────────────────────────────────────
@@ -529,7 +541,7 @@ check("tracker：已是最新时报 current", async () => {
 })
 
 check("tracker：网络失败也不抛，并且记住上次查到的新版本", async () => {
-  const answers = [["v1.1.0"], new Error("getaddrinfo ENOTFOUND api.github.com")]
+  const answers = [["v1.1.0"], new Error("getaddrinfo ENOTFOUND registry.npmjs.org")]
   const tracker = createUpdateTracker({
     readVersion: () => "1.0.0",
     fetchTags: async () => {
@@ -661,7 +673,7 @@ check("tracker：document 把已经装上的 available 折成 current", async ()
   await tracker.check()
   let doc = tracker.document({ python: { wanted: "1.0.0", installed: "1.0.0", venv: true } })
   assert.equal(doc.update.state, "available")
-  assert.equal(doc.update.spec, `git+https://github.com/${UPDATE_REPOSITORY}.git#v1.1.0`)
+  assert.equal(doc.update.spec, `${NPM_PACKAGE}@1.1.0`, "spec 必须是 registry 形式，不能是 git URL")
   assert.equal(doc.version, "1.0.0")
   // 装上之后新实例读到的就是新版本
   version = "1.1.0"
@@ -925,14 +937,15 @@ check("index：apply 在拿到 pluginManager 后会把 spec 交出去", async ()
   }
   // 让 tracker 查到一个比当前高的版本，且不碰网络
   const realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => [{ name: "v999.0.0" }] })
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ versions: { "999.0.0": {} } }) })
   try {
     plugin.apply(ctx, plugin.Config({ pythonSync: false }))
     const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
     const value = await tool.execute({ action: "apply" })
     assert.equal(value.result.ok, true)
     assert.equal(installed.length, 1)
-    assert.match(installed[0].spec, /^git\+https:\/\/github\.com\/citydirector\/ui-locate-mcp\.git#v999\.0\.0$/)
+    // 必须是 registry 形式：装成 github: 之后 DSH 插件页就没有更新按钮了
+    assert.equal(installed[0].spec, `${NPM_PACKAGE}@999.0.0`)
     assert.ok(installed[0].options.requestId, "要给 requestId，否则取消不了")
     assert.match(value.result.note, /Python/)
     ctx._disposeAll()
@@ -954,7 +967,7 @@ check("index：apply 认得不裹 ok 的 installBundle 返回值（同进程调�
     },
   }
   const realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => [{ name: "v999.0.0" }] })
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ versions: { "999.0.0": {} } }) })
   try {
     plugin.apply(ctx, plugin.Config({ pythonSync: false }))
     const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
@@ -979,7 +992,7 @@ check("index：installBundle 报告 application=failed 时不能说成功", asyn
     },
   }
   const realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => [{ name: "v999.0.0" }] })
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ versions: { "999.0.0": {} } }) })
   try {
     plugin.apply(ctx, plugin.Config({ pythonSync: false }))
     const tool = ctx._tools.find((item) => item.name === "ui_locate_update")

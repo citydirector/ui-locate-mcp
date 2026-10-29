@@ -262,9 +262,9 @@ DSH 自带的 Python，也绕开了「PATH 里那个 python 是 Microsoft Store 
 
 所以「装完插件环境没起来」这件事，Agent 自己就能查、能修，不需要人来点。
 
-**为什么索引里写的是 git、而环境要另外准备**：索引只描述「怎么把包拉下来」，
-拉下来的是**源码 + patch**；Python 依赖与模型体积大、与平台强相关，不适合塞进
-包体，所以交给 Host 半身按需准备。这是刻意分工，不是遗漏。
+**为什么环境要另外准备**：索引只描述「怎么把包拉下来」，拉下来的是**代码 +
+patch**；Python 依赖与模型体积大、与平台强相关，不适合塞进包体，所以交给 Host
+半身按需准备。这是刻意分工，不是遗漏。
 
 ### 方式二：手写进 profile（本地开发用）
 
@@ -323,7 +323,7 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 | `UI_LOCATE_MIN_EDGE` | 跳过空白块的边缘密度下限 | `0.0008` |
 | `UI_LOCATE_MAX_SIDE` | 分块时每块长边 | `960` |
 | `UI_LOCATE_OCR_CUDA` | `1` 让 OCR 也走 GPU | 关 |
-| `DSH_UI_LOCATE_UPDATE_API` | 换掉查版本的 GitHub API 地址（自建镜像 / 离线测试） | `https://api.github.com` |
+| `UI_LOCATE_REGISTRY` | 换掉查版本用的 npm registry（自建镜像 / 离线测试） | `https://registry.npmjs.org` |
 | `DSH_UI_LOCATE_UPDATE_DELAY_MS` | 启动后隔多久查第一次 | `8000` |
 | `UI_LOCATE_PYTHON` | 准备环境时用哪个解释器 | DSH 自带的那个 |
 
@@ -356,7 +356,7 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 它注册了工具 `ui_locate_update`：
 
 ```
-ui_locate_update(action: "check")   # 只读发布标签，报版本差异
+ui_locate_update(action: "check")   # 只读 registry 上的版本列表，报版本差异
 ui_locate_update(action: "apply")   # 装最新版本（会改动本机插件）
 ```
 
@@ -366,10 +366,38 @@ ui_locate_update(action: "apply")   # 装最新版本（会改动本机插件）
 本身没有可执行代码。DSH 的插件管理器能装 JS/YAML 那部分，但**装不到 venv 里的
 Python 包**——而那才是真正会改进的部分（算法、模型、OCR 参数）。
 
+### 更新走 npm，不走 GitHub 标签
+
+**这是一条硬约束，不是偏好。** DSH 插件页的更新按钮只有一个判据
+（`dsh-plugin-manager` 的 `updateRefusal()`）：
+
+```js
+const parsed = parsedForRegistry(bundle.source)
+if (parsed.kind !== "registry" || parsed.name !== bundle.name || parsed.range?.includes(":") === true)
+    return `${bundle.name} is not installed from a registry under its own name`
+```
+
+也就是说：**只有装的是 registry 包，界面里才有更新入口**。依赖写成
+`github:owner/repo` 时 `kind === "git"`，这一条永远不成立——插件装得好好的，
+但永远看不到「有新版本」。
+
+所以整条链路都统一到 registry：
+
+| 环节 | 用什么 | 装完依赖变成 |
+|---|---|---|
+| 插件页「安装」 | `ui-locate-mcp` | `0.4.0` |
+| 插件页「更新」（原生） | `ui-locate-mcp@0.4.1` | `0.4.1` |
+| `ui_locate_update(apply)` | `ui-locate-mcp@0.4.1` | `0.4.1` |
+| 市场索引 `market-index.json` | `{"type": "npm"}` | `0.4.1` |
+
+**三者必须同源。** 只要有一段往 `git+https://...#vX.Y.Z` 走，它装完就会把
+profile 的依赖改回 `github:` 形式，下一次界面里就没有更新按钮了——这正是 0.4.0
+之前的状态。
+
 ### 更新是两段，顺序不能颠倒
 
-1. **JS 侧**：`pluginManager.installBundle('git+<url>#vX.Y.Z')`，DSH 用它装官方
-   插件的方式装本包，落到 profile 的 `node_modules`，然后热替换本插件。
+1. **JS 侧**：`pluginManager.installBundle('ui-locate-mcp@X.Y.Z')`，DSH 用它装
+   官方插件的方式装本包，落到 profile 的 `node_modules`，然后热替换本插件。
 2. **Python 侧**：新版本的源码这时才出现在 `node_modules` 里，所以只能在**换上
    来之后**执行。它由「新实例启动时发现版本不一致」触发，不塞进 install 的同一
    段流程——那样会拿旧路径去装新版本。
@@ -379,21 +407,34 @@ Python 包**——而那才是真正会改进的部分（算法、模型、OCR �
 
 ### 只查不装
 
-`updateCheck` 默认开着，但**检查本身从不安装任何东西**——它只读发布标签并记下
-结论。安装必须由一次显式的工具调用触发。
+`updateCheck` 默认开着，但**检查本身从不安装任何东西**——它只读 registry 上的
+版本列表并记下结论。安装必须由一次显式的工具调用触发。
+
+检查读的是 `https://registry.npmjs.org/<包名>` 的 `versions` 字段，**只要三段式
+正式版**（`1.2.3`），预发布（`1.2.3-rc.1`）一律跳过：自动装的东西必须是确定的。
 
 ### 发布新版本时要做什么
 
-两处版本号必须一起改，否则每次启动都会白装一次 Python 侧：
+**三处版本号必须一起改**，否则会出现「包装上了但 Python 侧还是旧的」或者
+「索引说 0.5.0、npm 上还是 0.4.0」这种自相矛盾：
 
 - `package.json` 的 `version`
 - `pyproject.toml` 的 `[project] version`
+- `market-index.json`（用 `make_index.py --npm` 重新生成）
 
-然后打一个 `vX.Y.Z` 标签（只认这三段，预发布标签会被忽略）+ 推上去：
+发布流程：
 
 ```bash
-git tag v0.2.1 && git push gh main --tags
+# 1. 改两处版本号 → 跑测试 → 提交
+# 2. 发到 npm（网页或 CI；本地 npm publish 也行）
+npm publish --access public
+# 3. 重生成索引并提交
+python scripts/make_index.py --npm --out market-index.json
+python scripts/make_index.py --check market-index.json
 ```
+
+**不再需要打 git 标签**：更新源是 registry，GitHub 那边只用来放源码和索引。
+（`vX.Y.Z` 标签仍然值得打，方便人对照，但程序不看它。）
 
 ### 五个配置项
 
@@ -441,7 +482,7 @@ python -m unittest discover -s tests -p "test_*.py"
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 插件行为测试（69 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json 的写与读、后台任务的失败处置）
+# 插件行为测试（70 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json 的写与读、后台任务的失败处置）
 node --test tests/
 ```
 
@@ -865,6 +906,19 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     看到 `stage: "act"`，于是去查目标窗口对不对 —— 而真正的问题可能是这个
     进程既抓不了屏也注入不了输入（`SendInput` 全部失败、`last_error=5`）。
     这两件事该查的方向完全相反。现在早退分支也会带上 `verify_unavailable`。
+
+36. **两条更新链路必须同源，否则互相拆台**。DSH 插件页的更新按钮只认
+    registry 包（`updateRefusal()` 要求 `parseInstallSpec()` 得到的
+    `kind === "registry"`）。如果依赖是 `github:owner/repo`，按钮永远不出现；
+    而如果只有「读版本」改成 registry、`installBundle` 仍然传
+    `git+https://...#vX.Y.Z`，那么**自研更新器升一次就会把依赖写回 git 形式**，
+    界面里的按钮随即消失 —— 修了一半比没修更难查，因为它是「升一次好一次、
+    再升一次坏掉」的间歇性表现。判据、读源、装法、市场索引四处必须一起改。
+
+37. **`npm publish` 的三道门槛不会在打包时检查**。`private: true`（直接拒绝）、
+    缺 `license` 字段、缺 `LICENSE` 文件。这三条对「用 git 装」完全无感 ——
+    装得上、跑得动，只有真要发 npm 时才一次性全崩。所以 `check_bundle.py`
+    现在把这三条并进 [1b] 段，让它们在**打包前**就红。
 
 ## 文件
 
