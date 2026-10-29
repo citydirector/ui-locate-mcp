@@ -47,6 +47,34 @@ if not pkg_path.is_file():
 pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
 ok(f"name={pkg.get('name')} version={pkg.get('version')}")
 
+# ── 发布到 npm 的门槛 ─────────────────────────────────────────────────────
+# 这几条以前没人查，结果是：包能装（git 源不看这些字段），但一旦想发 npm
+# 就全线崩 —— private:true 让 npm publish 直接拒，缺 license 会被 npm 警告
+# 甚至拒（取决于 registry 策略），而缺 LICENSE 文件在某些法务审查里是硬门槛。
+print("\n[1b] npm 发布门槛")
+if pkg.get("private") is True:
+    bad('package.json 有 "private": true —— npm publish 会直接拒绝。'
+        "要发 npm 就必须去掉它")
+else:
+    ok("没有 private:true")
+if not str(pkg.get("license") or "").strip():
+    bad("缺少 license 字段（npm 会警告，某些 registry 会拒）")
+else:
+    ok(f"license={pkg.get('license')}")
+license_file = next((n for n in ("LICENSE", "LICENSE.md", "LICENSE.txt") if (PKG / n).is_file()), None)
+if license_file is None:
+    bad("缺少 LICENSE 文件")
+else:
+    ok(f"LICENSE 文件存在（{license_file}，{(PKG / license_file).stat().st_size} 字节）")
+if not str(pkg.get("description") or "").strip():
+    bad("缺少 description（npm 列表页会是空的）")
+else:
+    ok("description 非空")
+if not (pkg.get("keywords") or []):
+    warn("缺少 keywords（影响 npm 搜索）")
+else:
+    ok(f"keywords {len(pkg['keywords'])} 个")
+
 patch_rel = (pkg.get("dsh") or {}).get("bundle", {}).get("patch")
 if not patch_rel:
     bad("缺少 dsh.bundle.patch")

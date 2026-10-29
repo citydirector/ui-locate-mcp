@@ -13,11 +13,18 @@ import { execFile } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
-/** 本插件发布所在的仓库。 */
+/** 本插件的仓库，只用于展示（`ui_locate_update` 的返回值里带上它，方便人去看）。 */
 export const UPDATE_REPOSITORY = "citydirector/ui-locate-mcp"
+
+/** npm 上的包名，同时也**是**更新源的主键。 */
+export const NPM_PACKAGE = "ui-locate-mcp"
+
+/** 默认读的 registry。可用 `UI_LOCATE_REGISTRY` 覆盖（镜像）。 */
+export const DEFAULT_REGISTRY = "https://registry.npmjs.org"
 
 /** Python 包名，用来问 venv 里装的是哪个版本。 */
 export const PYTHON_PACKAGE = "ui-locate-mcp"
+
 
 /**
  * 只认 `vX.Y.Z`。
@@ -319,34 +326,54 @@ async function canRunPython(python, { exec }) {
 // ── 发布源 ─────────────────────────────────────────────────────────────────
 
 /**
- * 读 GitHub 的 tag 列表。
+ * 读 npm registry 上这个包发布过的版本。
  *
- * 只读公开仓库、不带凭据：这里没有可泄露的东西，也不需要用户配 token。
+ * **为什么从 GitHub tag 换成 registry**：DSH 的插件页只有在「装的是 registry
+ * 包」时才会显示更新按钮 —— `updateRefusal()` 要求 `parseInstallSpec()` 得到的
+ * `kind === "registry"`。依赖写成 `github:...` 时这一条永远不成立，界面里没有
+ * 更新入口。既然更新入口只能建立在 registry 上，**我们自己的更新器也必须
+ * 从 registry 读、往 registry 装**，否则它升一次就会把依赖写回 `github:`，
+ * 好不容易出现的按钮又没了。
  *
- * @param options - `{ repository, api, fetch, signal }`，测试用。
- * @returns 标签名数组。
+ * 返回值刻意做成和以前一样的 `vX.Y.Z` 字符串数组：下游的
+ * `parseReleaseTag` / `latestRelease` / `updateVerdict` 一行都不用改。
+ *
+ * 只读公开 registry、不带凭据：这里没有可泄露的东西，也不需要用户配 token。
+ *
+ * @param options - `{ name, registry, fetch, signal }`，测试用。
+ * @returns 形如 `["v0.4.0", "v0.4.1"]` 的版本标签数组（未排序）。
  */
-export async function fetchReleaseTags({
-  repository = UPDATE_REPOSITORY,
-  api = "https://api.github.com",
+export async function fetchPublishedVersions({
+  name = NPM_PACKAGE,
+  registry = process.env.UI_LOCATE_REGISTRY || DEFAULT_REGISTRY,
   fetch: request = fetch,
   signal,
 } = {}) {
-  const response = await request(`${api.replace(/\/+$/, "")}/repos/${repository}/tags?per_page=100`, {
-    headers: {
-      accept: "application/vnd.github+json",
-      "user-agent": "ui-locate-mcp",
-      "x-github-api-version": "2022-11-28",
-    },
+  const base = String(registry).replace(/\/+$/, "")
+  // 带 scope 的包名要按 npm 的规则把 `/` 编码成 %2F，这里统一 encode 一次。
+  const url = `${base}/${encodeURIComponent(name)}`
+  const response = await request(url, {
+    headers: { accept: "application/json", "user-agent": "ui-locate-mcp" },
     signal,
   })
+  if (response.status === 404) {
+    throw new Error(`${name} is not published on ${base} yet`)
+  }
   if (!response.ok) {
-    const limited = response.status === 403 || response.status === 429
-    throw new Error(limited ? `GitHub rate limit (HTTP ${response.status})` : `GitHub answered HTTP ${response.status}`)
+    const limited = response.status === 429
+    throw new Error(limited ? `registry rate limit (HTTP ${response.status})` : `registry answered HTTP ${response.status}`)
   }
   const body = await response.json()
-  if (!Array.isArray(body)) throw new Error("GitHub answered something other than a tag list")
-  return body.map((item) => item?.name).filter((value) => typeof value === "string")
+  const versions = body?.versions
+  if (versions === null || typeof versions !== "object" || Array.isArray(versions)) {
+    throw new Error("registry answered something other than a version map")
+  }
+  const tags = []
+  for (const raw of Object.keys(versions)) {
+    // 预发布（`1.0.0-rc.1`）不参与：自动装的东西必须是确定的。
+    if (RELEASE_TAG.test(`v${raw}`)) tags.push(`v${raw}`)
+  }
+  return tags
 }
 
 // ── 更新状态机 ─────────────────────────────────────────────────────────────
@@ -357,11 +384,14 @@ export async function fetchReleaseTags({
  * 和框架无关，所以能完整测到（包括失败路径和时间安排）。它**从不安装任何
  * 东西**——安装是 `index.mjs` 在收到显式工具调用时才做的事。
  *
+ * 参数的键名仍叫 `fetchTags`（下游测试与状态机都按这个名字），但它现在
+ * 读的是 registry 上的版本列表，不再读 GitHub 标签。
+ *
  * @param options - `{ readVersion, fetchTags, delayMs, intervalMs, now, log, timeoutMs }`。
  */
 export function createUpdateTracker({
   readVersion = () => packageVersion(),
-  fetchTags = (options) => fetchReleaseTags(options),
+  fetchTags = (options) => fetchPublishedVersions(options),
   delayMs = 8000,
   intervalMs = 12 * 60 * 60 * 1000,
   now = () => Date.now(),
@@ -478,10 +508,16 @@ export function createUpdateTracker({
       if (settled && doc.update.stale === "available") delete doc.update.stale
       // 只有真能装上时才给出安装 spec：已经是最新版了还留一个「去装这个」
       // 的地址，会让 UI 显示一个点了没有意义的按钮。
+      //
+      // spec 必须是 **registry 形式**（`<包名>@<版本>`），不能是
+      // `git+https://...#vX.Y.Z` —— 后者装完会把 profile 的依赖写成
+      // `github:...`，DSH 插件页的更新按钮随即消失（`updateRefusal()` 要求
+      // `kind === "registry"`）。这一条是和「读 registry」配套的，改一个
+      // 不改另一个等于白改。
       if (doc.update.state === "available" && doc.update.latest !== undefined) {
-        doc.update.spec = `git+https://github.com/${UPDATE_REPOSITORY}.git#${doc.update.latest}`
+        doc.update.spec = `${NPM_PACKAGE}@${doc.update.latest.replace(/^v/, "")}`
       } else if (doc.update.stale === "available" && doc.update.latest !== undefined) {
-        doc.update.spec = `git+https://github.com/${UPDATE_REPOSITORY}.git#${doc.update.latest}`
+        doc.update.spec = `${NPM_PACKAGE}@${doc.update.latest.replace(/^v/, "")}`
       }
       return doc
     },
