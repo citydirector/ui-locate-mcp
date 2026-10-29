@@ -1,0 +1,114 @@
+name: Release
+
+# Publishes the package to npm from a tag, using npm's trusted publishing (OIDC).
+# No NPM_TOKEN secret exists anywhere: the runner exchanges its short-lived GitHub
+# identity for a token that npm scopes to this repository and this workflow file.
+#
+# Trusted publishing only authorizes a publish that carries provenance, so
+# --provenance is not optional here.
+#
+# One-time setup, on npmjs.com → the package → Settings → Trusted publisher:
+#   publisher  GitHub Actions
+#   repository citydirector/ui-locate-mcp
+#   workflow   release.yml
+#   environment (leave empty)
+# Until that is saved, this workflow fails with 403 and nothing else can fix it.
+#
+# setup-node is deliberately NOT given a registry-url, and the publish step deletes
+# any _authToken line from the npmrc. With registry-url set, setup-node writes
+# "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}"; this workflow has no such
+# secret, so the value is empty — and npm treats a present-but-empty _authToken as
+# the credential to use, never performing the OIDC exchange. The registry answers
+# that with a misleading 404 ("Not found"), not 401. Measured on the first run of
+# the sibling dsh-pwsh-plugin workflow: provenance was signed, sigstore logged it,
+# and the PUT still 404'd.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish (e.g. v0.5.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # the OIDC token trusted publishing is built on
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Trusted publishing needs npm 11.5.1 or newer, and it only takes effect when
+      # no _authToken is configured. Both are checked here rather than assumed: a
+      # stale npmrc turns the publish into an opaque 404 instead of an error that
+      # says what is wrong.
+      - name: Check the publish prerequisites
+        run: |
+          npm --version
+          node -e "const [a,b,c]=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (a<11||(a===11&&(b<5||(b===5&&c<1)))) { console.error('npm 11.5.1 or newer is required'); process.exit(1) }"
+          if npm config get //registry.npmjs.org/:_authToken >/dev/null 2>&1; then
+            echo "removing a configured _authToken so trusted publishing is used"
+            npm config delete //registry.npmjs.org/:_authToken
+          fi
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NODE_AUTH_TOKEN is set; it would override trusted publishing" >&2
+            exit 1
+          fi
+
+      # The version in package.json is what the update check compares against the
+      # registry, so a mismatch here would publish a version nobody can upgrade to.
+      - name: Verify the tag matches package.json
+        run: node scripts/release-check.mjs
+
+      # The npm publish gates that have nothing to do with the code: a private flag,
+      # a missing license field, a missing LICENSE file. All three install fine from
+      # git, so they only ever fail on publish day — check them before packing.
+      - name: Check the bundle before packing
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          pkg = json.load(open('package.json', encoding='utf-8'))
+          bad = []
+          if pkg.get('private') is True:
+              bad.append('package.json has "private": true — npm publish refuses outright')
+          if not pkg.get('license'):
+              bad.append('package.json has no "license" field')
+          if not os.path.isfile('LICENSE'):
+              bad.append('LICENSE file is missing')
+          if not pkg.get('description'):
+              bad.append('package.json has no "description"')
+          if bad:
+              print('\n'.join('release: ' + line for line in bad), file=sys.stderr)
+              sys.exit(1)
+          print('package: ' + pkg['name'] + '@' + pkg['version'] + ' is publishable')
+          PY
+
+      - name: Show what will be published
+        run: npm pack --dry-run
+
+      - name: Publish
+        run: npm publish --provenance --access public
+
+      - name: Report what landed
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "published $name@$version"
+          npm view "$name@$version" dist.tarball dist.integrity --json || true
