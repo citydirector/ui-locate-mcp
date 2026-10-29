@@ -33,7 +33,9 @@
     "src/**/*.py",
     "scripts/*.ps1",
     "README.md",
-    "market-index.json"
+    "market-index.json",
+    "docs",
+    "README.en.md"
   ],
   "dsh": {
     "bundle": {
