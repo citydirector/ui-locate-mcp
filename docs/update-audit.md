@@ -1,6 +1,6 @@
-# 更新机制核对（2026-10-29，0.6.0）
+# 更新机制核对（2026-10-30，0.6.1）
 
-0.6.0 起，插件自身的新版本**只由 DSH 插件页管理**，本包不再有第二条更新链路。
+0.6.1 起，插件自身的新版本**只由 DSH 插件页管理**，本包不再有第二条更新链路。
 
 ## 现在的分工
 
@@ -19,7 +19,7 @@
    `github:owner/repo`，而 `updateRefusal()` 要求 `kind === "registry"` ——
    插件页的更新按钮随即消失。表现是「升一次好一次、再升一次坏掉」。
 
-0.6.0 删掉的是：`updateCheck` 配置项、`createUpdateTracker`、`fetchPublishedVersions`、
+这次删掉的是：`updateCheck` 配置项、`createUpdateTracker`、`fetchPublishedVersions`、
 `updateVerdict` / `latestRelease` / `parseReleaseTag` / `compareVersions`、
 `ui_locate_update` 工具、`pluginManager` 按需注入与两个 update timer effect。
 
