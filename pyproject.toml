@@ -1,6 +1,6 @@
 [project]
 name = "ui-locate-mcp"
-version = "0.6.0"
+version = "0.6.1"
 description = "Lightweight local visual grounding engine: find on-screen elements by text and get pixel-exact coordinates"
 license = { text = "MIT" }
 readme = "README.md"
