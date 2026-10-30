@@ -45,7 +45,7 @@ const SCHEMASTERY_SRC = `/**
  *
  * 真的 schemastery 会把 z.object({...}) 变成一个「可以调用、也能直接读字段」
  * 的东西——字段本身是带 .get() 的 volatile 引用。这里复刻的正是这两个性质，
- * 因为 apply() 依赖它们：config.updateCheck.get() 拿当前值，Config({}) 能拿
+ * 因为 apply() 依赖它们：config.pythonSync.get() 拿当前值，Config({}) 能拿
  * 默认值建一份新实例。
  */
 
