@@ -39,12 +39,16 @@
           UI_LOCATE_HOME: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}`'
         # 首次调用要等常驻服务预热（CUDA 约 35 秒 / DirectML 约 2 秒）+ 一次整页 OCR
         toolCallTimeoutMs: 180000
-    # 更新器。名字用**包名**而不是 ./plugin/index.mjs：DSH 会把相对名解析成
-    # 绝对 file URL，配置编辑器首次保存就把那个绝对路径写进用户 patch，便携版
-    # 一搬目录就断。包名则会走 package.json 的 exports["."]。
+    # Host 半身：准备 Python 运行环境，并让 venv 里的包跟着 npm 包版本走。
+    #
+    # 更新不在这里 —— 插件自己的新版本由 DSH 插件页管（依赖是 registry 形式时
+    # 那一页就有更新按钮）。这一段只负责宿主不管的那半：venv 里的 Python 包。
+    #
+    # 名字用**包名**而不是 ./plugin/index.mjs：DSH 会把相对名解析成绝对 file
+    # URL，配置编辑器首次保存就把那个绝对路径写进用户 patch，便携版一搬目录
+    # 就断。包名则走 package.json 的 exports["."]。
     - id: ui-locate-update
       name: ui-locate-mcp
       config:
-        updateCheck: true
         pythonSync: true
 

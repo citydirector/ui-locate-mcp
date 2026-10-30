@@ -43,7 +43,6 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `list_monitors` | Display sizes, origins and indices |
 | `health` | Check service readiness |
 | `ui_locate_setup` | Prepare or rebuild Python dependencies and models |
-| `ui_locate_update` | Check or install an npm update |
 
 The first nine entries come from MCP; the last two are Host tools. The host may prefix tool names with a namespace.
 
@@ -60,7 +59,6 @@ The Host row ID is `ui-locate-update`; the MCP row is `mcp-ui-locate`.
 
 | Host setting | Default | Meaning |
 | --- | --- | --- |
-| `updateCheck` | `true` | Periodic npm checks; does not automatically install the JS bundle |
 | `pythonSync` | `true` | Synchronize the Python package with the bundle's declared version |
 | `runtimeDir` | Empty | Python environment, state and logs |
 | `modelDir` | Empty | Model directory; existing models can be reused |
@@ -72,9 +70,21 @@ The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCA
 
 ## Updates
 
-**The current code retains its own updater, now using npm.** By default it checks after about 8 seconds and every 12 hours afterwards. Installation is requested from the UI or `ui_locate_update(action="apply")`; `action="check"` only checks.
+**The plugin itself is updated by the DSH plugin page; this package no longer ships
+an updater of its own.** The dependency is a registry spec (`ui-locate-mcp`), so that
+row grows a native update button backed by the host's own plugin manager.
 
-DSH installs the npm bundle first; the replacement instance then synchronizes Python according to `pythonSync`. This is separate from initial runtime setup. Disabling `updateCheck` stops scheduled checks but does not remove the tool. See the [update audit](docs/update-audit.md) for code entrypoints.
+What this package still owns is the half the host does not: after npm swaps the
+package, the copy inside the venv is still the old one. Every startup compares the
+two versions and reinstalls with `pip install --no-deps` when they differ (turn it
+off with `pythonSync`). Running it at startup is also self-healing — a failure here
+does not undo the JS side, and the next start tries again.
+
+Before 0.5.x this repository carried a whole updater of its own (read a version
+list, then call `installBundle`). It was removed because it was a second update path
+running alongside the plugin page: the two disagreed about what was latest, and its
+installs rewrote the dependency back to `github:`, which made the plugin page's
+button disappear. See the [update audit](docs/update-audit.md).
 
 ## Troubleshooting and limits
 

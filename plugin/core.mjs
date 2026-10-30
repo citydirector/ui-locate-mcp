@@ -1,96 +1,31 @@
 /**
- * 更新逻辑里与框架无关的那部分：版本比较、发布源读取、venv 同步、状态机。
+ * 与框架无关的那部分：读本包元数据、算运行目录、问 venv 里的 Python 版本、
+ * 把 Python 侧同步到包内声明的版本。
  *
  * 单独成文件的原因是可测——这里一行 Cordis 都没有，测试可以直接用真 node
- * 跑，不需要给 `@deepseek-ai/dsh-tools` 造桩。`index.mjs` 只负责把它接到
- * Host 上。
+ * 跑，不需要给宿主包造桩。`index.mjs` 只负责把它接到 Host 上。
  *
- * 所有会碰外部世界的东西（`fetch`、`execFile`、时钟）都从参数注入，测试
- * 因此不需要开端口、不需要真的装包。
+ * 所有会碰外部世界的东西（`execFile`）都从参数注入，测试因此不需要真的
+ * 装包。
+ *
+ * ## 这里**没有**更新检查
+ *
+ * 插件的新版本由 DSH 插件页自己管：装上 registry 包之后，那一页就会给每个
+ * 三方可更新插件显示更新按钮，走的是宿主自己的 `pluginManager`。我们不再
+ * 自己读版本列表、也不再自己装——两套并行的更新链路只会互相打架（各自认为
+ * 什么是最新的，还能把对方的依赖写法改掉）。
+ *
+ * 保留下来的只有**版本同步**：npm 包换新之后，venv 里那份 Python 包还是旧的，
+ * 这一层宿主不管，必须由我们自己补上。
  */
 
 import { execFile } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
-/** 本插件的仓库，只用于展示（`ui_locate_update` 的返回值里带上它，方便人去看）。 */
-export const UPDATE_REPOSITORY = "citydirector/ui-locate-mcp"
-
-/** npm 上的包名，同时也**是**更新源的主键。 */
-export const NPM_PACKAGE = "ui-locate-mcp"
-
-/** 默认读的 registry。可用 `UI_LOCATE_REGISTRY` 覆盖（镜像）。 */
-export const DEFAULT_REGISTRY = "https://registry.npmjs.org"
-
 /** Python 包名，用来问 venv 里装的是哪个版本。 */
 export const PYTHON_PACKAGE = "ui-locate-mcp"
 
-
-/**
- * 只认 `vX.Y.Z`。
- *
- * 预发布标签故意不认：自动装的东西必须是确定的，`-rc.1` 这种随时会被替换。
- */
-const RELEASE_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
-
-// ── 版本比较 ───────────────────────────────────────────────────────────────
-
-/**
- * 读一个发布标签。
- *
- * @param tag - git 标签名。
- * @returns `[major, minor, patch]`；不是 `vX.Y.Z` 时返回 undefined。
- */
-export function parseReleaseTag(tag) {
-  const match = RELEASE_TAG.exec(String(tag ?? "").trim())
-  return match === null ? undefined : [Number(match[1]), Number(match[2]), Number(match[3])]
-}
-
-/**
- * 比较两个版本号，写 `X.Y.Z` 或 `vX.Y.Z` 都行。
- *
- * @returns 负数、零、正数，行为同排序比较器；解析不出来的排在后面。
- */
-export function compareVersions(a, b) {
-  const tag = (value) => (String(value ?? "").startsWith("v") ? String(value) : `v${value}`)
-  const pa = parseReleaseTag(tag(a))
-  const pb = parseReleaseTag(tag(b))
-  if (pa === undefined || pb === undefined) {
-    // 解析不出来的排到后面：调用方是在挑「最新版本」，认不出的标签不该胜出。
-    if (pa === undefined && pb === undefined) return 0
-    return pa === undefined ? 1 : -1
-  }
-  for (let i = 0; i < 3; i += 1) if (pa[i] !== pb[i]) return pa[i] - pb[i]
-  return 0
-}
-
-/**
- * 一组标签里最新的那个发布版本。
- *
- * @param tags - 标签名列表。
- * @returns 最新标签名，或 undefined（一个 `vX.Y.Z` 都没有）。
- */
-export function latestRelease(tags) {
-  let best
-  for (const tag of tags) {
-    if (parseReleaseTag(tag) === undefined) continue
-    if (best === undefined || compareVersions(tag, best) > 0) best = tag
-  }
-  return best
-}
-
-/**
- * 把标签列表和当前版本比一下。
- *
- * @param tags - 发布源里的标签名。
- * @param current - 本包正在跑的版本（`X.Y.Z`）。
- * @returns 有更新时 `{ state: "available", latest }`，否则 `{ state: "current", latest? }`。
- */
-export function updateVerdict(tags, current) {
-  const latest = latestRelease(tags)
-  if (latest !== undefined && compareVersions(latest, current) > 0) return { state: "available", latest }
-  return { state: "current", ...(latest !== undefined ? { latest } : {}) }
-}
 
 // ── 读本包自己的元数据 ──────────────────────────────────────────────────────
 
@@ -320,206 +255,5 @@ async function canRunPython(python, { exec }) {
     return String(out ?? "").trim().endsWith("1")
   } catch {
     return false
-  }
-}
-
-// ── 发布源 ─────────────────────────────────────────────────────────────────
-
-/**
- * 读 npm registry 上这个包发布过的版本。
- *
- * **为什么从 GitHub tag 换成 registry**：DSH 的插件页只有在「装的是 registry
- * 包」时才会显示更新按钮 —— `updateRefusal()` 要求 `parseInstallSpec()` 得到的
- * `kind === "registry"`。依赖写成 `github:...` 时这一条永远不成立，界面里没有
- * 更新入口。既然更新入口只能建立在 registry 上，**我们自己的更新器也必须
- * 从 registry 读、往 registry 装**，否则它升一次就会把依赖写回 `github:`，
- * 好不容易出现的按钮又没了。
- *
- * 返回值刻意做成和以前一样的 `vX.Y.Z` 字符串数组：下游的
- * `parseReleaseTag` / `latestRelease` / `updateVerdict` 一行都不用改。
- *
- * 只读公开 registry、不带凭据：这里没有可泄露的东西，也不需要用户配 token。
- *
- * @param options - `{ name, registry, fetch, signal }`，测试用。
- * @returns 形如 `["v0.4.0", "v0.4.1"]` 的版本标签数组（未排序）。
- */
-export async function fetchPublishedVersions({
-  name = NPM_PACKAGE,
-  registry = process.env.UI_LOCATE_REGISTRY || DEFAULT_REGISTRY,
-  fetch: request = fetch,
-  signal,
-} = {}) {
-  const base = String(registry).replace(/\/+$/, "")
-  // 带 scope 的包名要按 npm 的规则把 `/` 编码成 %2F，这里统一 encode 一次。
-  const url = `${base}/${encodeURIComponent(name)}`
-  const response = await request(url, {
-    headers: { accept: "application/json", "user-agent": "ui-locate-mcp" },
-    signal,
-  })
-  if (response.status === 404) {
-    throw new Error(`${name} is not published on ${base} yet`)
-  }
-  if (!response.ok) {
-    const limited = response.status === 429
-    throw new Error(limited ? `registry rate limit (HTTP ${response.status})` : `registry answered HTTP ${response.status}`)
-  }
-  const body = await response.json()
-  const versions = body?.versions
-  if (versions === null || typeof versions !== "object" || Array.isArray(versions)) {
-    throw new Error("registry answered something other than a version map")
-  }
-  const tags = []
-  for (const raw of Object.keys(versions)) {
-    // 预发布（`1.0.0-rc.1`）不参与：自动装的东西必须是确定的。
-    if (RELEASE_TAG.test(`v${raw}`)) tags.push(`v${raw}`)
-  }
-  return tags
-}
-
-// ── 更新状态机 ─────────────────────────────────────────────────────────────
-
-/**
- * 一个只在内存里的更新跟踪器：记当前状态、做检查、排出下一次检查。
- *
- * 和框架无关，所以能完整测到（包括失败路径和时间安排）。它**从不安装任何
- * 东西**——安装是 `index.mjs` 在收到显式工具调用时才做的事。
- *
- * 参数的键名仍叫 `fetchTags`（下游测试与状态机都按这个名字），但它现在
- * 读的是 registry 上的版本列表，不再读 GitHub 标签。
- *
- * @param options - `{ readVersion, fetchTags, delayMs, intervalMs, now, log, timeoutMs }`。
- */
-export function createUpdateTracker({
-  readVersion = () => packageVersion(),
-  fetchTags = (options) => fetchPublishedVersions(options),
-  delayMs = 8000,
-  intervalMs = 12 * 60 * 60 * 1000,
-  now = () => Date.now(),
-  log = () => {},
-  timeoutMs = 20000,
-} = {}) {
-  /** state ∈ off | pending | checking | current | available | failed */
-  let update = { state: "pending" }
-  let running
-  let delayTimer
-  let intervalTimer
-  const abort = new AbortController()
-
-  const stamp = () => new Date(now()).toISOString()
-
-  return {
-    /** 当前状态的一份快照（调用方可以随便改，不影响内部）。 */
-    get state() {
-      return { ...update }
-    },
-
-    /** 一次检查。已有检查在跑时复用同一个 Promise，不叠加请求。 */
-    check() {
-      if (running !== undefined) return running
-      const version = readVersion()
-      if (version === undefined) {
-        update = { state: "failed", error: "own version unreadable", checkedAt: stamp() }
-        return Promise.resolve(update)
-      }
-      const previous = update
-      update = { ...previous, state: "checking" }
-      const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(timeoutMs)])
-      running = fetchTags({ signal })
-        .then(
-          (tags) => {
-            update = { ...updateVerdict(tags, version), checkedAt: stamp() }
-            log(`update check: ${update.state}${update.latest ? ` (newest ${update.latest}, running ${version})` : ""}`)
-          },
-          (error) => {
-            if (abort.signal.aborted) return
-            const message =
-              error?.name === "TimeoutError" || error?.name === "AbortError"
-                ? "timed out"
-                : String(error?.message ?? error).split("\n")[0].slice(0, 200)
-            // 保留上次查到的版本：一次网络抖动不该把已知的新版本藏起来。
-            update = {
-              ...(previous.latest !== undefined ? { latest: previous.latest } : {}),
-              state: "failed",
-              error: message,
-              checkedAt: stamp(),
-              ...(previous.state === "available" ? { stale: "available" } : {}),
-            }
-            log(`update check failed: ${message}`)
-          },
-        )
-        .then(() => update)
-        .finally(() => {
-          running = undefined
-        })
-      return running
-    },
-
-    /**
-     * 跟着开关走：开着就排期，关了就把 timer 清掉。
-     *
-     * @param enabled - 是否继续检查。
-     */
-    schedule(enabled) {
-      if (!enabled) {
-        clearTimeout(delayTimer)
-        clearInterval(intervalTimer)
-        delayTimer = undefined
-        intervalTimer = undefined
-        update = { state: "off" }
-        return
-      }
-      if (delayTimer !== undefined || intervalTimer !== undefined) return
-      if (update.state === "off") update = { state: "pending" }
-      delayTimer = setTimeout(() => {
-        delayTimer = undefined
-        void this.check()
-        intervalTimer = setInterval(() => void this.check(), intervalMs)
-        intervalTimer.unref?.()
-      }, delayMs)
-      delayTimer.unref?.()
-    },
-
-    /** 停掉一切：清 timer、掐断在飞的请求。 */
-    dispose() {
-      abort.abort()
-      clearTimeout(delayTimer)
-      clearInterval(intervalTimer)
-      delayTimer = undefined
-      intervalTimer = undefined
-    },
-
-    /**
-     * 一页能看懂的当前状态。
-     *
-     * 早先查到的「有更新」可能已经装上了，所以按当前版本再过一遍。
-     *
-     * @param options - `{ python }`：`{ wanted, installed, venv }`。
-     */
-    document({ python } = {}) {
-      const version = readVersion()
-      const doc = {
-        version,
-        repository: UPDATE_REPOSITORY,
-        update: { ...update },
-      }
-      if (python !== undefined) doc.python = python
-      const settled = version !== undefined && doc.update.latest !== undefined && compareVersions(doc.update.latest, version) <= 0
-      if (settled && doc.update.state === "available") doc.update.state = "current"
-      if (settled && doc.update.stale === "available") delete doc.update.stale
-      // 只有真能装上时才给出安装 spec：已经是最新版了还留一个「去装这个」
-      // 的地址，会让 UI 显示一个点了没有意义的按钮。
-      //
-      // spec 必须是 **registry 形式**（`<包名>@<版本>`），不能是
-      // `git+https://...#vX.Y.Z` —— 后者装完会把 profile 的依赖写成
-      // `github:...`，DSH 插件页的更新按钮随即消失（`updateRefusal()` 要求
-      // `kind === "registry"`）。这一条是和「读 registry」配套的，改一个
-      // 不改另一个等于白改。
-      if (doc.update.state === "available" && doc.update.latest !== undefined) {
-        doc.update.spec = `${NPM_PACKAGE}@${doc.update.latest.replace(/^v/, "")}`
-      } else if (doc.update.stale === "available" && doc.update.latest !== undefined) {
-        doc.update.spec = `${NPM_PACKAGE}@${doc.update.latest.replace(/^v/, "")}`
-      }
-      return doc
-    },
   }
 }

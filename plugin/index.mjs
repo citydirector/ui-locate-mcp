@@ -1,5 +1,5 @@
 /**
- * ui-locate 的 Host 侧插件：查新版本、装新版本、准备 Python 运行环境。
+ * ui-locate 的 Host 侧插件：准备 Python 运行环境，并把它跟着 npm 包版本走。
  *
  * ## 为什么 ui-locate 需要一个 Host 插件
  *
@@ -9,31 +9,27 @@
  * 真正会改进的部分（算法、模型、OCR 参数）。所以需要一段 Host 代码同时
  * 管住两边。
  *
- * ## 三件事
+ * ## 两件事
  *
  * 1. **准备运行环境**（`runtime.mjs`）：venv、依赖、模型。用 DSH 自带的
  *    Python，不要求用户先装 uv，也不需要终端。
  * 2. **界面**（`api.mjs` + `client.js`）：设置里一页「运行环境」，能看见
  *    装到哪一步、装在哪，并且能一键重来。
- * 3. **自我更新**（`core.mjs`）：查 GitHub 的发布标签，装新版本，然后在
- *    新一代实例启动时把 Python 侧同步过去。
  *
- * ## 更新是两段，顺序不能颠倒
+ * ## 更新交给 DSH，这里只管 Python 侧
  *
- * 1. **JS 侧**：`pluginManager.installBundle('git+<url>#vX.Y.Z')`，DSH 用它
- *    装官方插件的方式装本包，落到 profile 的 node_modules，然后热替换本
- *    插件（本实例会被新的取代）。
- * 2. **Python 侧**：新版本的源码这时才出现在 node_modules 里，所以只能在
- *    **换上来之后**执行。第 2 步由「新实例启动时发现版本不一致」触发，
- *    不塞进 install 的同一段流程——那样会拿旧路径去装新版本。
+ * 插件的新版本由 **DSH 插件页自己管**：依赖写成 registry 形式之后，那一页
+ * 就会给这个包显示更新按钮，走宿主自己的 `pluginManager`。我们**不再**自己
+ * 读版本列表、也不再自己装——两套并行的更新链路只会互相打架：各自认为什么
+ * 是最新，而且我们那条装完之后还会把依赖写法改回 `github:`，宿主那边好不容易
+ * 出现的按钮又没了。
  *
- * 这个顺序也给了容错：Python 侧失败不影响 JS 侧已经装好，下次启动会重新
- * 发现不一致并再试一次，不需要用户干预。
+ * 剩下必须自己做的只有一件：npm 包换成新版之后，venv 里那份 Python 包还是
+ * 旧的，这一层宿主不管，由启动时的同步补上。
  *
- * ## 只查不装
- *
- * `updateCheck` 默认开着，但检查本身**从不安装任何东西**——它只读 GitHub
- * 的 tag 列表并记下结论。安装必须由一次显式的工具调用或界面上的按钮触发。
+ * 同步之所以放**启动时**而不是装的时候：新版本的源码要等换上来之后才出现在
+ * node_modules 里，在旧实例里装会拿旧路径去装新版本。放启动时也自带容错 ——
+ * 这一次失败不影响 JS 侧已经装好，下次启动会重新发现不一致并再试一次。
  *
  * 纯逻辑都在 `core.mjs` 与 `runtime.mjs`：那两个文件一行 Cordis 都没有，
  * 可以直接用 node 测。
@@ -45,18 +41,7 @@ import { fileURLToPath } from "node:url"
 import { execFile } from "node:child_process"
 import z from "@deepseek-ai/schemastery"
 import { defineTool, ToolArgsError } from "./tool.mjs"
-import {
-  NPM_PACKAGE,
-  bundledPythonVersion,
-  compareVersions,
-  createUpdateTracker,
-  fetchPublishedVersions,
-  installedPythonVersion,
-  packageVersion,
-  stateDir,
-  syncPythonToBundle,
-  venvPython,
-} from "./core.mjs"
+import { stateDir, syncPythonToBundle } from "./core.mjs"
 import {
   DEFAULT_BACKEND,
   bundledPythonCandidates,
@@ -71,11 +56,11 @@ import { createApi } from "./api.mjs"
 export const name = "ui-locate-update"
 
 /**
- * `tools` 必给：本插件要注册两个工具。
+ * `tools` 必给：本插件要注册一个工具。
  *
- * `pluginManager` 与 `webServer` **刻意不写进 inject**：都是可选能力，
- * 写进去会让整个插件在没有它们的部署里直接起不来，连查版本都做不了。
- * 改为在 apply 里用 `ctx.inject([...])` 按需拿。
+ * `webServer` **刻意不写进 inject**：它是可选能力，写进去会让整个插件在
+ * 没有它的部署里直接起不来，连环境都准备不了。改为在 apply 里用
+ * `ctx.inject([...])` 按需拿。
  */
 export const inject = ["tools"]
 
@@ -83,11 +68,6 @@ export const inject = ["tools"]
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url))
 
 export const Config = z.object({
-  updateCheck: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description("启动几秒后查一次 GitHub 上的新版本，之后每 12 小时一次。只检查，不安装。"),
   pythonSync: z
     .boolean()
     .default(true)
@@ -121,20 +101,8 @@ export const Config = z.object({
 export function apply(ctx, config) {
   /** 最近一次读到的配置值。 */
   let current
-  /** 插件管理器，拿到之后才能安装；没有就只报告。 */
-  let manager
   /** webServer，拿到之后才有设置页接口；没有就只留工具。 */
   let server
-
-  const tracker = createUpdateTracker({
-    // 测试与自建镜像都可以改这个地址；默认打公开的 GitHub。
-    // 读 npm registry 上的版本，不再读 GitHub 标签：DSH 的更新按钮只认
-    // registry 包，我们的更新器也必须跟着同一条源，否则它升一次就把依赖
-    // 写回 github: 形式，按钮又没了。
-    fetchTags: ({ signal }) => fetchPublishedVersions({ signal }),
-    delayMs: readDelay(),
-    log: (line) => log(line),
-  })
 
   function log(line) {
     try {
@@ -144,16 +112,11 @@ export function apply(ctx, config) {
     }
   }
 
-  function readDelay() {
-    const value = Number(process.env.DSH_UI_LOCATE_UPDATE_DELAY_MS)
-    return Number.isFinite(value) && value >= 0 ? value : 8000
-  }
-
   /** 一次 `.get()` 读一个字段；缺省字段用 schema 默认值。 */
   function readConfig() {
     const parsed = config ?? Config({})
     const values = {}
-    for (const field of ["updateCheck", "pythonSync", "runtimeDir", "modelDir", "backend"]) {
+    for (const field of ["pythonSync", "runtimeDir", "modelDir", "backend"]) {
       const ref = parsed[field]
       values[field] = ref !== undefined && typeof ref.get === "function" ? ref.get() : ref
     }
@@ -218,24 +181,6 @@ export function apply(ctx, config) {
       if (item !== undefined) out[key] = lossless(item)
     }
     return out
-  }
-
-  /** venv 里 Python 侧的三项事实，给状态文档用。 */
-  async function pythonFacts() {
-    const home = plan().home
-    const python = venvPython(home)
-    return {
-      wanted: bundledPythonVersion(),
-      installed: await installedPythonVersion(python),
-      venv: existsSync(python),
-      home,
-    }
-  }
-
-  /** 一页能看懂的当前状态，工具的返回值就是这个。 */
-  async function statusDocument() {
-    const python = await pythonFacts()
-    return { ...tracker.document({ python }), home: python.home }
   }
 
   /** 把 Python 侧同步到包内声明的版本；`pythonSync` 关掉时不动。 */
@@ -324,121 +269,7 @@ export function apply(ctx, config) {
     return undefined
   }
 
-  /**
-   * 装一个新版本。
-   *
-   * 只做 JS 侧，Python 侧交给新一代实例的启动钩子（见文件头）。这样失败点
-   * 只有一个，也不需要旧实例去猜新版本的路径。
-   */
-  async function installLatest() {
-    if (manager === undefined) return { ok: false, error: "plugin manager unavailable" }
-    const state = tracker.state
-    if (state.latest === undefined) await tracker.check()
-    const settled = tracker.state
-    if (settled.latest === undefined) {
-      return { ok: false, error: settled.error ?? "no release tag found" }
-    }
-    const tag = settled.latest
-    const running = packageVersion()
-    if (running !== undefined && compareVersions(tag, running) <= 0) {
-      return { ok: true, state: "current", version: running }
-    }
-    // registry 形式：`ui-locate-mcp@0.4.1`。
-    // 不能用 `git+https://...#vX.Y.Z` —— 那样装完依赖会变成 `github:...`，
-    // DSH 插件页的更新按钮随即消失（`updateRefusal()` 要求 kind === "registry"）。
-    const spec = `${NPM_PACKAGE}@${tag.replace(/^v/, "")}`
-    log(`installing ${spec}`)
-    const requestId = globalThis.crypto?.randomUUID?.() ?? `ui-locate-${Date.now()}`
-    let answer
-    try {
-      answer = await manager.installBundle(spec, { requestId })
-    } catch (error) {
-      return { ok: false, error: String(error?.message ?? error) }
-    }
-    // installBundle 的返回形态取决于 manager 是怎么拿到的：
-    //   同进程 `ctx.inject(["pluginManager"])` → 直接就是 install 结果对象，
-    //     带 `application` / `changed` / `version`，**没有 `ok` 字段**。
-    //   跨进程 remote 代理（官方插件页走这条）→ 外面再包一层
-    //     `{ ok: true, value }` 或 `{ ok: false, error }`。
-    // 只按后者判断，会让同进程调用把每次成功都报成 "install failed"（实测踩过）。
-    const wrapped = typeof answer?.ok === "boolean"
-    if (wrapped && !answer.ok) return { ok: false, error: answer?.error?.message ?? "install failed" }
-    const result = wrapped ? answer.value : answer
-    if (result === null || result === undefined) {
-      return { ok: false, error: "the plugin manager returned no result" }
-    }
-    if (result.application === "failed" || result.application === "cancelled") {
-      return { ok: false, error: result.error?.diagnostic ?? result.error?.code ?? String(result.application) }
-    }
-    return {
-      ok: true,
-      state: "installed",
-      tag,
-      application: result.application,
-      restartReason: result.restartReason,
-      version: result.version,
-      // 新实例起来后自己会把 Python 侧补齐；这里只说明它会发生。
-      note: "Python 侧会在新实例启动时自动同步到同一版本",
-    }
-  }
-
   // ── Agent 工具 ───────────────────────────────────────────────────────────
-
-  ctx.tools.register(
-    defineTool({
-      name: "ui_locate_update",
-      description:
-        "检查或安装 ui-locate 插件的新版本。action=check 只读 GitHub 的发布标签并报告版本差异；action=apply 会让 DSH 的插件管理器安装最新标签，并在新实例启动时同步 venv 里的 Python 包。apply 会改动本机已安装的插件。",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          action: {
-            type: "string",
-            description: "check（只检查，默认）或 apply（安装最新版本）",
-          },
-        },
-      },
-      output: {
-        // 标准 JSON Schema：必填写在对象层的 required 数组里，不是属性层。
-        // 每个 object 节点都要显式 additionalProperties，否则宿主编译器
-        // 拒掉整份定义（见 README「必须知道的坑」第 16 条）。
-        schema: {
-          type: "object",
-          additionalProperties: true,
-          properties: {
-            version: { type: "string" },
-            repository: { type: "string" },
-            home: { type: "string" },
-            update: { type: "object", additionalProperties: true },
-            python: { type: "object", additionalProperties: true },
-            result: { type: "object", additionalProperties: true },
-          },
-          required: ["version", "repository", "home", "update", "python"],
-        },
-        render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
-      },
-      async execute(args) {
-        const action = String(args?.action ?? "check")
-        if (action !== "check" && action !== "apply") {
-          return lossless({
-            ...(await statusDocument()),
-            result: { ok: false, error: `unknown action: ${action}` },
-          })
-        }
-        if (action === "check") {
-          if (current?.updateCheck !== false) await tracker.check()
-          return lossless({ ...(await statusDocument()), result: { ok: true, action } })
-        }
-        const installed = await installLatest()
-        return lossless({
-          ...(await statusDocument()),
-          result: { ok: installed.ok !== false, action, ...installed },
-        })
-      },
-      presentCall: (args) => ({ card: "generic", title: "ui_locate_update", rawInput: args }),
-    }),
-  )
 
   /**
    * 准备运行环境。装上插件就能调，不需要用户先开终端。
@@ -549,32 +380,19 @@ export function apply(ctx, config) {
 
   // ── 挂载与生命周期 ────────────────────────────────────────────────────────
 
-  // 插件管理器按需注入：没有它，检查照常，只是装不了。
-  ctx.inject(["pluginManager"], (child) => {
-    manager = child.pluginManager
-    child.effect(
-      () => () => {
-        manager = undefined
-      },
-      "ui-locate: plugin manager",
-    )
-  })
-
-  // 配置变了就跟着变：开关关掉要真的停掉 timer，不能只是停止排期。
+  // 配置变了就跟着变：开关关掉就不该再动 venv。
   ctx.effect(
     () =>
       ctx.on?.("loader/volatile-update", () => {
         readConfig()
-        tracker.schedule(current?.updateCheck !== false)
         syncPython().catch((error) => {
           log(`python sync 失败: ${error?.message ?? error}`)
         })
       }),
-    "ui-locate: follow the update settings",
+    "ui-locate: follow the runtime settings",
   )
 
   readConfig()
-  tracker.schedule(current?.updateCheck !== false)
   // Python 侧自愈：这一代实例启动时，如果 node_modules 里的新版本和 venv
   // 里装的不一致，就在这里补齐。首次安装时 venv 还不存在，会返回 missing。
   //
@@ -584,13 +402,6 @@ export function apply(ctx, config) {
   syncPython().catch((error) => {
     log(`python sync 失败: ${error?.message ?? error}`)
   })
-
-  ctx.effect(
-    () => () => {
-      tracker.dispose()
-    },
-    "ui-locate: update timers",
-  )
 }
 
 export { ToolArgsError }
