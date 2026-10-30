@@ -141,6 +141,8 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     这个问题，不是版本回归。
 
 21. **`installBundle` 的返回形态有两套，只认一套会把每次成功都报成失败**。
+    （历史记录：0.5.x 自研更新器用过这段逻辑，0.6.0 已随更新器一起删除。
+    留在这里是因为只要将来再有人碰 `pluginManager`，这个坑一模一样。）
 
     | 拿到 manager 的方式 | 返回值 |
     |---|---|
@@ -336,9 +338,9 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     捕获鼠标时那个值本来就不变，判据本身失效。要判成没成，比截图。
 
 33. **后台任务没人接 rejection，会把宿主带走**。实测过一次：装上插件、重启
-    DSH，MCP 那半身照常工作、`mcp__ui-locate__*` 全在，但 Host 那半身的两个
-    工具（`ui_locate_update` / `ui_locate_setup`）**一个都没出现**。宿主日志里
-    什么都没有 —— 因为它是被打断的，不是报错退出的。
+    DSH，MCP 那半身照常工作、`mcp__ui-locate__*` 全在，但 Host 那半身的工具
+    （`ui_locate_setup`）**没出现**。宿主日志里什么都没有 —— 因为它是被打断的，
+    不是报错退出的。
 
     现场是这样的链路：
 
@@ -377,13 +379,18 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     进程既抓不了屏也注入不了输入（`SendInput` 全部失败、`last_error=5`）。
     这两件事该查的方向完全相反。现在早退分支也会带上 `verify_unavailable`。
 
-36. **两条更新链路必须同源，否则互相拆台**。DSH 插件页的更新按钮只认
-    registry 包（`updateRefusal()` 要求 `parseInstallSpec()` 得到的
-    `kind === "registry"`）。如果依赖是 `github:owner/repo`，按钮永远不出现；
-    而如果只有「读版本」改成 registry、`installBundle` 仍然传
-    `git+https://...#vX.Y.Z`，那么**自研更新器升一次就会把依赖写回 git 形式**，
-    界面里的按钮随即消失 —— 修了一半比没修更难查，因为它是「升一次好一次、
-    再升一次坏掉」的间歇性表现。判据、读源、装法、市场索引四处必须一起改。
+36. **更新只能有一条链路；两条必然互相拆台**。DSH 插件页的更新按钮只认
+    registry 包（`updateRefusal()` 要求 `kind === "registry"`），所以依赖必须是
+    `ui-locate-mcp` / `^X.Y.Z`，不能是 `github:owner/repo`。
+
+    更隐蔽的是并行两条链路会自己打自己：0.5.x 自研更新器传的是
+    `git+https://...#vX.Y.Z`，而 `installBundle` 收到 git spec 就会把 profile 的
+    依赖写回 `github:` —— 于是它升一次，插件页的按钮就消失一次。表现为「升一次
+    好一次、再升一次坏掉」，比完全没修更难查。
+
+    0.6.0 已经把自研那套整段删掉（`updateCheck` 配置项、tracker、版本比较、
+    registry 读取、`ui_locate_update` 工具）。**唯一的例外是 venv 里 Python 包的
+    版本同步** —— 那一层宿主不管，必须留着（见 `docs/update-audit.md`）。
 
 37. **`npm publish` 的三道门槛不会在打包时检查**。`private: true`（直接拒绝）、
     缺 `license` 字段、缺 `LICENSE` 文件。这三条对「用 git 装」完全无感 ——

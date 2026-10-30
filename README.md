@@ -43,7 +43,6 @@ dsh plugin --profile web add ui-locate-mcp
 | `list_monitors` | 显示器尺寸、原点和索引 |
 | `health` | 检查服务是否就绪 |
 | `ui_locate_setup` | 准备或重建 Python 环境与模型 |
-| `ui_locate_update` | 检查或安装本插件的 npm 更新 |
 
 前九项由 MCP 服务提供，最后两项由 Host 插件提供；实际调用名称可能带宿主添加的命名空间。
 
@@ -60,7 +59,6 @@ Host 行 ID 是 `ui-locate-update`，MCP 行 ID 是 `mcp-ui-locate`。
 
 | Host 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `updateCheck` | `true` | 定时检查 npm；不会因此自动安装 JS bundle |
 | `pythonSync` | `true` | 将环境中的 Python 包同步到 bundle 声明的版本 |
 | `runtimeDir` | 空 | Python 环境、状态与日志目录 |
 | `modelDir` | 空 | 模型目录，可复用已有模型 |
@@ -72,9 +70,16 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 ## 更新
 
-**当前代码仍保留独立更新器，更新来源已经改为 npm。** `updateCheck` 默认约 8 秒后检查，之后每 12 小时检查一次；安装由界面或 `ui_locate_update(action="apply")` 发起，`action="check"` 只检查。
+**插件本身由 DSH 插件页更新，本包不再自带更新器。** 依赖是 registry 形式
+（`ui-locate-mcp`），插件页那一行就会出现原生更新按钮，走宿主自己的插件管理器。
 
-更新先由 DSH 安装 npm bundle，再由新实例按 `pythonSync` 同步 Python 包。这与首次准备环境是不同步骤。关闭 `updateCheck` 可以停用定时检查，但不等于移除了更新工具。入口核对见[更新机制审计](docs/update-audit.md)。
+本包只负责宿主不管的那一半：npm 包装到新版之后，venv 里那份 Python 包还是旧的，
+所以每次启动会比对版本并 `pip install --no-deps` 重装一次（可用 `pythonSync` 关掉）。
+放在启动时也自带容错 —— 这一次失败不影响 JS 侧已经装好，下次会再试。
+
+0.5.x 之前这里自己维护过一整套更新器（读版本列表 + 调 `installBundle`）。它被删掉
+是因为和插件页的按钮是两条并行链路：各自判断什么是最新，而且它装完会把依赖写法
+改回 `github:`，插件页的按钮随即消失。历史核对见[更新机制审计](docs/update-audit.md)。
 
 ## 排障与使用边界
 
