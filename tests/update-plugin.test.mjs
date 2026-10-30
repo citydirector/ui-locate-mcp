@@ -13,9 +13,9 @@
  *    （`additionalProperties` 必须显式、实参要校验）搬了进来，所以这里直接
  *    测——不需要桩，也就不存在「桩抄漏一条」的风险。
  *
- * 一条纪律：**任何测试都不许打真实网络**。更新源已经换成 npm registry，
- * 所以用 `UI_LOCATE_REGISTRY` 把它指到 `127.0.0.1:9`：任何漏接 `fetch`
- * 的路径都会立刻连接被拒，而不是悄悄打到真的 registry 上。
+ * 一条纪律：**任何测试都不许打真实网络**。本插件现在不读任何远程版本列表
+ * （插件的新版本由 DSH 插件页管），所以这条纪律靠「代码里没有 fetch」维持，
+ * 而不是靠把地址挡到 127.0.0.1。
  */
 
 import assert from "node:assert/strict"
@@ -25,11 +25,6 @@ import { join } from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 
-// 必须在 import plugin 之前设：index.mjs 在 apply 时读它。
-// 更新源是 registry，所以挡在 registry 这一层（以前挡的是 GitHub API）。
-process.env.UI_LOCATE_REGISTRY = "http://127.0.0.1:9"
-process.env.DSH_UI_LOCATE_UPDATE_DELAY_MS = "600000"
-
 const ROOT = fileURLToPath(new URL("..", import.meta.url))
 
 // 两个 DSH 内置包由 Host 提供，本仓库不安装它们；先把桩装好，index.mjs 才
@@ -38,21 +33,12 @@ const { ensureStubs } = await import("./stubs.mjs")
 ensureStubs(ROOT)
 
 const {
-  DEFAULT_REGISTRY,
-  NPM_PACKAGE,
-  UPDATE_REPOSITORY,
   bundledPythonVersion,
-  compareVersions,
-  createUpdateTracker,
-  fetchPublishedVersions,
   installIntoVenv,
   installedPythonVersion,
-  latestRelease,
   packageVersion,
-  parseReleaseTag,
   stateDir,
   syncPythonToBundle,
-  updateVerdict,
   venvPython,
 } = await import("../plugin/core.mjs")
 
@@ -119,45 +105,6 @@ function check(name, fn) {
     }
   })
 }
-
-// ── 版本比较 ───────────────────────────────────────────────────────────────
-
-check("parseReleaseTag 只认 vX.Y.Z", () => {
-  assert.deepEqual(parseReleaseTag("v1.2.3"), [1, 2, 3])
-  assert.deepEqual(parseReleaseTag("v0.0.0"), [0, 0, 0])
-  assert.deepEqual(parseReleaseTag("  v10.20.30  "), [10, 20, 30])
-  for (const bad of ["1.2.3", "v1.2", "v1.2.3.4", "v01.2.3", "v1.2.3-rc.1", "v1.2.x", "", "v", null, undefined]) {
-    assert.equal(parseReleaseTag(bad), undefined, `应当拒绝 ${JSON.stringify(bad)}`)
-  }
-})
-
-check("compareVersions 逐段比较，带不带 v 都行", () => {
-  assert.ok(compareVersions("1.0.0", "1.0.1") < 0)
-  assert.ok(compareVersions("v1.2.0", "1.10.0") < 0, "数值比较，不是字典序")
-  assert.equal(compareVersions("1.2.3", "v1.2.3"), 0)
-  assert.ok(compareVersions("2.0.0", "1.99.99") > 0)
-})
-
-check("compareVersions 把解析不出的排到后面", () => {
-  assert.ok(compareVersions("1.0.0", "wat") < 0)
-  assert.ok(compareVersions("wat", "1.0.0") > 0)
-  assert.equal(compareVersions("a", "b"), 0)
-})
-
-check("latestRelease 忽略预发布与奇怪标签", () => {
-  assert.equal(latestRelease(["v1.0.0", "v1.2.0", "v1.1.9"]), "v1.2.0")
-  assert.equal(latestRelease(["v1.0.0", "v2.0.0-rc.1", "nightly"]), "v1.0.0")
-  assert.equal(latestRelease(["nightly", "v0.0.1"]), "v0.0.1")
-  assert.equal(latestRelease([]), undefined)
-  assert.equal(latestRelease(["nightly"]), undefined)
-})
-
-check("updateVerdict 分清 available 与 current", () => {
-  assert.deepEqual(updateVerdict(["v1.0.0", "v1.1.0"], "1.0.0"), { state: "available", latest: "v1.1.0" })
-  assert.deepEqual(updateVerdict(["v1.0.0"], "1.0.0"), { state: "current", latest: "v1.0.0" })
-  assert.deepEqual(updateVerdict(["v0.9.0"], "1.0.0"), { state: "current", latest: "v0.9.0" })
-  assert.deepEqual(updateVerdict([], "1.0.0"), { state: "current" })
-})
 
 // ── 读元数据 ───────────────────────────────────────────────────────────────
 
@@ -270,7 +217,7 @@ check("installedPythonVersion：exec 同步抛也不许把异常漏出去", asyn
 // 当时的表现是 Host 半身整个消失、MCP 半身照常工作 —— 极难判断。
 // 根因不是「同步抛」（Promise 构造器会接住它），而是 `void syncPython()`
 // 没人接 rejection，于是 unhandledRejection 把进程带走。
-check("index：venv 存在但解释器起不来时，apply 照样跑完并注册两个工具", async () => {
+check("index：venv 存在但解释器起不来时，apply 照样跑完并注册工具", async () => {
   // 这条守的是那次事故的现场：Host 半身整个不出现，而 MCP 半身照常工作，
   // 从外面看完全看不出问题。根因是 apply 里那个后台的 Python 同步把整个
   // 宿主带走了。
@@ -313,7 +260,7 @@ check("index：venv 存在但解释器起不来时，apply 照样跑完并注册
     rmSync(home, { recursive: true, force: true })
   }
 
-  assert.deepEqual(tools.sort(), ["ui_locate_setup", "ui_locate_update"], "两个工具都要注册上")
+  assert.deepEqual(tools.sort(), ["ui_locate_setup"], "工具要注册上")
 })
 
 check("inspectRuntime：exec 同步抛也不许把异常漏出去", async () => {
@@ -473,237 +420,6 @@ check("syncPythonToBundle：安装失败要带错误信息，不抛", async () =
   assert.match(answer.error, /network unreachable/)
 })
 
-// ── 发布源 ─────────────────────────────────────────────────────────────────
-
-check("fetchPublishedVersions：读 registry 的版本 map，只要正式版", async () => {
-  const fetch = mockFetch({
-    body: { versions: { "1.0.0": {}, "0.9.0": {}, "2.0.0-rc.1": {}, "nightly": {} } },
-  })
-  // 显式给 registry：整个测试进程把默认值指到了 127.0.0.1:9（见文件头），
-  // 而这条用例要验的是 URL 拼接规则本身。
-  const tags = await fetchPublishedVersions({ fetch, registry: DEFAULT_REGISTRY })
-  assert.deepEqual(tags.sort(), ["v0.9.0", "v1.0.0"], "预发布与非法版本都要滤掉")
-  assert.equal(fetch.calls.length, 1)
-  assert.equal(fetch.calls[0].url, `${DEFAULT_REGISTRY}/${NPM_PACKAGE}`)
-  const headers = fetch.calls[0].init.headers
-  assert.equal(headers.accept, "application/json")
-  assert.equal(headers.authorization, undefined, "这里绝不该带凭据")
-})
-
-check("fetchPublishedVersions：404 说清楚是「还没发」", async () => {
-  await assert.rejects(
-    () => fetchPublishedVersions({ fetch: mockFetch({ status: 404, body: { error: "Not found" } }) }),
-    /is not published on .* yet/,
-  )
-})
-
-check("fetchPublishedVersions：限流与非 200 分开报", async () => {
-  await assert.rejects(
-    () => fetchPublishedVersions({ fetch: mockFetch({ status: 429, body: {} }) }),
-    /registry rate limit \(HTTP 429\)/,
-  )
-  await assert.rejects(() => fetchPublishedVersions({ fetch: mockFetch({ status: 500, body: {} }) }), /HTTP 500/)
-})
-
-check("fetchPublishedVersions：返回的没有 versions map 就报错", async () => {
-  await assert.rejects(
-    () => fetchPublishedVersions({ fetch: mockFetch({ body: { message: "nope" } }) }),
-    /version map/,
-  )
-})
-
-check("fetchPublishedVersions：可以指到镜像，并正确编码带 scope 的包名", async () => {
-  const fetch = mockFetch({ body: { versions: {} } })
-  await fetchPublishedVersions({ fetch, registry: "http://mirror.local/npm/", name: "@scope/pkg" })
-  assert.equal(fetch.calls[0].url, "http://mirror.local/npm/%40scope%2Fpkg")
-})
-
-// ── 更新状态机 ─────────────────────────────────────────────────────────────
-
-check("tracker：有更新时报 available", async () => {
-  const tracker = createUpdateTracker({
-    readVersion: () => "1.0.0",
-    fetchTags: async () => ["v1.0.0", "v1.1.0"],
-  })
-  await tracker.check()
-  const state = tracker.state
-  assert.equal(state.state, "available")
-  assert.equal(state.latest, "v1.1.0")
-  assert.match(state.checkedAt, /^\d{4}-\d{2}-\d{2}T/)
-  tracker.dispose()
-})
-
-check("tracker：已是最新时报 current", async () => {
-  const tracker = createUpdateTracker({ readVersion: () => "1.1.0", fetchTags: async () => ["v1.0.0", "v1.1.0"] })
-  await tracker.check()
-  assert.equal(tracker.state.state, "current")
-  tracker.dispose()
-})
-
-check("tracker：网络失败也不抛，并且记住上次查到的新版本", async () => {
-  const answers = [["v1.1.0"], new Error("getaddrinfo ENOTFOUND registry.npmjs.org")]
-  const tracker = createUpdateTracker({
-    readVersion: () => "1.0.0",
-    fetchTags: async () => {
-      const next = answers.shift()
-      if (next instanceof Error) throw next
-      return next
-    },
-  })
-  await tracker.check()
-  assert.equal(tracker.state.state, "available")
-  await tracker.check()
-  const state = tracker.state
-  assert.equal(state.state, "failed")
-  assert.equal(state.stale, "available", "已知的新版本不该被一次抖动抹掉")
-  assert.equal(state.latest, "v1.1.0")
-  assert.match(state.error, /ENOTFOUND/)
-  tracker.dispose()
-})
-
-check("tracker：并发 check 只发一个请求", async () => {
-  let calls = 0
-  const tracker = createUpdateTracker({
-    readVersion: () => "1.0.0",
-    fetchTags: async () => {
-      calls += 1
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      return ["v1.1.0"]
-    },
-  })
-  await Promise.all([tracker.check(), tracker.check(), tracker.check()])
-  assert.equal(calls, 1)
-  tracker.dispose()
-})
-
-check("tracker：自己版本读不出来时立刻失败，不发请求", async () => {
-  let calls = 0
-  const tracker = createUpdateTracker({
-    readVersion: () => undefined,
-    fetchTags: async () => {
-      calls += 1
-      return []
-    },
-  })
-  await tracker.check()
-  assert.equal(tracker.state.state, "failed")
-  assert.equal(calls, 0)
-  tracker.dispose()
-})
-
-check("tracker：超时要归成 timed out，不是把原始错误喷给用户", async () => {
-  // AbortSignal.timeout 的 timer 是 unref 的：如果测试里没有别的活儿，事件循环
-  // 会在超时触发之前就空掉，node 直接判定「Promise 还没 resolve 循环已经空了」。
-  // 先用一个 ref 的 timer 托住循环，再让 tracker 去超时。
-  const hold = new Promise((resolve) => setTimeout(resolve, 80))
-  const tracker = createUpdateTracker({
-    readVersion: () => "1.0.0",
-    timeoutMs: 10,
-    fetchTags: ({ signal }) =>
-      new Promise((_resolve, reject) => {
-        signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })))
-      }),
-  })
-  await tracker.check()
-  await hold
-  assert.equal(tracker.state.state, "failed")
-  assert.equal(tracker.state.error, "timed out")
-  tracker.dispose()
-})
-
-check("tracker：schedule(false) 真的把 timer 停掉", async () => {
-  const tracker = createUpdateTracker({ readVersion: () => "1.0.0", fetchTags: async () => [] })
-  tracker.schedule(true)
-  tracker.schedule(false)
-  assert.equal(tracker.state.state, "off")
-  const before = tracker.state.state
-  await new Promise((resolve) => setTimeout(resolve, 30))
-  assert.equal(tracker.state.state, before, "关掉之后不该还有检查在跑")
-  tracker.dispose()
-})
-
-check("tracker：schedule(false) 之后 schedule(true) 能恢复", async () => {
-  const tracker = createUpdateTracker({ readVersion: () => "1.0.0", fetchTags: async () => ["v1.0.0"], delayMs: 0 })
-  tracker.schedule(true)
-  tracker.schedule(false)
-  assert.equal(tracker.state.state, "off")
-  tracker.schedule(true)
-  await new Promise((resolve) => setTimeout(resolve, 60))
-  assert.equal(tracker.state.state, "current")
-  tracker.dispose()
-})
-
-check("tracker：重复 schedule(true) 不叠加 timer", async () => {
-  let calls = 0
-  const tracker = createUpdateTracker({
-    readVersion: () => "1.0.0",
-    delayMs: 5,
-    fetchTags: async () => {
-      calls += 1
-      return ["v1.0.0"]
-    },
-  })
-  tracker.schedule(true)
-  tracker.schedule(true)
-  tracker.schedule(true)
-  await new Promise((resolve) => setTimeout(resolve, 60))
-  assert.equal(calls, 1, "三次排期只能落一次检查")
-  tracker.dispose()
-})
-
-check("tracker：dispose 之后不再发请求", async () => {
-  let calls = 0
-  const tracker = createUpdateTracker({
-    readVersion: () => "1.0.0",
-    delayMs: 0,
-    fetchTags: async () => {
-      calls += 1
-      return ["v1.0.0"]
-    },
-  })
-  tracker.schedule(true)
-  tracker.dispose()
-  await new Promise((resolve) => setTimeout(resolve, 60))
-  assert.equal(calls, 0)
-})
-
-check("tracker：document 把已经装上的 available 折成 current", async () => {
-  let version = "1.0.0"
-  const tracker = createUpdateTracker({ readVersion: () => version, fetchTags: async () => ["v1.1.0"] })
-  await tracker.check()
-  let doc = tracker.document({ python: { wanted: "1.0.0", installed: "1.0.0", venv: true } })
-  assert.equal(doc.update.state, "available")
-  assert.equal(doc.update.spec, `${NPM_PACKAGE}@1.1.0`, "spec 必须是 registry 形式，不能是 git URL")
-  assert.equal(doc.version, "1.0.0")
-  // 装上之后新实例读到的就是新版本
-  version = "1.1.0"
-  doc = tracker.document()
-  assert.equal(doc.update.state, "current", "装完不该还提示有更新")
-  assert.equal(doc.update.spec, undefined, "current 时不给出安装 spec")
-  tracker.dispose()
-})
-
-check("tracker：stale 的 available 在装完之后也要清掉", async () => {
-  let version = "1.0.0"
-  const answers = [["v1.1.0"], new Error("boom")]
-  const tracker = createUpdateTracker({
-    readVersion: () => version,
-    fetchTags: async () => {
-      const next = answers.shift()
-      if (next instanceof Error) throw next
-      return next
-    },
-  })
-  await tracker.check()
-  await tracker.check()
-  assert.equal(tracker.state.stale, "available")
-  version = "1.1.0"
-  const doc = tracker.document()
-  assert.equal(doc.update.stale, undefined)
-  assert.equal(doc.update.state, "failed", "状态仍是上次的失败，但不再是「有个装着的新版本」")
-  tracker.dispose()
-})
-
 // ── 接线层 ─────────────────────────────────────────────────────────────────
 
 /** 一个够用的假 ctx：记下注册的工具、inject、effect 与事件监听。 */
@@ -719,9 +435,11 @@ function fakeCtx() {
     inject(deps, callback) {
       injected.push([...deps])
       // 模拟「服务在」：立刻把子上下文交给回调。
-      if (deps.includes("pluginManager")) {
+      // 现在按需注入的只有 webServer（自研更新器删掉之后不再要 pluginManager）。
+      if (deps.includes("webServer")) {
         callback({
-          pluginManager: ctx._manager,
+          webServer: { register: () => () => {} },
+          get: () => undefined,
           effect: (fn, label) => {
             effects.push(label)
             const dispose = fn()
@@ -752,266 +470,69 @@ function fakeCtx() {
   return ctx
 }
 
-check("index：只 inject tools，插件管理器按需注入", async () => {
+check("index：只 inject tools，webServer 按需注入", async () => {
   const plugin = await import("../plugin/index.mjs")
   assert.equal(plugin.name, "ui-locate-update")
-  assert.deepEqual(plugin.inject, ["tools"], "pluginManager 不能写死，否则没它的部署起不来")
+  assert.deepEqual(plugin.inject, ["tools"], "webServer 不能写死，否则没它的部署起不来")
 })
 
-check("index：Config 两个开关默认都开，且是 volatile", async () => {
+check("index：Config 的字段都是 volatile，能热改", async () => {
   const plugin = await import("../plugin/index.mjs")
   const parsed = plugin.Config({})
-  assert.equal(parsed.updateCheck.get(), true)
   assert.equal(parsed.pythonSync.get(), true)
+  assert.equal(parsed.runtimeDir.get(), "")
+  assert.equal(parsed.modelDir.get(), "")
+  assert.equal(parsed.backend.get(), "")
+  // updateCheck 随自研更新器一起删掉了：插件版本由 DSH 插件页管。
+  assert.equal(parsed.updateCheck, undefined)
   // 热改：改完再读就是新值
-  parsed.updateCheck.set(false)
-  assert.equal(parsed.updateCheck.get(), false)
+  parsed.pythonSync.set(false)
+  assert.equal(parsed.pythonSync.get(), false)
 })
 
-check("index：apply 注册了 ui_locate_update 并声明输出形状", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  plugin.apply(ctx, plugin.Config({}))
-  try {
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    assert.ok(tool, "工具必须注册")
-    assert.match(tool.description, /check/)
-    assert.match(tool.description, /apply/)
-    const schema = tool.output.schema
-    for (const field of ["version", "repository", "home", "update", "python"]) {
-      assert.ok(schema.properties[field], `输出必须有 ${field}`)
-    }
-    // 标准 JSON Schema：必填写在对象层的 required 数组里。
-    assert.deepEqual(schema.required, ["version", "repository", "home", "update", "python"])
-    // 每个 object 节点都要显式 additionalProperties，宿主那边漏写会直接拒掉。
-    for (const field of ["update", "python"]) {
-      assert.equal(schema.properties[field].additionalProperties, true, `${field} 缺 additionalProperties`)
-    }
-    assert.equal(schema.additionalProperties, true)
-    // presentCall 要给得出东西，否则 UI 会空
-    const presented = tool.presentCall({ action: "check" })
-    assert.equal(presented.title, "ui_locate_update")
-    assert.equal(presented.card, "generic")
-    assert.deepEqual(presented.rawInput, { action: "check" })
-  } finally {
-    ctx._disposeAll()
-  }
-})
-
-check("index：apply 挂了 pluginManager 的按需注入与 volatile-update 监听", async () => {
+check("index：apply 挂了 webServer 的按需注入与 volatile-update 监听", async () => {
   const plugin = await import("../plugin/index.mjs")
   const ctx = fakeCtx()
   plugin.apply(ctx, plugin.Config({}))
   try {
     const wanted = ctx._injected.map((row) => row.join(","))
-    assert.ok(wanted.includes("pluginManager"), `pluginManager 要按需注入，实际 ${JSON.stringify(wanted)}`)
     assert.ok(wanted.includes("webServer"), `webServer 要按需注入，实际 ${JSON.stringify(wanted)}`)
+    assert.ok(!wanted.includes("pluginManager"), "自研更新器删了之后就不该再要插件管理器")
     assert.ok(ctx._handlers.get("loader/volatile-update")?.length, "配置热改要能被接住")
-    assert.ok(ctx._effects.includes("ui-locate: update timers"))
-    assert.ok(ctx._effects.includes("ui-locate: plugin manager"))
+    assert.ok(ctx._effects.includes("ui-locate: settings routes"))
+    assert.ok(!ctx._effects.includes("ui-locate: update timers"), "定时检查已经删了")
   } finally {
     ctx._disposeAll()
   }
 })
 
-check("index：工具 action 非法时不装、也不崩", async () => {
+check("index：apply 在没有 webServer 时也能起来，工具照样注册", async () => {
   const plugin = await import("../plugin/index.mjs")
   const ctx = fakeCtx()
-  plugin.apply(ctx, plugin.Config({ updateCheck: false }))
-  try {
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "delete-everything" })
-    assert.equal(value.result.ok, false)
-    assert.match(value.result.error, /unknown action/)
-    // updateCheck 关掉时状态就是 off，不该偷偷联网
-    assert.equal(value.update.state, "off")
-    assert.equal(typeof value.version, "string")
-  } finally {
-    ctx._disposeAll()
-  }
-})
-
-check("index：check 在 updateCheck 关掉时不联网", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  plugin.apply(ctx, plugin.Config({ updateCheck: false }))
-  try {
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "check" })
-    assert.equal(value.result.ok, true)
-    assert.equal(value.update.state, "off")
-  } finally {
-    ctx._disposeAll()
-  }
-})
-
-check("index：apply 时 python 一栏反映真实 venv 状态", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  plugin.apply(ctx, plugin.Config({ updateCheck: false }))
-  try {
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "check" })
-    assert.equal(typeof value.home, "string")
-    assert.ok(value.home.endsWith("ui-locate"), value.home)
-    assert.equal(value.python.wanted, packageVersion())
-    // 这台机器的 venv 可能还没建；两种都算对，但不能是 undefined 之外的糊状。
-    assert.equal(typeof value.python.venv, "boolean")
-    assert.ok(value.python.installed === undefined || typeof value.python.installed === "string")
-    assert.equal(value.repository, UPDATE_REPOSITORY)
-  } finally {
-    ctx._disposeAll()
-  }
-})
-
-/**
- * 递归找值为 `undefined` 的键。
- *
- * DSH 按「无损 JSON」校验工具返回值，`undefined` 不是合法 JSON 值：只要有一处
- * 漏出来，整个返回值就被判成 `INVALID_TOOL_OUTPUT`，调用直接失败。这个断言就是
- * 把那条规则搬进测试，免得又一次在装进 DSH 之后才发现。
- */
-function undefinedPaths(value, path = "") {
-  if (Array.isArray(value)) {
-    return value.flatMap((item, index) =>
-      item === undefined ? [`${path}[${index}]`] : undefinedPaths(item, `${path}[${index}]`),
-    )
-  }
-  if (value === null || typeof value !== "object") return []
-  const found = []
-  for (const [key, item] of Object.entries(value)) {
-    const here = path === "" ? key : `${path}.${key}`
-    if (item === undefined) found.push(here)
-    else found.push(...undefinedPaths(item, here))
-  }
-  return found
-}
-
-check("index：venv 没建时返回值里也不能有 undefined", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  // 指到一个不存在的目录，逼出「版本读不到」的路径——那正是 undefined 的来源。
-  const before = process.env.UI_LOCATE_HOME
-  process.env.UI_LOCATE_HOME = join(tmpdir(), "ui-locate-不存在-" + Date.now())
-  try {
-    plugin.apply(ctx, plugin.Config({ updateCheck: false, pythonSync: false }))
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    for (const action of ["check", "apply", "bogus"]) {
-      const value = await tool.execute({ action })
-      assert.deepEqual(undefinedPaths(value), [], `action=${action} 的返回值里有 undefined`)
-    }
-  } finally {
-    if (before === undefined) delete process.env.UI_LOCATE_HOME
-    else process.env.UI_LOCATE_HOME = before
-    ctx._disposeAll()
-  }
-})
-
-check("index：apply 在没有 pluginManager 时也能起来", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  // 让 inject 回调永远不来，模拟没有插件管理器的部署
+  // 让 inject 回调永远不来，模拟没有 web 服务的部署（比如纯 CLI）
   ctx.inject = (deps) => {
     ctx._injected.push([...deps])
   }
-  plugin.apply(ctx, plugin.Config({ updateCheck: false }))
+  plugin.apply(ctx, plugin.Config({}))
   try {
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "apply" })
-    assert.equal(value.result.ok, false)
-    assert.match(value.result.error, /plugin manager unavailable/)
+    assert.deepEqual(
+      ctx._tools.map((item) => item.name),
+      ["ui_locate_setup"],
+      "设置页没挂上不该影响工具",
+    )
+    assert.ok(!ctx._effects.includes("ui-locate: settings routes"), "回调没来就不该有路由")
   } finally {
     ctx._disposeAll()
-  }
-})
-
-check("index：apply 在拿到 pluginManager 后会把 spec 交出去", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const installed = []
-  const ctx = fakeCtx()
-  ctx._manager = {
-    async installBundle(spec, options) {
-      installed.push({ spec, options })
-      return { ok: true, value: { application: "restart-required", version: "9.9.9" } }
-    },
-  }
-  // 让 tracker 查到一个比当前高的版本，且不碰网络
-  const realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ versions: { "999.0.0": {} } }) })
-  try {
-    plugin.apply(ctx, plugin.Config({ pythonSync: false }))
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "apply" })
-    assert.equal(value.result.ok, true)
-    assert.equal(installed.length, 1)
-    // 必须是 registry 形式：装成 github: 之后 DSH 插件页就没有更新按钮了
-    assert.equal(installed[0].spec, `${NPM_PACKAGE}@999.0.0`)
-    assert.ok(installed[0].options.requestId, "要给 requestId，否则取消不了")
-    assert.match(value.result.note, /Python/)
-    ctx._disposeAll()
-  } finally {
-    globalThis.fetch = realFetch
-  }
-})
-
-check("index：apply 认得不裹 ok 的 installBundle 返回值（同进程调用就是这种）", async () => {
-  // 实测踩过的坑：`ctx.inject(["pluginManager"])` 拿到的是同进程的服务对象，
-  // 它的 installBundle 直接返回结果对象，**没有 `ok` 字段**；而官方插件页走
-  // 的 remote 代理会再包一层 `{ ok, value }`。代码若只认后者，同进程调用就会
-  // 把每一次成功都报成 "install failed"。
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  ctx._manager = {
-    async installBundle() {
-      return { application: "applied", changed: true, version: "9.9.9", bundle: "ui-locate-mcp" }
-    },
-  }
-  const realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ versions: { "999.0.0": {} } }) })
-  try {
-    plugin.apply(ctx, plugin.Config({ pythonSync: false }))
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "apply" })
-    assert.equal(value.result.ok, true, JSON.stringify(value.result))
-    assert.equal(value.result.state, "installed")
-    assert.equal(value.result.application, "applied")
-    assert.equal(value.result.version, "9.9.9")
-    ctx._disposeAll()
-  } finally {
-    globalThis.fetch = realFetch
-  }
-})
-
-check("index：installBundle 报告 application=failed 时不能说成功", async () => {
-  const plugin = await import("../plugin/index.mjs")
-  const ctx = fakeCtx()
-  ctx._manager = {
-    async installBundle() {
-      // manager 内部把失败折进结果里，而不是抛出来 —— 只看有没有异常会漏掉。
-      return { application: "failed", changed: false, error: { code: "incompatible-version" } }
-    },
-  }
-  const realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ versions: { "999.0.0": {} } }) })
-  try {
-    plugin.apply(ctx, plugin.Config({ pythonSync: false }))
-    const tool = ctx._tools.find((item) => item.name === "ui_locate_update")
-    const value = await tool.execute({ action: "apply" })
-    assert.equal(value.result.ok, false)
-    assert.match(value.result.error, /incompatible-version/)
-    ctx._disposeAll()
-  } finally {
-    globalThis.fetch = realFetch
   }
 })
 
 check("index：ui_locate_setup 的参数按类型校验，且工具定义能被宿主接受", async () => {
   const plugin = await import("../plugin/index.mjs")
   const ctx = fakeCtx()
-  plugin.apply(ctx, plugin.Config({ updateCheck: false, pythonSync: false }))
+  plugin.apply(ctx, plugin.Config({ pythonSync: false }))
   try {
     const tool = ctx._tools.find((item) => item.name === "ui_locate_setup")
-    assert.ok(tool, "第二个工具必须注册")
+    assert.ok(tool, "工具必须注册")
     // 长任务：超时给足，否则下 200MB 的时候会被判死。
     assert.ok(tool.timeoutMs >= 600_000, `timeoutMs 太小：${tool.timeoutMs}`)
 
@@ -1052,7 +573,7 @@ check("index：ui_locate_setup 的参数按类型校验，且工具定义能被�
 check("index：准备环境失败时返回 ok:false 而不是抛异常", async () => {
   const plugin = await import("../plugin/index.mjs")
   const ctx = fakeCtx()
-  plugin.apply(ctx, plugin.Config({ updateCheck: false, pythonSync: false }))
+  plugin.apply(ctx, plugin.Config({ pythonSync: false }))
   const realPython = process.env.UI_LOCATE_PYTHON
   // 指到一个不存在的解释器，逼 pickPython 回落到自动探测；若自动探测也
   // 找不到，就应该给一句人话，而不是把栈甩出去。

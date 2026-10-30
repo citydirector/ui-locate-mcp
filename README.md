@@ -253,14 +253,14 @@ DSH 自带的 Python，也绕开了「PATH 里那个 python 是 Microsoft Store 
 
 #### Agent 也能自己修环境
 
-两个工具直接挂在工具目录里，不经过界面：
+工具直接挂在工具目录里，不经过界面：
 
 | 工具 | 用途 |
 |------|------|
-| `ui_locate_update` | `action=check` 查新版本；`action=apply` 装新版本 |
 | `ui_locate_setup` | 准备运行环境；`force=true` 删掉重装；可传 `home` / `modelDir` / `backend` |
 
 所以「装完插件环境没起来」这件事，Agent 自己就能查、能修，不需要人来点。
+插件本身的新版本不在这里——那是插件页更新按钮的事。
 
 **为什么环境要另外准备**：索引只描述「怎么把包拉下来」，拉下来的是**代码 +
 patch**；Python 依赖与模型体积大、与平台强相关，不适合塞进包体，所以交给 Host
@@ -350,26 +350,19 @@ scrub 掉所有 `DSH_` 开头的变量，所以还要把算好的目录经 `conf
 想覆盖文件，就把 `UI_LOCATE_MODEL_DIR` / `UI_LOCATE_PROVIDER` 设上。文件坏了
 或者内容不是对象，一律当成没设过。
 
-## 自动更新
+## 更新与版本同步
 
-包内有一个 Host 插件（`plugin/index.mjs`），负责**查版本、装版本、同步 Python 侧**。
-它注册了工具 `ui_locate_update`：
+这两件事现在**分工给两个不同的地方**，分清楚很重要：
 
-```
-ui_locate_update(action: "check")   # 只读 registry 上的版本列表，报版本差异
-ui_locate_update(action: "apply")   # 装最新版本（会改动本机插件）
-```
+| 谁升 | 谁来管 |
+|---|---|
+| 插件本身（JS/YAML 那部分） | **DSH 插件页**的原生更新按钮 |
+| venv 里的 Python 包 | 本插件的 Host 半身，启动时自动对齐 |
 
-### 为什么需要一段 Host 代码
+### 插件更新交给 DSH，不要再自己造
 
-这个 bundle 的主体是一个 MCP 客户端行，它只声明「用什么命令起 Python 进程」，
-本身没有可执行代码。DSH 的插件管理器能装 JS/YAML 那部分，但**装不到 venv 里的
-Python 包**——而那才是真正会改进的部分（算法、模型、OCR 参数）。
-
-### 更新走 npm，不走 GitHub 标签
-
-**这是一条硬约束，不是偏好。** DSH 插件页的更新按钮只有一个判据
-（`dsh-plugin-manager` 的 `updateRefusal()`）：
+DSH 插件页会给每个「从 registry 装的三方插件」显示更新按钮，判据是
+`dsh-plugin-manager` 的 `updateRefusal()`：
 
 ```js
 const parsed = parsedForRegistry(bundle.source)
@@ -377,76 +370,74 @@ if (parsed.kind !== "registry" || parsed.name !== bundle.name || parsed.range?.i
     return `${bundle.name} is not installed from a registry under its own name`
 ```
 
-也就是说：**只有装的是 registry 包，界面里才有更新入口**。依赖写成
-`github:owner/repo` 时 `kind === "git"`，这一条永远不成立——插件装得好好的，
-但永远看不到「有新版本」。
+所以依赖必须是 registry 形式（`ui-locate-mcp` / `^0.5.1`），不能写
+`github:owner/repo`——后者 `kind === "git"`，条件永远不成立，插件装得好好的
+但永远看不到更新入口。
 
-所以整条链路都统一到 registry：
+**0.5.x 之前这里自己写过一整套更新器**（读版本列表、判断有没有新版、调
+`installBundle` 装）。它被删掉了，原因是它和插件页的按钮是**两条并行的更新
+链路**：
 
-| 环节 | 用什么 | 装完依赖变成 |
-|---|---|---|
-| 插件页「安装」 | `ui-locate-mcp` | `0.4.0` |
-| 插件页「更新」（原生） | `ui-locate-mcp@0.4.1` | `0.4.1` |
-| `ui_locate_update(apply)` | `ui-locate-mcp@0.4.1` | `0.4.1` |
-| 市场索引 `market-index.json` | `{"type": "npm"}` | `0.4.1` |
+- 两边各自判断「什么是最新」，可以给出不同答案；
+- 自己那条装完会把依赖写法改回 `github:`（`installBundle` 收到 git spec 就会
+  这么写），插件页的按钮随即消失——升一次好一次、再升一次坏掉，这种间歇性
+  故障最难查。
 
-**三者必须同源。** 只要有一段往 `git+https://...#vX.Y.Z` 走，它装完就会把
-profile 的依赖改回 `github:` 形式，下一次界面里就没有更新按钮了——这正是 0.4.0
-之前的状态。
+现在只剩一条链路，由宿主负责。
 
-### 更新是两段，顺序不能颠倒
+### Python 侧：宿主不管，必须自己同步
 
-1. **JS 侧**：`pluginManager.installBundle('ui-locate-mcp@X.Y.Z')`，DSH 用它装
-   官方插件的方式装本包，落到 profile 的 `node_modules`，然后热替换本插件。
-2. **Python 侧**：新版本的源码这时才出现在 `node_modules` 里，所以只能在**换上
-   来之后**执行。它由「新实例启动时发现版本不一致」触发，不塞进 install 的同一
-   段流程——那样会拿旧路径去装新版本。
+npm 包装到新版之后，`venv` 里那份 Python 包还是旧的——那是 `pip` 的地盘，
+宿主不会去动它。所以 Host 半身在**每次启动时**比一次：
 
-这个顺序也给了容错：Python 侧失败不影响 JS 侧已经装好，下次启动会重新发现不一致
-并再试一次，不需要人干预。
+```
+venv 里的 ui-locate-mcp 版本  ←→  包内 pyproject.toml 的 version
+```
 
-### 只查不装
+不一致就 `pip install --no-deps <包目录>` 重装一次，**只换代码、不动依赖**
+（三个 ORT wheel 都提供同一个 `onnxruntime` 顶层包，重装依赖可能把用户选好的
+CUDA 换成 DirectML 而且不报错）。
 
-`updateCheck` 默认开着，但**检查本身从不安装任何东西**——它只读 registry 上的
-版本列表并记下结论。安装必须由一次显式的工具调用触发。
+放在启动时而不是安装时，有两个原因：新版本的源码要等换上来之后才出现在
+`node_modules` 里；而且这样自带容错——这一次失败不影响 JS 侧已经装好，下次
+启动会重新发现不一致并再试一次。
 
-检查读的是 `https://registry.npmjs.org/<包名>` 的 `versions` 字段，**只要三段式
-正式版**（`1.2.3`），预发布（`1.2.3-rc.1`）一律跳过：自动装的东西必须是确定的。
+手动触发也可以：`ui_locate_setup` 会顺带做这件事。想关掉就设 `pythonSync: false`。
 
 ### 发布新版本时要做什么
 
 **三处版本号必须一起改**，否则会出现「包装上了但 Python 侧还是旧的」或者
-「索引说 0.5.0、npm 上还是 0.4.0」这种自相矛盾：
+「索引说 0.5.1、npm 上还是 0.5.0」这种自相矛盾：
 
 - `package.json` 的 `version`
 - `pyproject.toml` 的 `[project] version`
 - `market-index.json`（用 `make_index.py --npm` 重新生成）
 
-发布流程：
+发布走 GitHub Actions 的 trusted publishing（OIDC，不需要任何 token）：
 
 ```bash
-# 1. 改两处版本号 → 跑测试 → 提交
-# 2. 发到 npm（网页或 CI；本地 npm publish 也行）
-npm publish --access public
-# 3. 重生成索引并提交
+# 1. 改两处版本号 + 重生成索引 → 跑测试 → 提交
 python scripts/make_index.py --npm --out market-index.json
 python scripts/make_index.py --check market-index.json
+
+# 2. 打标签并推送，CI 会自动发布
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin main vX.Y.Z
 ```
 
-**不再需要打 git 标签**：更新源是 registry，GitHub 那边只用来放源码和索引。
-（`vX.Y.Z` 标签仍然值得打，方便人对照，但程序不看它。）
+workflow 在 `.github/workflows/release.yml`，`scripts/release-check.mjs` 会先核对
+「版本号 / 索引 / 标签 / 工作区干净」四件事，任何一项不对就拒绝发布。
 
-### 五个配置项
-
-在插件页的配置里（都在设置页能看到、能改，改完立刻生效）：
+### 四个配置项
 
 | 配置 | 默认 | 作用 |
 |------|------|------|
-| `updateCheck` | 开 | 启动几秒后查一次版本，之后每 12 小时一次。只查不装 |
 | `pythonSync` | 开 | 发现 venv 版本与包内声明不一致时自动重装 Python 侧 |
 | `runtimeDir` | 空 | Python 环境与日志放哪；空则跟随 DSH 数据目录 |
 | `modelDir` | 空 | 检测模型放哪；空则跟随运行目录下的 `models/` |
 | `backend` | `directml` | `directml` / `cuda` / `cpu`，只在下一次准备环境时生效 |
+
+工具只剩一个：`ui_locate_setup`（准备环境；`force=true` 覆盖重装）。
 
 ### 设置页怎么接上的
 
@@ -482,8 +473,8 @@ python -m unittest discover -s tests -p "test_*.py"
 # 全链路冒烟（真实 stdio JSON-RPC，8 项）
 python tests\smoke_mcp.py
 
-# 插件行为测试（70 例：纯逻辑、接线层、JSON Schema 硬规则、runtime.json 的写与读、后台任务的失败处置）
-node --test tests/
+# 插件行为测试（40 例：元数据、venv 同步、接线层、JSON Schema 硬规则、runtime.json 的写与读）
+/usr/bin/node --test tests/
 ```
 
 跑测试用真 node，别用 bun —— WSL 里 `node` 是 bun 的符号链接，`node --test tests/`
@@ -636,12 +627,12 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 16. **工具返回的 object 必须显式写 `additionalProperties`**。DSH 的 schema 编译器
     对每个 object 节点都要求 `additionalProperties: true` 或 `false`，漏写会抛
     `unsupported JSON schema: ... must be explicitly true or false`，整个插件起不来。
-    顶层不例外，嵌套的 `update` / `python` 也一样。
+    顶层不例外，嵌套的 `steps` / `runtime` 也一样。
 17. **工具返回值里不能有 `undefined`**。校验器按「无损 JSON」判，`undefined` 不是
     合法 JSON 值——一处漏出来整个返回值就被判成 `INVALID_TOOL_OUTPUT`，调用直接
-    失败。而这个插件返回的到处是「可能读不到」的字段（版本号、venv 里的包版本、
-    上次查到的最新标签、安装结果里的 `application`）。出口统一过一遍
-    `lossless()`，别指望每处赋值都记得判断。
+    失败。而这个插件返回的到处是「可能读不到」的字段（venv 里的包版本、
+    模型文件大小、可用的 ORT 后端）。出口统一过一遍 `lossless()`，别指望
+    每处赋值都记得判断。
 18. **`node_modules` 里的 `@deepseek-ai` 桩不能当成真包**。本仓库测试用现场生成的
     最小桩（`tests/stubs.mjs`），它能验证自己写的逻辑，但**验不了 DSH 的 schema
     规则**——真 `defineTool` 有几十行约束是桩复刻不出来的。想验真实约束，从
@@ -866,9 +857,9 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     捕获鼠标时那个值本来就不变，判据本身失效。要判成没成，比截图。
 
 33. **后台任务没人接 rejection，会把宿主带走**。实测过一次：装上插件、重启
-    DSH，MCP 那半身照常工作、`mcp__ui-locate__*` 全在，但 Host 那半身的两个
-    工具（`ui_locate_update` / `ui_locate_setup`）**一个都没出现**。宿主日志里
-    什么都没有 —— 因为它是被打断的，不是报错退出的。
+    DSH，MCP 那半身照常工作、`mcp__ui-locate__*` 全在，但 Host 那半身的工具
+    （`ui_locate_setup`）**没出现**。宿主日志里什么都没有 —— 因为它是被打断的，
+    不是报错退出的。
 
     现场是这样的链路：
 
@@ -907,13 +898,16 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     进程既抓不了屏也注入不了输入（`SendInput` 全部失败、`last_error=5`）。
     这两件事该查的方向完全相反。现在早退分支也会带上 `verify_unavailable`。
 
-36. **两条更新链路必须同源，否则互相拆台**。DSH 插件页的更新按钮只认
-    registry 包（`updateRefusal()` 要求 `parseInstallSpec()` 得到的
-    `kind === "registry"`）。如果依赖是 `github:owner/repo`，按钮永远不出现；
-    而如果只有「读版本」改成 registry、`installBundle` 仍然传
-    `git+https://...#vX.Y.Z`，那么**自研更新器升一次就会把依赖写回 git 形式**，
-    界面里的按钮随即消失 —— 修了一半比没修更难查，因为它是「升一次好一次、
-    再升一次坏掉」的间歇性表现。判据、读源、装法、市场索引四处必须一起改。
+36. **更新只能有一条链路：交给插件页，别自己再写一个**。DSH 的更新按钮只认
+    registry 包（`updateRefusal()` 要求 `kind === "registry"`），所以依赖必须是
+    `ui-locate-mcp` / `^X.Y.Z`，不能是 `github:owner/repo`。
+
+    更隐蔽的是**并行两条链路会互相拆台**：本插件 0.5.x 之前自己做过一套
+    （读版本列表 + 调 `installBundle`）。它传的是 `git+https://...#vX.Y.Z`，
+    而 `installBundle` 收到 git spec 就会把 profile 的依赖写回 `github:` ——
+    于是自研更新器升一次，插件页的按钮就消失一次。表现为「升一次好一次、
+    再升一次坏掉」，比完全没修更难查。那一整套已经删掉，`updateCheck` 配置项
+    也没了；留下的只有 venv 里 Python 包的版本同步，那是宿主不管的一层。
 
 37. **`npm publish` 的三道门槛不会在打包时检查**。`private: true`（直接拒绝）、
     缺 `license` 字段、缺 `LICENSE` 文件。这三条对「用 git 装」完全无感 ——
@@ -962,7 +956,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
 | `tests/test_frames.py` | 帧记忆测试（16 例）：回合编号、整回合淘汰、负原点裁片 |
 | `tests/test_integration.py` | **进程内集成测试**（10 例）：真 Handler + 真 HTTP，只把抓屏与输入换成桩 —— 真机 e2e 在受限进程里跑不动，靠这层守接线 |
 | `tests/check_http.py` | HTTP 层回归检查（5 项）—— keep-alive 复用与 chunked 请求体（详见坑 30、31） |
-| `tests/update-plugin.test.mjs` | 插件行为测试（69 例，`node --test tests/`） |
+| `tests/update-plugin.test.mjs` | 插件行为测试（40 例，`node --test tests/`） |
 | `tests/stubs.mjs` | 测试脚手架：现场生成 `@deepseek-ai/*` 两个桩，不占版本控制 |
 | `experiments/` | 一次性探测与校准脚本，每个都记了结论 |
 
