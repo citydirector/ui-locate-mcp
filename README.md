@@ -77,7 +77,7 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 所以每次启动会比对版本并 `pip install --no-deps` 重装一次（可用 `pythonSync` 关掉）。
 放在启动时也自带容错 —— 这一次失败不影响 JS 侧已经装好，下次会再试。
 
-0.5.x 之前这里自己维护过一整套更新器（读版本列表 + 调 `installBundle`）。它被删掉
+0.5.x 及更早的版本里自己维护过一整套更新器（读版本列表 + 调 `installBundle`）。它被删掉
 是因为和插件页的按钮是两条并行链路：各自判断什么是最新，而且它装完会把依赖写法
 改回 `github:`，插件页的按钮随即消失。历史核对见[更新机制审计](docs/update-audit.md)。
 

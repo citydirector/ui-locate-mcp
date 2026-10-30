@@ -80,7 +80,7 @@ two versions and reinstalls with `pip install --no-deps` when they differ (turn 
 off with `pythonSync`). Running it at startup is also self-healing — a failure here
 does not undo the JS side, and the next start tries again.
 
-Before 0.5.x this repository carried a whole updater of its own (read a version
+In 0.5.x and earlier this repository carried a whole updater of its own (read a version
 list, then call `installBundle`). It was removed because it was a second update path
 running alongside the plugin page: the two disagreed about what was latest, and its
 installs rewrote the dependency back to `github:`, which made the plugin page's
