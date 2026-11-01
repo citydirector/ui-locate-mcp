@@ -612,9 +612,11 @@ class Handler(BaseHTTPRequestHandler):
                 count=int(params.get("count") or 1),
                 delivery=str(params.get("delivery") or "auto"),
                 delay_ms=int(params.get("delay_ms") or 40),
+                pointer=params.get("pointer"),
             )
         if action_name in ("hover", "move"):
-            return actions.move(int(params["x"]), int(params["y"]))
+            return actions.move(int(params["x"]), int(params["y"]),
+                                pointer=params.get("pointer"))
         if action_name == "drag":
             return actions.drag(
                 int(params["x1"]), int(params["y1"]),
@@ -622,20 +624,29 @@ class Handler(BaseHTTPRequestHandler):
                 button=str(params.get("button") or "left"),
                 steps=int(params.get("steps") or 12),
                 duration_ms=int(params.get("duration_ms") or 300),
+                pointer=params.get("pointer"),
             )
         if action_name == "scroll":
             return actions.scroll(
                 int(params["x"]), int(params["y"]),
                 delta=int(params.get("delta") or -3),
                 horizontal=bool(params.get("horizontal")),
+                pointer=params.get("pointer"),
             )
         if action_name == "type":
             return actions.type_text(str(params.get("text") or ""),
                                      delay_ms=int(params.get("delay_ms") or 12))
         if action_name == "press":
-            return actions.press(str(params.get("key") or ""))
+            return actions.press(str(params.get("key") or ""),
+                                 keys_mode=params.get("keys_mode"),
+                                 hold_ms=int(params.get("hold_ms") or 0))
+        if action_name == "hold":
+            return actions.hold(str(params.get("keys") or ""),
+                                duration_ms=int(params.get("duration_ms") or 500),
+                                keys_mode=params.get("keys_mode"))
         if action_name == "hotkey":
-            return actions.hotkey(str(params.get("keys") or ""))
+            return actions.hotkey(str(params.get("keys") or ""),
+                                  keys_mode=params.get("keys_mode"))
         raise actions.InputError(f"服务端不认识的动作 {action_name!r}")
 
     def _compare(self, before: object, after: object, x: int, y: int,
@@ -653,6 +664,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         if img_a.shape != img_b.shape or org_a != org_b:
             return None
+
+        if x is None or y is None:
+            # 没有目标点（纯键盘动作，比如在游戏里按 ESC / I）：整屏比。
+            # 隔点采样，4K 也只算几十万个像素
+            a = img_a[::4, ::4].astype(np.float32)
+            b = img_b[::4, ::4].astype(np.float32)
+            return float(np.abs(a - b).mean())
 
         ox, oy = org_a
         h, w = img_a.shape[:2]

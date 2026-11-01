@@ -159,6 +159,7 @@ def _point_from(value: Any, *, probe: Callable[..., dict | None], spec: dict,
 # ---------------------------------------------------------------------------
 
 _MOUSE_ACTIONS = {"click", "double_click", "right_click", "middle_click", "hover", "move"}
+_KEYBOARD_ACTIONS = {"type", "write", "press", "key", "hold", "hold_key", "hotkey", "shortcut"}
 
 
 def build_action(spec: dict, target: dict) -> tuple[str, dict]:
@@ -168,6 +169,17 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
     的那组参数是纯数据，可以逐字段断言。
     """
     action = str(spec.get("action") or "click").strip().lower()
+    params: dict[str, Any] = {}
+    action, params = _build(action, spec, target)
+    # 输入方式随动作一起带下去（没给就由输入层按 环境变量 / runtime.json 决定）
+    if spec.get("pointer") and action in _MOUSE_ACTIONS | {"drag", "scroll"}:
+        params["pointer"] = str(spec["pointer"])
+    if spec.get("keys_mode") and action in ("press", "hotkey", "hold"):
+        params["keys_mode"] = str(spec["keys_mode"])
+    return action, params
+
+
+def _build(action: str, spec: dict, target: dict) -> tuple[str, dict]:
     params: dict[str, Any] = {}
 
     if action in _MOUSE_ACTIONS:
@@ -223,7 +235,14 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
 
     if action in ("press", "key"):
         params = {"key": str(spec.get("key") or spec.get("value") or "")}
+        if spec.get("hold_ms"):
+            params["hold_ms"] = int(spec["hold_ms"])
         return "press", params
+
+    if action in ("hold", "hold_key"):
+        params = {"keys": str(spec.get("keys") or spec.get("key") or spec.get("value") or ""),
+                  "duration_ms": int(spec.get("duration_ms") or 500)}
+        return "hold", params
 
     if action in ("hotkey", "shortcut"):
         params = {"keys": str(spec.get("keys") or spec.get("value") or "")}
@@ -234,7 +253,7 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
 
     raise ActError(
         f"不认识的动作 {action!r}；可用：click / double_click / right_click / "
-        "middle_click / hover / move / drag / scroll / type / press / hotkey"
+        "middle_click / hover / move / drag / scroll / type / press / hold / hotkey"
     )
 
 
@@ -290,6 +309,7 @@ def verify_screen(
 
     只看点击点附近而不是整屏，是因为整屏里有太多与本次动作无关的变化
     （时钟、光标闪烁、背景动画）。实测整屏平均差在游戏里静止时就有 2.8。
+    x / y 为 None（纯键盘动作、没有目标点）时整屏比，结果里 ``scope: "screen"``。
     """
     diff = compare(before, after, x, y, radius)
     if diff is None:
@@ -300,7 +320,8 @@ def verify_screen(
         "changed": round(float(diff), 2),
         "changed_enough": float(diff) > _DEFAULT_CHANGE_THRESHOLD,
         "threshold": _DEFAULT_CHANGE_THRESHOLD,
-        "radius": radius,
+        "radius": radius if x is not None else None,
+        "scope": "point" if x is not None else "screen",
     }
 
 
@@ -395,7 +416,16 @@ def act(
             "timings": timings,
         }
 
-    target, info = resolve_target(spec, probe=probe, timings=timings, clock=clock)
+    act_name = str(spec.get("action") or "click").strip().lower()
+    has_target = bool(spec.get("text")) or spec.get("x") is not None or isinstance(spec.get("at"), dict)
+    if act_name in _KEYBOARD_ACTIONS and not has_target:
+        # 纯键盘动作不需要目标：游戏里「按 ESC」「按住 W」「Ctrl+S」本来就没有
+        # 可点的东西。以前这里要求 text 或 x/y，调用方只好随便编一个坐标。
+        timings["find_ms"] = 0.0
+        target = {"text": None, "cx": None, "cy": None, "w": 0, "h": 0, "conf": 1.0, "score": None}
+        info = {"reason": "keyboard"}
+    else:
+        target, info = resolve_target(spec, probe=probe, timings=timings, clock=clock)
     if target is None:
         timings["total_ms"] = _ms(t_all, clock)
         return {

@@ -97,6 +97,17 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 `health` 的 `screen.capture` 会显示每块屏上次用的方式。
 
+### 游戏里的输入
+
+全屏游戏常用 Raw Input / DirectInput 读鼠标键盘，桌面程序认的那套它不认。下面两项可以每次调用单独指定（`pointer=`、`keys_mode=`），也可以全局设：
+
+| 设置 | 取值 | 什么时候用 |
+| --- | --- | --- |
+| `UI_LOCATE_POINTER` / `"pointer"` | `absolute`（默认）、`relative` | 全屏游戏里点了没反应、光标不动。`relative` 像真鼠标一样把光标推过去，移动期间临时关掉加速并按回读闭环修正；结果里 `tracking: false` 表示游戏锁住了系统光标，位置是按 1:1 估算的 |
+| `UI_LOCATE_KEYS` / `"keys"` | `vk`（默认，同时填扫描码）、`scancode` | DirectInput 游戏按键没反应 |
+
+`action="hold"` 按住键 `duration_ms` 毫秒（走路、蓄力）。纯键盘动作不需要目标，屏幕验证改为整屏比对。
+
 ## 更新
 
 **插件本身由 DSH 插件页更新，本包不再自带更新器。** 依赖是 registry 形式

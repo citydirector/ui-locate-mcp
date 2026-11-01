@@ -20,6 +20,8 @@
   UI_LOCATE_BASE        客户端连接的服务地址，默认 http://<host>:<port>
   UI_LOCATE_PROVIDER     cuda / dml / cpu / auto，默认 auto（cuda → dml → cpu）
   UI_LOCATE_CAPTURE      auto / dxgi / wgc / gdi，默认 auto（见 capture.py）
+  UI_LOCATE_POINTER      absolute / relative，鼠标怎么移动，默认 absolute（见 actions.py）
+  UI_LOCATE_KEYS         vk / scancode，按键怎么送，默认 vk（见 actions.py）
 
 可调参数（都有默认值，一般不用改）：
   UI_LOCATE_MIN_EDGE     跳过空白块的边缘密度下限，默认 0.0008

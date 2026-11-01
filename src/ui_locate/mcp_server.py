@@ -492,6 +492,9 @@ def ui_locate_act(
     keys: str = "",
     verify_text: str = "",
     verify_timeout_ms: int = 3000,
+    pointer: str = "",
+    keys_mode: str = "",
+    duration_ms: int = 0,
 ) -> str:
     """定位 → 动作 → 验证，**一次调用走完**。
 
@@ -502,13 +505,16 @@ def ui_locate_act(
     参数：
       text        要操作的目标文字（推荐）。界面一变坐标就变，文字不变。
                   也可以不给 text，改用 mark（编号）或 x + y（坐标）。
+                  纯键盘动作（press / hold / hotkey / type）可以什么目标都不给，
+                  此时 verify="screen" 改为整屏比对
       mark        `ui_locate_marks` 标注图上的编号。没有稳定文字的目标用它，
                   比自己估坐标准得多。
       cell        标注图上的网格名（如 "B2"），点那一格的中心。格子越小越准：
                   先用 box=格子名 放大重标，再选更小的格子或编号
       mark_set    可选，标注时返回的集合号；画面已被重新标注过就拒绝执行
       action      click（默认）/ double_click / right_click / middle_click /
-                  hover / drag / scroll / type / press / hotkey / wait
+                  hover / drag / scroll / type / press / hold / hotkey / wait
+                  hold = 按住 key/keys 一段时间（游戏里走路、蓄力），时长见 duration_ms
       verify      动作后怎么确认生效：
                     "screen"（默认）—— 点击点周围像素变了没有
                     "text"          —— 指定时间内有没有出现 verify_text
@@ -525,6 +531,12 @@ def ui_locate_act(
       key / keys  action=press 的单键，或 action=hotkey 的组合键（"ctrl+s"）
       verify_text verify="text" 时要等的文字
       verify_timeout_ms  等文字的时限，默认 3000
+      pointer     鼠标怎么动：absolute（默认，一步到位）/ relative（像真鼠标那样推过去）。
+                  **全屏游戏点了没反应、光标不动时换 relative** —— 用 Raw Input 的游戏
+                  只认相对位移。结果里 relative.tracking=false 表示游戏锁住了系统光标，
+                  位置是按 1:1 估算的，务必看 verify 或重新截图确认
+      keys_mode   按键怎么送：vk（默认）/ scancode（DirectInput 游戏按键没反应时用）
+      duration_ms action=hold 按住多久（毫秒，默认 500）；action=press 时表示按住多久再松
 
     返回 JSON：
       ok        流程是否走完（**不代表动作生效了**）
@@ -569,6 +581,12 @@ def ui_locate_act(
         payload["key"] = key
     if keys:
         payload["keys"] = keys
+    if pointer:
+        payload["pointer"] = pointer
+    if keys_mode:
+        payload["keys_mode"] = keys_mode
+    if duration_ms:
+        payload["duration_ms" if action in ("hold", "hold_key", "drag") else "hold_ms"] = int(duration_ms)
 
     if verify == "text":
         payload["verify"] = {"text": verify_text, "timeout_ms": int(verify_timeout_ms)}
