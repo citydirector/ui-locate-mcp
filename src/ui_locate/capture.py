@@ -47,6 +47,10 @@ AUTO_CHAIN = ("dxgi", "wgc", "gdi")
 # 文字和图标也远高于它；全黑帧（GDI 抓独占全屏）则恒为 0。
 BLACK_MAX = 8
 
+# 记住的后端不是链首（dxgi）时，隔这么久重新从链首试一次。一次偶发失败
+# （驱动重置、ACCESS_LOST、某一帧抽风）不该让这块屏永远停在慢 / 降级的后端上。
+STICKY_RETRY_S = 30.0
+
 
 class CaptureError(RuntimeError):
     """某个后端抓不到图。信息里写明是哪个后端、为什么。"""
@@ -249,17 +253,28 @@ GRABBERS: dict[str, Callable[[Region], np.ndarray]] = {
 class Capturer:
     """按偏好选后端，auto 时带回落，并记住每块屏上次成功的后端。"""
 
-    def __init__(self, grabbers: dict[str, Callable[[Region], np.ndarray]] | None = None) -> None:
+    def __init__(self, grabbers: dict[str, Callable[[Region], np.ndarray]] | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self.grabbers = grabbers if grabbers is not None else GRABBERS
+        self._clock = clock
         self._sticky: dict[str, str] = {}
+        self._sticky_at: dict[str, float] = {}
         self._lock = threading.Lock()
         self.last: dict = {}
 
     def _chain(self, choice: str, device: str) -> list[str]:
         if choice != "auto":
             return [choice]
-        sticky = self._sticky.get(device.lower())
+        key = device.lower()
+        sticky = self._sticky.get(key)
         chain = list(AUTO_CHAIN)
+        if sticky in chain and sticky != chain[0]:
+            since = self._sticky_at.setdefault(key, self._clock())
+            if self._clock() - since >= STICKY_RETRY_S:
+                # 到期：这一次按原顺序从链首试；首选恢复了就换回去，没恢复
+                # 照样落回原来那个，并重新计时
+                self._sticky_at[key] = self._clock()
+                return chain
         if sticky in chain:
             chain.remove(sticky)
             chain.insert(0, sticky)
@@ -290,7 +305,10 @@ class Capturer:
                     black = (name, bgr, ms)
                 continue
             with self._lock:
-                self._sticky[region.device.lower()] = name
+                key = region.device.lower()
+                if self._sticky.get(key) != name:
+                    self._sticky_at[key] = self._clock()
+                self._sticky[key] = name
             shot = Shot(bgr, name, ms, tried)
             self._remember(region, shot, errors)
             return shot

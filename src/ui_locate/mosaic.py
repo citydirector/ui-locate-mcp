@@ -59,6 +59,9 @@ def _crop_box(
     return x1, y1, x2, y2
 
 
+MIN_SHEET_H = 64
+
+
 def _layout(
     items: list[dict],
     scale: float,
@@ -99,8 +102,10 @@ def _layout(
         x += w + PAD * 2 + GAP
         row_h = max(row_h, h + PAD * 2)
 
-    sheet_h = y + row_h + GAP if slots else 1
-    canvas = np.full((max(1, sheet_h), SHEET_W, 3), 255, dtype=np.uint8)
+    # 拼图至少 MIN_SHEET_H 高：OCR 对极端长宽比极慢（实测宽 1200 时高 1 → 97s、
+    # 高 8 → 1.4s、高 16 → 0.6s）。多出来的是白底，不影响识别。
+    sheet_h = max(MIN_SHEET_H, y + row_h + GAP) if slots else MIN_SHEET_H
+    canvas = np.full((sheet_h, SHEET_W, 3), 255, dtype=np.uint8)
     return SHEET_W, sheet_h, slots, canvas
 
 
