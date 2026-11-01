@@ -114,6 +114,49 @@ def _iou_and_cover(a: tuple, b: tuple) -> tuple[float, float]:
     return inter / (area_a + area_b - inter), inter / min(area_a, area_b)
 
 
+BLANK_EDGE_DENSITY = 0.003
+
+
+def drop_blank(elements: list[dict], bgr: np.ndarray, origin: tuple[int, int],
+               stats: dict | None = None) -> list[dict]:
+    """去掉「空白区凑出来的框」：框里（含边）几乎没有边缘、也没有文字。
+
+    纯色 / 渐变背景上的误检会让标注数虚高（regress3：590×70、65×70 两个空框）。
+    有边框的空物品格、空槽位边上有一圈边缘，密度远高于阈值，不受影响。
+    """
+    import cv2
+
+    ox, oy = origin
+    H, W = bgr.shape[:2]
+    keep: list[dict] = []
+    dropped = 0
+    for it in elements:
+        if (it.get("text") or "").strip():
+            keep.append(it)
+            continue
+        try:
+            x1 = max(0, int(round(float(it["x1"]) - ox)) - 1)
+            y1 = max(0, int(round(float(it["y1"]) - oy)) - 1)
+            x2 = min(W, int(round(float(it["x2"]) - ox)) + 1)
+            y2 = min(H, int(round(float(it["y2"]) - oy)) + 1)
+        except (KeyError, TypeError, ValueError):
+            keep.append(it)
+            continue
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            keep.append(it)
+            continue
+        crop = bgr[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        density = float(np.count_nonzero(cv2.Canny(gray, 50, 150))) / gray.size
+        if density < BLANK_EDGE_DENSITY:
+            dropped += 1
+            continue
+        keep.append(it)
+    if stats is not None:
+        stats["blank_dropped"] = stats.get("blank_dropped", 0) + dropped
+    return keep
+
+
 def build_marks(
     elements: list[dict],
     *,
