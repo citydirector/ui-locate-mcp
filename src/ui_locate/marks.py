@@ -122,6 +122,7 @@ def build_marks(
     iou_dup: float = 0.7,
     max_area_ratio: float = 0.35,
     min_side: float = 3.0,
+    stats: dict | None = None,
 ) -> list[Mark]:
     """检测结果 → 编号好的 Mark 列表。
 
@@ -181,7 +182,11 @@ def build_marks(
     # 密集文字（文件管理器、表格）里检测器常把一个词切成一字一框：先把同一行里
     # 挨着的文字碎片并回去，再截断 —— 否则 200 个名额被单字吃光。
     kept = merge_text_fragments(kept)
+    kept = drop_container_cells(kept)
     kept.sort(key=lambda c: (bool(c["text"]), c["conf"]), reverse=True)
+    if stats is not None:
+        stats["candidates"] = len(kept)
+        stats["truncated"] = len(kept) > max_marks
     kept = kept[:max_marks]
 
     if not kept:
@@ -277,6 +282,24 @@ def merge_text_fragments(cands: list[dict], *, gap_ratio: float = 0.45,
             }
         merged.append(cur)
     return others + merged
+
+
+def drop_container_cells(cands: list[dict]) -> list[dict]:
+    """几何补出来的「格子」如果把另外两个以上格子的中心包在里面，它是外框
+    （或跨格的误检），不是一个可点的格子 —— 去掉。2048 棋盘上曾出现一个
+    363x283 的格子横跨两行两列。"""
+    cells = [c for c in cands if c["kind"] == "cell"]
+    if len(cells) < 3:
+        return cands
+    centers = [((c["box"][0] + c["box"][2]) / 2, (c["box"][1] + c["box"][3]) / 2) for c in cells]
+    drop = set()
+    for i, c in enumerate(cells):
+        x1, y1, x2, y2 = c["box"]
+        inside = sum(1 for j, (cx, cy) in enumerate(centers)
+                     if j != i and x1 < cx < x2 and y1 < cy < y2)
+        if inside >= 2:
+            drop.add(id(c))
+    return [c for c in cands if id(c) not in drop]
 
 
 def grid_cells(origin: tuple[int, int], size: tuple[int, int], n: int) -> dict[str, tuple[float, float, float, float]]:

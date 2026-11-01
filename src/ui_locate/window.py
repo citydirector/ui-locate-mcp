@@ -331,6 +331,111 @@ def is_shell(hwnd: int) -> bool:
     return bool(hwnd) and _class(hwnd).lower() in _SHELL_CLASSES
 
 
+# ── 权限（UIPI）─────────────────────────────────────────────────────────────
+#
+# SendInput 被 UIPI 拦下时既不报错也不少计数（MS 文档原话：Neither GetLastError
+# nor the return value will indicate the failure）—— 只能事前比完整性级别。
+
+INTEGRITY_NAMES = {0x0000: "untrusted", 0x1000: "low", 0x2000: "medium",
+                   0x2100: "medium+", 0x3000: "high", 0x4000: "system"}
+
+
+def integrity_name(rid: int | None) -> str | None:
+    if rid is None:
+        return None
+    best = max((k for k in INTEGRITY_NAMES if k <= rid), default=0)
+    return INTEGRITY_NAMES[best]
+
+
+def uipi_verdict(self_rid: int | None, target_rid: int | None, ui_access: bool) -> dict:
+    """纯函数：本进程往目标窗口送输入，会不会被 UIPI 吞掉。"""
+    out = {"self": integrity_name(self_rid), "target": integrity_name(target_rid),
+           "ui_access": bool(ui_access)}
+    if self_rid is None or target_rid is None:
+        out["blocked"] = None
+        return out
+    out["blocked"] = (target_rid > self_rid) and not ui_access
+    if out["blocked"]:
+        out["hint"] = (f"目标窗口是 {out['target']} 完整性（多半以管理员运行），本服务是 "
+                       f"{out['self']}：鼠标键盘会被系统静默丢弃。用管理员身份启动 DSH / 本服务后再试")
+    return out
+
+
+if _IS_WINDOWS:
+    _a = ctypes.WinDLL("advapi32", use_last_error=True)
+    _k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    _k.OpenProcess.restype = wt.HANDLE
+    _k.CloseHandle.argtypes = [wt.HANDLE]
+    _k.GetCurrentProcess.restype = wt.HANDLE
+    _a.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
+    _a.GetTokenInformation.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD,
+                                       ctypes.POINTER(wt.DWORD)]
+    _a.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    _a.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    _a.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wt.DWORD]
+    _a.GetSidSubAuthority.restype = ctypes.POINTER(wt.DWORD)
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_TokenIntegrityLevel = 25
+_TokenUIAccess = 26
+
+
+def _token_info(pid: int | None) -> tuple[int | None, bool]:
+    """(完整性 RID, uiAccess)。pid=None 表示本进程。查不到返回 (None, False)。"""
+    if not _IS_WINDOWS:
+        return None, False
+    proc = _k.GetCurrentProcess() if pid is None else _k.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not proc:
+        return None, False
+    token = wt.HANDLE()
+    try:
+        if not _a.OpenProcessToken(proc, _TOKEN_QUERY, ctypes.byref(token)):
+            return None, False
+        try:
+            need = wt.DWORD(0)
+            _a.GetTokenInformation(token, _TokenIntegrityLevel, None, 0, ctypes.byref(need))
+            buf = ctypes.create_string_buffer(max(need.value, 64))
+            if not _a.GetTokenInformation(token, _TokenIntegrityLevel, buf, len(buf),
+                                          ctypes.byref(need)):
+                return None, False
+            sid = ctypes.c_void_p.from_buffer(buf).value   # TOKEN_MANDATORY_LABEL.Label.Sid
+            count = _a.GetSidSubAuthorityCount(sid)[0]
+            rid = int(_a.GetSidSubAuthority(sid, count - 1)[0])
+            ua = wt.DWORD(0)
+            ok = _a.GetTokenInformation(token, _TokenUIAccess, ctypes.byref(ua),
+                                        ctypes.sizeof(ua), ctypes.byref(need))
+            return rid, bool(ok and ua.value)
+        finally:
+            _k.CloseHandle(token)
+    finally:
+        if pid is not None:
+            _k.CloseHandle(proc)
+
+
+def self_integrity() -> dict:
+    rid, ua = _token_info(None)
+    return {"level": integrity_name(rid), "ui_access": ua}
+
+
+def process_integrity(pid: int) -> str | None:
+    try:
+        return integrity_name(_token_info(pid)[0])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def uipi(hwnd: int) -> dict:
+    """往 hwnd 送输入会不会被 UIPI 拦。查不到权限时 blocked 为 None（不确定）。"""
+    if not _IS_WINDOWS or not hwnd:
+        return uipi_verdict(None, None, False)
+    me, ua = _token_info(None)
+    pid, _tid = _pid_tid(hwnd)
+    target, _ = _token_info(pid)
+    return uipi_verdict(me, target, ua)
+
+
 # ── 前台 ───────────────────────────────────────────────────────────────────
 
 def _is_front(hwnd: int) -> bool:

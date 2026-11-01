@@ -32,6 +32,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 import threading
 import time
@@ -56,9 +58,29 @@ class CaptureError(RuntimeError):
     """某个后端抓不到图。信息里写明是哪个后端、为什么。"""
 
 
+_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar("ui_locate_capture", default=None)
+
+
+@contextlib.contextmanager
+def choose(backend: object):
+    """在这个 with 块里（本线程 / 本请求）改用指定后端；None / 空 / 非法名不改。
+
+    给 HTTP 请求体里的 ``capture`` 字段用：不必为了换一次后端去改环境变量。
+    """
+    value = str(backend or "").strip().lower()
+    if value not in BACKENDS:
+        yield
+        return
+    token = _OVERRIDE.set(value)
+    try:
+        yield
+    finally:
+        _OVERRIDE.reset(token)
+
+
 def preferred() -> str:
-    """当前要用的后端名。非法值退回 ``auto``。"""
-    value = os.environ.get("UI_LOCATE_CAPTURE", "").strip().lower()
+    """当前要用的后端名。非法值退回 ``auto``。优先级：请求里的 capture > 环境变量 > runtime.json。"""
+    value = _OVERRIDE.get() or os.environ.get("UI_LOCATE_CAPTURE", "").strip().lower()
     if not value:
         try:
             from ui_locate.config import runtime_settings

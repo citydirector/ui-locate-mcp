@@ -149,6 +149,47 @@ class TextFragmentTests(unittest.TestCase):
         self.assertEqual(marks[0].text, "文件夹大小")
 
 
+class Regress2Tests(unittest.TestCase):
+    """第二轮回归（2026-10-31）发现的问题。"""
+
+    def test_truncation_is_reported(self):
+        els = [{"x1": i * 40, "y1": 0, "x2": i * 40 + 20, "y2": 20, "conf": 0.5} for i in range(5)]
+        st = {}
+        build_marks(els, max_marks=3, stats=st)
+        self.assertEqual(st, {"candidates": 5, "truncated": True})
+        st = {}
+        build_marks(els, max_marks=5, stats=st)
+        self.assertFalse(st["truncated"])
+
+    def test_container_cell_dropped(self):
+        cells = [{"x1": x, "y1": y, "x2": x + 100, "y2": y + 100, "conf": 0.5, "source": "grid"}
+                 for x in (0, 110, 220) for y in (0, 110)]
+        big = {"x1": 50, "y1": 50, "x2": 280, "y2": 200, "conf": 0.5, "source": "grid"}
+        marks = build_marks(cells + [big])
+        self.assertEqual(len(marks), 6)
+
+    def test_capture_choose_overrides_and_restores(self):
+        from ui_locate import capture
+
+        before = capture.preferred()
+        with capture.choose("gdi"):
+            self.assertEqual(capture.preferred(), "gdi")
+        with capture.choose("nope"):
+            self.assertEqual(capture.preferred(), before)
+        self.assertEqual(capture.preferred(), before)
+
+    def test_uipi_verdict(self):
+        from ui_locate import window
+
+        v = window.uipi_verdict(0x2000, 0x3000, False)
+        self.assertTrue(v["blocked"])
+        self.assertEqual((v["self"], v["target"]), ("medium", "high"))
+        self.assertIn("管理员", v["hint"])
+        self.assertFalse(window.uipi_verdict(0x3000, 0x3000, False)["blocked"])
+        self.assertFalse(window.uipi_verdict(0x2000, 0x3000, True)["blocked"])
+        self.assertIsNone(window.uipi_verdict(None, 0x3000, False)["blocked"])
+
+
 class ApiPitfallTests(unittest.TestCase):
     """报告第四节的调用坑。"""
 

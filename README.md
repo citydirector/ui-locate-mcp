@@ -109,7 +109,9 @@ The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCA
 | `wgc` | Windows Graphics Capture (needs `dxcam[winrt]`) | Hybrid-GPU laptops where DXGI reports `UNSUPPORTED` |
 | `gdi` | BitBlt | Maximum compatibility; often black for fullscreen games |
 
-`health` reports the backend each monitor last used under `screen.capture`.
+`health` reports the backend each monitor last used under `screen.capture`. A remembered fallback is re-checked against DXGI every 30 s, so one bad frame does not demote a monitor for good. HTTP requests (`/marks`, `/act`, `/steps`, `/diff`, `/detect`) may also carry `"capture": "gdi"` etc. for that request only.
+
+If a target window runs as administrator and the server does not, Windows silently drops synthetic input (UIPI). `health.integrity` shows the server's level, `/windows` shows each window's, and actions on such a window return `uipi.blocked: true` with a warning.
 
 ### Input for games
 
