@@ -403,6 +403,7 @@ def ui_locate_marks(
     max_side: int = 1600,
     grid: int = 0,
     cells: bool = True,
+    incremental: bool = True,
 ):
     """截一张屏，把每个可点的东西都标上编号 —— **直接返回图片**。看图选号，再用
     `ui_locate_act(mark=编号)` 去点。不用自己估坐标。
@@ -432,6 +433,9 @@ def ui_locate_marks(
       text       顺带 OCR 认字，默认 True；只关心图标时关掉能快 0.5 秒左右
       max_marks  最多标多少个，默认 200
       max_side   标注图长边像素，默认 1600
+      incremental 默认 True：和上一次标注同一块屏 / 窗口时先做差分，没变就直接复用、
+                 只变了一小块就只对那一块重新检测 + OCR（返回里 incremental.mode =
+                 reuse / partial / full）。编号仍然重新分配，旧 mark_set 照样作废
       cells      补「成排成列的同尺寸格子」（物品栏、标签页、技能栏、棋盘、表格），
                  不靠模型，跨游戏通用；默认 True。返回里这类编号 kind="cell"
       grid       叠加网格，长边切几格（短边按比例），0 = 不画（默认）。8 左右合适
@@ -462,6 +466,8 @@ def ui_locate_marks(
         payload["grid"] = int(grid)
     if not cells:
         payload["cells"] = False
+    if not incremental:
+        payload["incremental"] = False
     res = _post_any("/marks", payload)
     if not res.get("ok"):
         return json.dumps(res, ensure_ascii=False)
@@ -503,7 +509,8 @@ def ui_locate_act(
     pointer: str = "",
     keys_mode: str = "",
     duration_ms: int = 0,
-) -> str:
+    watch_ms: int = 0,
+):
     """定位 → 动作 → 验证，**一次调用走完**。
 
     这是「快」的关键：以前是「找坐标」一次往返、「点击」一次往返、「截图确认」
@@ -559,6 +566,9 @@ def ui_locate_act(
                   身份启动 DSH 再试
       keys_mode   按键怎么送：vk（默认）/ scancode（DirectInput 游戏按键没反应时用）
       duration_ms action=hold 按住多久（毫秒，默认 500）；action=press 时表示按住多久再松
+      watch_ms    动作之后接着**看一小段**（毫秒，0=不看）：返回里多一个 watch 和一张
+                  关键帧拼图（同 ui_locate_watch），用来看结果怎么演变 —— 角色走到哪、
+                  弹窗出没出来、技能是否进了冷却。「看 → 做 → 看」一次调用走完
 
     返回 JSON：
       ok        流程是否走完（**不代表动作生效了**）
@@ -626,7 +636,19 @@ def ui_locate_act(
     elif verify in ("none", ""):
         payload["verify"] = None
 
-    return json.dumps(_post_any("/act", payload), ensure_ascii=False)
+    if watch_ms:
+        payload["watch_ms"] = int(watch_ms)
+    res = _post_any("/act", payload)
+    watch = res.get("watch") if isinstance(res, dict) else None
+    if isinstance(watch, dict) and watch.get("image_b64"):
+        import base64
+
+        from mcp.server.fastmcp.utilities.types import Image
+
+        data = base64.b64decode(watch.pop("image_b64"))
+        fmt = watch.pop("image_format", "jpeg")
+        return [json.dumps(res, ensure_ascii=False), Image(data=data, format=fmt)]
+    return json.dumps(res, ensure_ascii=False)
 
 
 def _window_spec(window: str) -> str:
@@ -680,6 +702,56 @@ def ui_locate_diff(monitor: str = "primary", window: str = "", cell: int = 32,
     if reset:
         payload["reset"] = True
     return json.dumps(_post_any("/diff", payload), ensure_ascii=False)
+
+
+def _with_image(res: dict) -> list:
+    """把服务返回里的 image_b64 拆成一张 MCP 图片，其余留在 JSON 里。"""
+    import base64
+
+    from mcp.server.fastmcp.utilities.types import Image
+
+    data = base64.b64decode(res.pop("image_b64", "") or b"")
+    fmt = res.pop("image_format", "jpeg")
+    out: list = [json.dumps(res, ensure_ascii=False)]
+    if data:
+        out.append(Image(data=data, format=fmt))
+    return out
+
+
+@mcp.tool()
+def ui_locate_watch(monitor: str = "primary", window: str = "", duration_ms: int = 3000,
+                    fps: float = 5.0, mode: str = "regions", max_keyframes: int = 6):
+    """**录几秒看一看**：连抓一小段，挑出关键帧，只把「变了的地方」拼成一张图返回。
+
+    不知道一个操作会引起什么（地图会不会动、怪往哪走、动画什么时候结束、按钮
+    是不是在冷却）时，先看几秒再决定；动手之后也可以再看几秒确认结果。比连发
+    十几张截图便宜得多：静止画面只回一帧，变化只回裁片。
+
+    水面、粒子、时钟这类**一直在动**的格子会被识别成环境噪声（返回里的 ambient），
+    不算关键帧。
+
+    参数：
+      monitor       哪块屏，默认 "primary"
+      window        只看一个窗口（标题或句柄），被挡住也能抓；给了就忽略 monitor
+      duration_ms   录多久，默认 3000，最多 15000
+      fps           每秒几帧，默认 5，最多 15
+      mode          "regions"（默认）= 第一帧全景 + 之后每个关键帧只贴变化区域裁片；
+                    "full" = 每个关键帧整帧缩略图
+      max_keyframes 最多几个关键帧（含第一帧），默认 6；多了按变化量挑，保留最后一帧
+
+    返回：JSON + 一张拼图。
+      JSON：{static, frames, fps, keyframes:[{index, t_ms, changed_frac,
+             regions:[{x, y, w, h, cx, cy, cells, strength}]}], ambient, timings}
+      拼图里每块标着 K<序号> t=<秒>，裁片还标着屏幕坐标 @x,y 和尺寸。
+      static=true 表示这段时间画面没变（只有第一帧）。
+    """
+    payload: dict[str, Any] = {"monitor": _window_spec(window) or monitor or "primary",
+                               "duration_ms": int(duration_ms), "fps": float(fps),
+                               "mode": mode, "max_keyframes": int(max_keyframes)}
+    res = _post_any("/watch", payload)
+    if not res.get("ok"):
+        return json.dumps(res, ensure_ascii=False)
+    return _with_image(res)
 
 
 @mcp.tool()

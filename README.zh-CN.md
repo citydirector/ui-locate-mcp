@@ -44,6 +44,7 @@ dsh plugin --profile web add ui-locate-mcp
 | `ui_locate_steps` | 串行执行一组步骤，返回失败位置 |
 | `ui_locate_windows` | 列出顶层窗口（标题、句柄、客户区、是否前台） |
 | `ui_locate_diff` | 上次调用之后屏幕哪里变了，回矩形（不回图、不花视觉 token） |
+| `ui_locate_watch` | 录几秒，回一张关键帧拼图，只贴变化区域 |
 | `ui_locate_frames` / `ui_locate_frame` | 列出或取回近期动作帧 |
 | `list_monitors` | 显示器尺寸、原点和索引 |
 | `health` | 检查服务是否就绪 |
@@ -82,6 +83,12 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 ### 等待与验证
 
 `verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 不给文字 = 等画面静止。动作前会先静置约 80ms 量一下画面自己在动多少（水面、粒子、视频）；这类画面（`verify.noise.animated`）上阈值随噪声抬高，本来就在动的格子不计，点空白动态背景不会再报 `verified: true`。
+
+### 先看几秒再动手
+
+很多操作的结果没法从一张截图预判（地图会不会动、怪往哪走、技能是否在冷却）。`ui_locate_watch` 连录几秒（`duration_ms`、`fps`），用网格差分挑关键帧，只回**一张**图：第一帧全景，之后每个关键帧只贴变化区域的裁片，标着时间和屏幕坐标。画面不动只回一帧；几乎每帧都在变的格子（水面、粒子、时钟）当作环境噪声不计（结果里的 `ambient`）。`ui_locate_act(..., watch_ms=2000)` 动手后接着看，「看 → 做 → 看」一次调用完成。
+
+`ui_locate_marks` 默认增量：同一块屏或同一个窗口，先和上一次比差分，没变就整份复用；变化不到 30% 时只对变化区域（以及跨在边界上的元素）重跑检测和 OCR。返回里 `incremental.mode` 是 `reuse` / `partial` / `full`；编号每次都重新分配。
 
 ## 配置与数据目录
 
