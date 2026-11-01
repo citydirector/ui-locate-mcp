@@ -89,8 +89,11 @@ class IntegrationTests(unittest.TestCase):
 
         def fake_grab(monitor=None):
             self._n += 1
-            # 每次抓屏颜色微变，让 verify 的像素比对能看出「变了」
-            return make_frame(value=40 + self._n * 20), (0, 0)
+            # 每次抓屏颜色变一档，让 verify 的像素比对能看出「变了」。
+            # 必须取模：`wait` 步会按 40~60ms 一直抓到超时，10 来帧之后
+            # `40 + n*20` 就超过 255，`np.full(..., dtype=uint8)` 直接抛
+            # OverflowError —— 那是桩自己的锅，不该让它看起来像产品缺陷。
+            return make_frame(value=40 + (self._n % 8) * 20), (0, 0)
 
         screen.grab = fake_grab
         S.actions.click = lambda *a, **k: {"sent": 3, "cursor_moved": True}
@@ -212,14 +215,33 @@ class IntegrationTests(unittest.TestCase):
             len(mine["frames"]), 1,
             "没有验证的动作也要留下可回看的帧")
 
-    def test_step_without_text_is_a_400(self):
-        """`{"action":"wait"}` 缺 text 是调用方写错了，该 400 而不是 500。"""
+    def test_step_wait_without_text_waits_for_stillness(self):
+        """`{"action":"wait"}` 不给 text 是合法的一步：等画面静止，不是 400。
+
+        这条断言在 `9079162` 之前是反的 —— 那时候缺 text 会抛「需要 text」，
+        所以期待 400。现在语义改了：不给文字的 wait = 等界面加载完 / 动画放完，
+        返回 200，`ok` 由 `settle.stable` 决定。
+
+        这里**不断言 `ok`**：本文件的 `fake_grab` 每帧都换一个灰度（那是故意的，
+        verify 要看出「变了」），所以 `wait` 一定等不到静止、`ok` 恒为 false。
+        该验的是「这一步跑得下去」：200、走到 wait、报告里有 settle 而不是异常。
+        """
         code, _h, body = self.call("/steps", {"steps": [
             {"action": "move", "x": 1, "y": 1},
-            {"action": "wait"},
+            {"action": "wait", "timeout_ms": 600, "verify": "none"},
         ]}, method="POST")
-        self.assertEqual(code, 400)
-        self.assertIn("error", body)
+        self.assertEqual(code, 200, body)
+        last = body["steps"][-1]
+        self.assertEqual(last["action"], "none")
+        self.assertIsNone(last["target"])
+        self.assertIn("settle_ms", last["timings"])
+        settle = last["settle"]
+        self.assertEqual(settle["mode"], "stable")
+        # 桩一直在变，所以 stable 是 False；关键是它**有**结论，
+        # 而不是把 OverflowError 之类的东西兜成 "stable": None
+        self.assertFalse(settle["stable"])
+        self.assertGreater(settle["frames"], 1)
+        self.assertNotIn("error", settle)
 
     def test_keepalive_survives_image_then_json(self):
         """拿完 PNG 之后同一条连接上的 JSON 请求不能被污染。
