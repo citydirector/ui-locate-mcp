@@ -572,7 +572,9 @@ def watch_screen(body: dict) -> dict:
     last_t, last_img, last_org = frames[-1]
     with _DIFF_LOCK:
         _DIFF_BASE[str(monitor)] = (last_img, last_org, time.monotonic())
-    ok, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    from ui_locate.marks import encode_jpeg
+
+    ok, buf = encode_jpeg(sheet)
     import base64
 
     info.update(ok=True, monitor=str(monitor), capture=_capture_last(monitor),

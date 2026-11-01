@@ -357,7 +357,7 @@ def render(
     max_side: int = 1600,
     upscale_max: float = 1.0,
     fmt: str = "jpeg",
-    quality: int = 88,
+    quality: int = 0,
     cells: dict[str, tuple[float, float, float, float]] | None = None,
 ) -> tuple[bytes, float]:
     """画标注图，返回 (图片字节, scale)。scale = 标注图像素 / 屏幕像素。
@@ -450,10 +450,33 @@ def render(
     if fmt == "png":
         ok, buf = cv2.imencode(".png", canvas)
     else:
-        ok, buf = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+        ok, buf = encode_jpeg(canvas, quality)
     if not ok:
         raise RuntimeError("标注图编码失败")
     return buf.tobytes(), scale
+
+
+def jpeg_quality(default: int = 90) -> int:
+    import os
+
+    try:
+        return max(50, min(int(os.environ.get("UI_LOCATE_JPEG_QUALITY") or default), 100))
+    except ValueError:
+        return default
+
+
+def encode_jpeg(img: np.ndarray, quality: int = 0) -> tuple[bool, np.ndarray]:
+    """给模型看的图统一这样编码：质量 90、色度**不降采样**（4:4:4）。
+
+    视觉模型按像素尺寸计 token，和文件大小无关，所以压得更狠省不了钱；反过来，
+    默认的 4:2:0 会把彩色小字和彩色编号标签的边缘糊掉（色度只剩四分之一分辨率），
+    模型就认不清。4:4:4 + q90 比 4:2:0 + q88 大约多 20~40% 字节，本机回环传输
+    这点体积可以忽略。``UI_LOCATE_JPEG_QUALITY`` 可改质量。
+    """
+    params = [cv2.IMWRITE_JPEG_QUALITY, int(quality) or jpeg_quality()]
+    if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
+        params += [cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]
+    return cv2.imencode(".jpg", img, params)
 
 
 @dataclass

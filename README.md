@@ -103,7 +103,7 @@ The Host row ID is `ui-locate-update`; the MCP row is `mcp-ui-locate`.
 
 The default home follows `UI_LOCATE_HOME` → `DSH_HOME/ui-locate` → `LOCALAPPDATA/ui-locate`. Empty directory settings follow portable DSH data; explicit absolute paths require maintenance.
 
-The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCATE_PROVIDER` and `UI_LOCATE_PORT`; see [config.py](src/ui_locate/config.py). MCP connects to local port 7788 by default.
+The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCATE_PROVIDER` and `UI_LOCATE_PORT`; see [config.py](src/ui_locate/config.py). MCP connects to local port 7788 by default. Images for the model are JPEG at quality 90 with 4:4:4 chroma (no subsampling) so small colored text stays legible; vision tokens depend on pixel size, not bytes. `UI_LOCATE_JPEG_QUALITY` changes the quality.
 
 ### Screen capture
 

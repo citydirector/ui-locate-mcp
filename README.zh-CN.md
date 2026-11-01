@@ -103,7 +103,7 @@ Host 行 ID 是 `ui-locate-update`，MCP 行 ID 是 `mcp-ui-locate`。
 
 默认运行目录按 `UI_LOCATE_HOME` → `DSH_HOME/ui-locate` → `LOCALAPPDATA/ui-locate` 选择。目录留空可跟随便携版的数据目录；显式绝对路径需要自行维护。
 
-Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PROVIDER` 和 `UI_LOCATE_PORT`，详见 [config.py](src/ui_locate/config.py)。MCP 默认连接本机 7788 端口。
+Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PROVIDER` 和 `UI_LOCATE_PORT`，详见 [config.py](src/ui_locate/config.py)。MCP 默认连接本机 7788 端口。给模型的图统一是 JPEG 质量 90、色度不降采样（4:4:4），彩色小字不会糊；视觉 token 只看像素尺寸，不看文件大小。`UI_LOCATE_JPEG_QUALITY` 可改质量。
 
 ### 抓屏方式
 
