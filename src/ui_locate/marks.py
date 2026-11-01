@@ -56,7 +56,7 @@ class Mark:
     y2: float
     text: str = ""
     conf: float = 0.0
-    kind: str = "icon"  # icon（检测框）/ text（检测框且认出了字）/ ocr（只有文字）
+    kind: str = "icon"  # icon（检测框）/ text（认出了字）/ ocr（只有文字）/ cell（成排成列的格子）
 
     @property
     def cx(self) -> float:
@@ -147,7 +147,14 @@ def build_marks(
             continue
         text = str(it.get("text") or "").strip()
         conf = float(it.get("conf") or 0.0)
-        kind = "ocr" if it.get("text_only") else ("text" if text else "icon")
+        if it.get("text_only"):
+            kind = "ocr"
+        elif text:
+            kind = "text"
+        elif it.get("source") == "grid":
+            kind = "cell"
+        else:
+            kind = "icon"
         cands.append({"box": (x1, y1, x2, y2), "text": text, "conf": conf, "kind": kind})
 
     # 优先级：带文字 > 置信度。去重和截断都按这个顺序保留。

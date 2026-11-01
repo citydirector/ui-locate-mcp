@@ -401,6 +401,7 @@ def ui_locate_marks(
     max_marks: int = 200,
     max_side: int = 1600,
     grid: int = 0,
+    cells: bool = True,
 ):
     """截一张屏，把每个可点的东西都标上编号 —— **直接返回图片**。看图选号，再用
     `ui_locate_act(mark=编号)` 去点。不用自己估坐标。
@@ -427,6 +428,8 @@ def ui_locate_marks(
       text       顺带 OCR 认字，默认 True；只关心图标时关掉能快 0.5 秒左右
       max_marks  最多标多少个，默认 200
       max_side   标注图长边像素，默认 1600
+      cells      补「成排成列的同尺寸格子」（物品栏、标签页、技能栏、棋盘、表格），
+                 不靠模型，跨游戏通用；默认 True。返回里这类编号 kind="cell"
       grid       叠加网格，长边切几格（短边按比例），0 = 不画（默认）。8 左右合适
 
     返回：一段 JSON + 一张标注图。
@@ -451,6 +454,8 @@ def ui_locate_marks(
         payload["box"] = box
     if grid:
         payload["grid"] = int(grid)
+    if not cells:
+        payload["cells"] = False
     res = _post_any("/marks", payload)
     if not res.get("ok"):
         return json.dumps(res, ensure_ascii=False)

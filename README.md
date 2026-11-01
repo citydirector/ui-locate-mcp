@@ -65,7 +65,7 @@ ui_locate_marks(box="D3", grid=4)            # zoom that cell, then pick a mark 
 ui_locate_act(cell="B2")                     # click a cell's center
 ~~~
 
-Numbers belong to one marked image; pass `mark_set` to refuse a stale one.
+Besides detector boxes, marks include repeated same-size cells found by geometry alone (inventory slots, tabs, skill bars, tables; `kind: "cell"`), which UI detectors usually miss in games. Numbers belong to one marked image; pass `mark_set` to refuse a stale one.
 
 Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string or `all`. Locate again after the UI moves.
 
