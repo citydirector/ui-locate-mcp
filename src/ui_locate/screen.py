@@ -252,10 +252,30 @@ def grab(monitor: object = None) -> tuple[np.ndarray, tuple[int, int]]:
     for mon in mons:
         img = _grab_monitor(mon)
         x0, y0 = mon.x - vx, mon.y - vy
-        h = min(img.shape[0], vh - y0)
-        w = min(img.shape[1], vw - x0)
-        canvas[y0:y0 + h, x0:x0 + w] = img[:h, :w]
+        check_tile(img.shape, mon, (vx, vy, vw, vh))
+        canvas[y0:y0 + mon.h, x0:x0 + mon.w] = img
     return canvas, (vx, vy)
+
+
+def check_tile(shape: tuple, mon: "Monitor", virtual: tuple[int, int, int, int]) -> None:
+    """拼整个虚拟桌面前核对尺寸：对不上就抛，不静默裁剪。
+
+    对不上几乎总是 DPI 感知没生效（逻辑像素 vs 物理像素）或显示器刚热插拔。
+    以前这里按较小的一边裁了贴上去，返回的图被截断而 origin 不变 —— 之后
+    每个坐标都错位，没有任何提示。
+    """
+    from ui_locate.capture import CaptureError
+
+    vx, vy, vw, vh = virtual
+    h, w = int(shape[0]), int(shape[1])
+    if (w, h) != (mon.w, mon.h):
+        raise CaptureError(
+            f"{mon.device} 抓到 {w}x{h}，显示器报 {mon.w}x{mon.h}：DPI 感知未生效或显示器刚变化")
+    x0, y0 = mon.x - vx, mon.y - vy
+    if x0 < 0 or y0 < 0 or x0 + w > vw or y0 + h > vh:
+        raise CaptureError(
+            f"{mon.device} ({mon.x},{mon.y},{mon.w}x{mon.h}) 超出虚拟桌面 "
+            f"({vx},{vy},{vw}x{vh})：DPI 感知未生效或显示器刚变化")
 
 
 def iter_monitors() -> Iterable[Monitor]:

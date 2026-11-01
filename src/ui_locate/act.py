@@ -34,6 +34,7 @@ cua_driver 点击 → 模型再截图确认。每一步都是一次完整的模�
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Callable
 
@@ -63,6 +64,13 @@ _STABLE_POLL_MS = 50
 _REGION_STRENGTH = 16.0
 # 整屏比对（纯键盘动作）时，变化格占比超过它也算生效：开关菜单、切换页签。
 _SCREEN_FRAC = 0.05
+
+# 动作前先量一下「什么都不做时画面自己变多少」：连抓三帧、间隔 40ms。
+# 水面、粒子、视频背景下，静止画面相邻帧就有一半格子在变、平均差 8 以上，
+# 绝对阈值 3.5 在这种画面上等于永远判「生效」（实测点空白水面 verified:true）。
+_NOISE_GAP_MS = 40
+# 噪声帧里变化格占比超过它就当「动态画面」：此后判据全部相对噪声来定。
+_ANIMATED_FRAC = 0.01
 
 
 class ActError(RuntimeError):
@@ -158,6 +166,10 @@ def _point_from(value: Any, *, probe: Callable[..., dict | None], spec: dict,
         raise ActError(f"{what} 只给了半个坐标：{value!r}")
     if isinstance(value, list) and len(value) == 2:
         return int(round(float(value[0]))), int(round(float(value[1])))
+    if isinstance(value, str) and _XY.match(value):
+        # "40,-540" 是坐标，不是要在屏幕上找的文字（MCP 文档里就这么写的）
+        a, b = value.split(",")
+        return int(round(float(a))), int(round(float(b)))
     if isinstance(value, str) and value.strip():
         t0 = _now(clock)
         hit = probe(value.strip(), spec)
@@ -171,6 +183,16 @@ def _point_from(value: Any, *, probe: Callable[..., dict | None], spec: dict,
 # ---------------------------------------------------------------------------
 # 单步：动作
 # ---------------------------------------------------------------------------
+
+_XY = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$")
+
+
+def _keys(value: Any) -> str:
+    """键名可以是 "ctrl+a"，也可以是 ["ctrl", "a"]。以前列表被 str() 成 "['ctrl', 'a']"。"""
+    if isinstance(value, (list, tuple)):
+        return "+".join(str(v).strip() for v in value if str(v).strip())
+    return str(value or "")
+
 
 _MOUSE_ACTIONS = {"click", "double_click", "right_click", "middle_click", "hover", "move"}
 _KEYBOARD_ACTIONS = {"type", "write", "press", "key", "hold", "hold_key", "hotkey", "shortcut"}
@@ -264,18 +286,18 @@ def _build(action: str, spec: dict, target: dict) -> tuple[str, dict]:
         return "type", params
 
     if action in ("press", "key"):
-        params = {"key": str(spec.get("key") or spec.get("value") or "")}
+        params = {"key": _keys(spec.get("key") or spec.get("value") or "")}
         if spec.get("hold_ms"):
             params["hold_ms"] = int(spec["hold_ms"])
         return "press", params
 
     if action in ("hold", "hold_key"):
-        params = {"keys": str(spec.get("keys") or spec.get("key") or spec.get("value") or ""),
+        params = {"keys": _keys(spec.get("keys") or spec.get("key") or spec.get("value") or ""),
                   "duration_ms": int(spec.get("duration_ms") or 500)}
         return "hold", params
 
     if action in ("hotkey", "shortcut"):
-        params = {"keys": str(spec.get("keys") or spec.get("value") or "")}
+        params = {"keys": _keys(spec.get("keys") or spec.get("value") or "")}
         return "hotkey", params
 
     if action in ("wait", "none", "noop"):
@@ -474,6 +496,17 @@ def act(
 
     act_name = str(spec.get("action") or "click").strip().lower()
     has_target = bool(spec.get("text")) or spec.get("x") is not None or isinstance(spec.get("at"), dict)
+    if act_name == "drag" and not has_target:
+        # drag 只给了起点（from / from_x+from_y）：起点就是目标
+        start = None
+        if spec.get("from_x") is not None and spec.get("from_y") is not None:
+            start = (int(round(float(spec["from_x"]))), int(round(float(spec["from_y"]))))
+        elif spec.get("from") not in (None, ""):
+            start = _point_from(spec["from"], probe=probe, spec=spec, timings=timings,
+                                clock=clock, what="拖动起点 from")
+        if start is not None:
+            spec = {**spec, "at": {"text": None, "cx": start[0], "cy": start[1]}}
+            has_target = True
     if act_name in _KEYBOARD_ACTIONS and not has_target:
         # 纯键盘动作不需要目标：游戏里「按 ESC」「按住 W」「Ctrl+S」本来就没有
         # 可点的东西。以前这里要求 text 或 x/y，调用方只好随便编一个坐标。
@@ -518,6 +551,7 @@ def act(
 
     verify = spec.get("verify")
     before = None
+    noise: dict | None = None
     capture_error = None
     if verify == "screen":
         # 抓 before 图失败**不能**中断整次调用。抓屏和输入是两条独立的能力：
@@ -526,6 +560,12 @@ def act(
         # 调用方只看到 500，完全不知道该重试还是该换通道。
         try:
             before = capture(monitor)
+            if differ is not None and spec.get("noise_ms", _NOISE_GAP_MS):
+                before, noise = sample_noise(
+                    before, lambda: capture(monitor), differ, compare,
+                    x=target["cx"], y=target["cy"],
+                    radius=int(spec.get("verify_radius") or 90),
+                    gap_ms=int(spec.get("noise_ms") or _NOISE_GAP_MS), sleep=sleep)
         except Exception as exc:  # noqa: BLE001
             capture_error = f"{type(exc).__name__}: {exc}"
 
@@ -560,7 +600,8 @@ def act(
         try:
             report, after = wait_stable(
                 lambda: capture(monitor), differ, sleep=sleep, clock=clock,
-                timeout_ms=int(spec.get("settle_timeout_ms") or _DEFAULT_STABLE_TIMEOUT_MS))
+                timeout_ms=int(spec.get("settle_timeout_ms") or _DEFAULT_STABLE_TIMEOUT_MS),
+                ignore=noise.get("_mask") if noise else None)
             result["settle"] = {"mode": "stable", **report}
         except Exception as exc:  # noqa: BLE001
             capture_error = capture_error or f"{type(exc).__name__}: {exc}"
@@ -585,9 +626,13 @@ def act(
                 before, after, x=target["cx"], y=target["cy"], compare=compare,
                 radius=int(spec.get("verify_radius") or 90),
             )
+            if noise is not None:
+                _relative_to_noise(check, noise)
             if differ is not None:
                 _add_regions(check, before, after, differ, target,
-                             radius=int(spec.get("verify_radius") or 90))
+                             radius=int(spec.get("verify_radius") or 90), noise=noise)
+            if noise is not None:
+                check["noise"] = {k: v for k, v in noise.items() if not k.startswith("_")}
             checks.append(check)
         timings["verify_ms"] = _ms(t1, clock)
 
@@ -644,6 +689,7 @@ def wait_stable(
     min_ms: int = _STABLE_MIN_MS,
     poll_ms: int = _STABLE_POLL_MS,
     quiet_frames: int = 2,
+    ignore: Any = None,
 ) -> tuple[dict, Any]:
     """反复抓帧直到连续 ``quiet_frames`` 次相邻两帧几乎不变。返回 (报告, 最后一帧)。
 
@@ -660,7 +706,7 @@ def wait_stable(
         sleep(max(poll_ms, 5) / 1000.0)
         cur = grab()
         frames += 1
-        d = differ(prev, cur)
+        d = differ(prev, cur, ignore=ignore) if ignore is not None else differ(prev, cur)
         if d is None:                 # 尺寸变了（切全屏 / 改分辨率）：重新数
             quiet = 0
         else:
@@ -676,14 +722,17 @@ def wait_stable(
 
 
 def _add_regions(check: dict, before: Any, after: Any,
-                 differ: Callable[[Any, Any], dict | None], target: dict, *, radius: int) -> None:
+                 differ: Callable[..., dict | None], target: dict, *, radius: int,
+                 noise: dict | None = None) -> None:
     """给 screen 验证补上网格差分：哪些区域变了，以及据此能不能判定生效。
 
     平均差只看点击点周围 180px 的方块：小按钮变色被方块里不变的部分稀释，
     常常过不了阈值。网格差分按 32px 格子算，按钮那一格的变化不会被摊薄。
     """
+    mask = noise.get("_mask") if noise else None
+    animated = bool(noise and noise.get("animated"))
     try:
-        d = differ(before, after)
+        d = differ(before, after, ignore=mask) if mask is not None else differ(before, after)
     except Exception:  # noqa: BLE001 - 差分只是补充信息，失败不影响原判定
         return
     if not d:
@@ -697,13 +746,60 @@ def _add_regions(check: dict, before: Any, after: Any,
     cx, cy = target.get("cx"), target.get("cy")
     if cx is not None and cy is not None:
         hit = griddiff.near(d, cx, cy, radius)
-        if hit is not None and hit["strength"] >= _REGION_STRENGTH:
+        # 动态画面里一格大小的变化多半是飘过的粒子，至少要两格
+        if hit is not None and hit["strength"] >= _REGION_STRENGTH \
+                and (not animated or hit["cells"] >= 2):
             check["changed_enough"] = True
             check["by"] = "region"
             check["region"] = hit
     elif (d.get("changed_frac") or 0) >= _SCREEN_FRAC:
         check["changed_enough"] = True
         check["by"] = "region"
+
+
+def sample_noise(first: Any, grab: Callable[[], Any], differ: Callable[..., dict | None],
+                 compare: Callable[..., float | None], *, x: Any, y: Any, radius: int,
+                 gap_ms: int, sleep: Callable[[float], None]) -> tuple[Any, dict]:
+    """动作前再抓两帧，量出画面自己在变的程度。返回 (最新一帧, 噪声)。
+
+    最新一帧当「动作之前」用（离动作最近）。噪声里：
+      changed_frac  静止时变化格占比（两次里取大）
+      mean          静止时点击点附近（或整屏）的平均差（两次里取大）
+      animated      是不是动态画面
+      _mask         静止时就在变的格子，外扩一格（粒子会漂）—— 之后的比对忽略它们
+    """
+    frames = [first]
+    for _ in range(2):
+        sleep(max(gap_ms, 1) / 1000.0)
+        frames.append(grab())
+    mask = None
+    frac = 0.0
+    mean = 0.0
+    for a, b in zip(frames, frames[1:]):
+        d = differ(a, b)
+        if d is None:
+            continue
+        frac = max(frac, float(d.get("changed_frac") or 0.0))
+        m = d.get("_mask")
+        if m is not None:
+            mask = m.copy() if mask is None else (mask | m)
+        v = compare(a, b, x, y, radius)
+        if v is not None:
+            mean = max(mean, float(v))
+    noise = {"changed_frac": round(frac, 4), "mean": round(mean, 2),
+             "animated": frac > _ANIMATED_FRAC}
+    if mask is not None:
+        noise["_mask"] = griddiff.dilate(mask)
+    return frames[-1], noise
+
+
+def _relative_to_noise(check: dict, noise: dict) -> None:
+    """平均差的阈值随噪声抬高：变化必须明显超过「什么都不做时」的水平。"""
+    if check.get("changed") is None:
+        return
+    threshold = max(_DEFAULT_CHANGE_THRESHOLD, noise["mean"] * 2 + 1.5)
+    check["threshold"] = round(threshold, 2)
+    check["changed_enough"] = float(check["changed"]) > threshold
 
 
 def _checks_pass(checks: list[dict]) -> bool:

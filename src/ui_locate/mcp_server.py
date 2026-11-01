@@ -558,7 +558,9 @@ def ui_locate_act(
       target    实际点的位置 {text, cx, cy, w, h, conf}
       verify    验证细节 {kind, changed, changed_enough, by, regions} 或 {kind, found, ...}
                 regions = 动作前后变了的区域（屏幕坐标，按大小排序）；by="region" 表示
-                平均差不够但点击点旁边有一块明显变化（小按钮变色常见）
+                平均差不够但点击点旁边有一块明显变化（小按钮变色常见）。
+                动作前会先静置量一下噪声（约 80ms）：noise.animated=true 表示画面自己
+                就在动（水面、粒子、视频），此时阈值按噪声抬高、一直在动的格子不计
       timings   find_ms / act_ms / verify_ms / total_ms
       stage     失败时在哪一步：find / act / verify
 

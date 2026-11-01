@@ -99,16 +99,17 @@ class GridDiffTests(unittest.TestCase):
         self.assertFalse(report["stable"])
 
 
-def differ(a, b):
+def differ(a, b, ignore=None):
     (ia, oa), (ib, ob) = a, b
     if ia.shape != ib.shape:
         return None
-    return G.public(G.diff(ia, ib, origin=oa))
+    return G.diff(ia, ib, origin=oa, ignore=ignore)
 
 
 class ActWithDifferTests(unittest.TestCase):
     def run_act(self, spec, frames, *, compare=lambda *a: 0.5):
         clock = FakeClock()
+        frames = [frames[0], frames[0]] + list(frames)   # 动作前量噪声多抓的两帧
         it = iter(frames)
         last = {"f": frames[-1]}
 
@@ -167,7 +168,7 @@ class ActWithDifferTests(unittest.TestCase):
         menu = blank()
         menu[0:128, 0:160] = 200           # 菜单弹出：大面积变化
         clock = FakeClock()
-        frames = iter([before, (menu, (0, 0)), (menu, (0, 0)), (menu, (0, 0))])
+        frames = iter([before, before, before, (menu, (0, 0)), (menu, (0, 0)), (menu, (0, 0))])
         state = {"f": before}
 
         def cap(_m):
@@ -179,6 +180,49 @@ class ActWithDifferTests(unittest.TestCase):
                     compare=lambda *a: 1.0, sleep=clock.advance, clock=clock, differ=differ)
         self.assertTrue(out["verified"])
         self.assertEqual(out["verify"]["by"], "region")
+
+    def test_animated_scene_click_on_nothing_is_not_verified(self):
+        # 水面 / 粒子：静止时右半边一直在变，点左边空白处之后也只有右半边在变
+        rng = np.random.default_rng(1)
+
+        def frame():
+            f = blank()
+            f[:, 160:] = rng.integers(0, 255, (256, 160, 3), dtype=np.uint8)
+            return f, (0, 0)
+
+        clock = FakeClock()
+        out = A.act({"x": 170, "y": 100, "verify": "screen"}, probe=lambda *a: None,
+                    capture=lambda _m: frame(), perform=lambda a, p: {"sent": 1},
+                    compare=lambda a, b, x, y, r: float(np.abs(a[0].astype(int) - b[0].astype(int)).mean()),
+                    sleep=clock.advance, clock=clock, differ=differ)
+        self.assertTrue(out["verify"]["noise"]["animated"])
+        self.assertFalse(out["verified"])
+        self.assertGreater(out["verify"]["threshold"], 3.5)
+
+    def test_animated_scene_real_change_still_verifies(self):
+        rng = np.random.default_rng(2)
+        state = {"n": 0}
+
+        def frame():
+            state["n"] += 1
+            f = blank()
+            f[:, 192:] = rng.integers(0, 255, (256, 128, 3), dtype=np.uint8)
+            if state["n"] > 3:                 # 动作之后左上弹出面板
+                f[32:128, 32:160] = 230
+            return f, (0, 0)
+
+        clock = FakeClock()
+        out = A.act({"x": 80, "y": 80, "verify": "screen"}, probe=lambda *a: None,
+                    capture=lambda _m: frame(), perform=lambda a, p: {"sent": 1},
+                    compare=lambda a, b, x, y, r: 0.0, sleep=clock.advance, clock=clock,
+                    differ=differ)
+        self.assertTrue(out["verified"])
+        self.assertEqual(out["verify"]["by"], "region")
+
+    def test_dilate(self):
+        m = np.zeros((5, 5), bool)
+        m[2, 2] = True
+        self.assertEqual(int(G.dilate(m).sum()), 9)
 
     def test_window_spec_passes_to_input_layer(self):
         name, params = A.build_action({"action": "press", "key": "esc", "monitor": "window:原神"},

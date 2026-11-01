@@ -137,7 +137,9 @@ class Engine:
                 t1 = time.perf_counter()
                 if text_mode == "mosaic":
                     sheet, slots, scale = build_mosaic(bgr, items, 1.2)
-                    lines = map_back(self.ocr.lines(sheet), slots, scale)
+                    # 没有裁片就没有字可认。以前照样把 1 像素高的空拼图送进 OCR，
+                    # 1200:1 的长宽比让 OCR 预处理跑了 97~108 秒（实测）
+                    lines = map_back(self.ocr.lines(sheet), slots, scale) if slots else []
                 else:
                     lines = self.ocr.lines(bgr)
                 attach_text(items, lines)
@@ -200,7 +202,7 @@ def make_marks(body: dict) -> dict:
     """
     assert ENGINE is not None
     t0 = time.perf_counter()
-    monitor = body.get("monitor", "primary")
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor", "primary")
     if monitor in (None, ""):
         monitor = "primary"
     box = None if marks_mod.is_cell_ref(body.get("box")) else _parse_box(body.get("box"))
@@ -376,8 +378,12 @@ def _window_monitor(spec: object) -> object:
     return out
 
 
-def _differ(before: object, after: object) -> dict | None:
-    """act 用的网格差分：两帧 (bgr, origin) → 变化区域（屏幕坐标）。尺寸 / 原点不同返回 None。"""
+def _differ(before: object, after: object, ignore: object = None) -> dict | None:
+    """act 用的网格差分：两帧 (bgr, origin) → 变化区域（屏幕坐标）。尺寸 / 原点不同返回 None。
+
+    结果里保留 ``_mask``（变化格的布尔掩码），act 量噪声时要用；对外报告前会剥掉。
+    ignore：忽略这些格子（动作前就在动的地方）。
+    """
     try:
         img_a, org_a = before  # type: ignore[misc]
         img_b, org_b = after   # type: ignore[misc]
@@ -385,7 +391,8 @@ def _differ(before: object, after: object) -> dict | None:
         return None
     if img_a.shape != img_b.shape or tuple(org_a) != tuple(org_b):
         return None
-    return griddiff.public(griddiff.diff(img_a, img_b, origin=tuple(org_a)))
+    mask = ignore if isinstance(ignore, np.ndarray) else None
+    return griddiff.diff(img_a, img_b, origin=tuple(org_a), ignore=mask)
 
 
 # /diff 的基准帧：每个 monitor 写法一张，问一次换一次
@@ -395,7 +402,7 @@ _DIFF_LOCK = threading.Lock()
 
 def diff_since(body: dict) -> dict:
     """「上次问过之后屏幕哪里变了」。第一次问只建基准。"""
-    monitor = body.get("monitor") or "primary"
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor") or "primary"
     cell = max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256))
     threshold = float(body.get("threshold") or griddiff.DEFAULT_THRESHOLD)
     key = str(monitor)
@@ -813,7 +820,7 @@ class Handler(BaseHTTPRequestHandler):
         b = img_b[y0:y1, x0:x1].astype(np.float32)
         return float(np.abs(a - b).mean())
 
-    def _act(self, data: dict) -> dict:
+    def _act(self, data: dict, multi: bool | None = None) -> dict:
         """跑一次 act / steps。两个端点共用，差别只在 spec 的形状。
 
         开一个回合：本次调用里抓到的每一帧都记到同一个 turn 下，结果里带回
@@ -828,16 +835,22 @@ class Handler(BaseHTTPRequestHandler):
             "differ": _differ,
         }
         mark_info = None
+        # /steps 的 steps 是步骤数组；/act 里 drag 的 steps 是插值步数（整数）。
+        # 以前只看「有没有 steps 这个键」，drag 带 steps:12 就被当成多步请求。
+        if multi is None:
+            multi = isinstance(data.get("steps"), list)
+        if multi and not isinstance(data.get("steps"), list):
+            raise act_mod.ActError("steps 需要一个非空数组")
         data = _window_monitor(data)
-        if "steps" in data and isinstance(data["steps"], list):
+        if multi:
             data = {**data, "steps": [_window_monitor(s) for s in data["steps"]]}
-        if "steps" in data:
+        if multi:
             if isinstance(data["steps"], list):
                 data = {**data, "steps": [apply_marks(s) for s in data["steps"]]}
         else:
             data = apply_marks(data)
             mark_info = data.pop("_mark", None)
-        if "steps" in data and isinstance(data["steps"], list):
+        if multi:
             for step in data["steps"]:
                 if isinstance(step, dict):
                     step.pop("_mark", None)
@@ -846,7 +859,7 @@ class Handler(BaseHTTPRequestHandler):
         self._turn = turn
         self._frame_seq = 0
         try:
-            if "steps" in data:
+            if multi:
                 out = act_mod.run_steps(data["steps"], **common)
             else:
                 out = act_mod.act(data, **common)
@@ -1236,7 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": f"{type(e).__name__}: {e}"})
                 return
             try:
-                self._send(200, self._act(data))
+                self._send(200, self._act(data, multi=u.path == "/steps"))
             except act_mod.ActError as e:
                 # 指令本身写错了，重试没有意义 → 400 而不是 500
                 self._send(400, {"ok": False, "error": str(e)})

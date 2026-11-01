@@ -177,8 +177,12 @@ def build_marks(
                 break
         if not dup:
             kept.append(c)
-        if len(kept) >= max_marks:
-            break
+
+    # 密集文字（文件管理器、表格）里检测器常把一个词切成一字一框：先把同一行里
+    # 挨着的文字碎片并回去，再截断 —— 否则 200 个名额被单字吃光。
+    kept = merge_text_fragments(kept)
+    kept.sort(key=lambda c: (bool(c["text"]), c["conf"]), reverse=True)
+    kept = kept[:max_marks]
 
     if not kept:
         return []
@@ -202,6 +206,77 @@ def build_marks(
         Mark(i, *c["box"], text=c["text"], conf=c["conf"], kind=c["kind"])
         for i, c in enumerate(ordered, start=1)
     ]
+
+
+_TEXT_KINDS = ("text", "ocr")
+
+
+def _joiner(a: str, b: str) -> str:
+    """两段英文 / 数字之间补一个空格，中文之间不补。"""
+    if a and b and a[-1].isascii() and a[-1].isalnum() and b[0].isascii() and b[0].isalnum():
+        return " "
+    return ""
+
+
+def merge_text_fragments(cands: list[dict], *, gap_ratio: float = 0.45,
+                         height_ratio: float = 1.6) -> list[dict]:
+    """把同一行、高度相近、横向间距小于约半个字高的文字框并成一个。
+
+    只并 kind 为 text / ocr 的框（图标、格子不动）。阈值取「半个字高」：
+    同一个词里字与字的间距通常不到 0.2 个字高，而相邻的两个按钮 / 菜单项
+    之间至少隔一个字宽，所以不会把「文件 编辑」并成一个。
+    """
+    def mergeable(c: dict) -> bool:
+        # 单个英文字母 / 符号多半是工具栏按钮上的字形（粗体 B、斜体 I、对齐图标），
+        # 按钮之间也挨得很近，并起来就点不到单个按钮了 —— 不并。
+        t = c["text"]
+        return c["kind"] in _TEXT_KINDS and bool(t) and not (len(t) == 1 and t.isascii())
+
+    texts = [c for c in cands if mergeable(c)]
+    others = [c for c in cands if not mergeable(c)]
+    if len(texts) < 2:
+        return cands
+    texts = sorted(texts, key=lambda c: ((c["box"][1] + c["box"][3]) / 2, c["box"][0]))
+    merged: list[dict] = []
+    used = [False] * len(texts)
+    # 按 x 排好的同行链：逐个往右找能接上的
+    order = sorted(range(len(texts)), key=lambda i: texts[i]["box"][0])
+    for i in order:
+        if used[i]:
+            continue
+        cur = dict(texts[i])
+        used[i] = True
+        while True:
+            x1, y1, x2, y2 = cur["box"]
+            h = y2 - y1
+            cy = (y1 + y2) / 2
+            nxt = None
+            for j in order:
+                if used[j]:
+                    continue
+                bx1, by1, bx2, by2 = texts[j]["box"]
+                bh = by2 - by1
+                if max(h, bh) / max(1.0, min(h, bh)) > height_ratio:
+                    continue
+                if abs((by1 + by2) / 2 - cy) > 0.35 * min(h, bh):
+                    continue
+                gap = bx1 - x2
+                if -0.3 * min(h, bh) <= gap <= gap_ratio * min(h, bh):
+                    if nxt is None or bx1 < texts[nxt]["box"][0]:
+                        nxt = j
+            if nxt is None:
+                break
+            other = texts[nxt]
+            used[nxt] = True
+            bx1, by1, bx2, by2 = other["box"]
+            cur = {
+                **cur,
+                "box": (min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2)),
+                "text": cur["text"] + _joiner(cur["text"], other["text"]) + other["text"],
+                "conf": max(cur["conf"], other["conf"]),
+            }
+        merged.append(cur)
+    return others + merged
 
 
 def grid_cells(origin: tuple[int, int], size: tuple[int, int], n: int) -> dict[str, tuple[float, float, float, float]]:

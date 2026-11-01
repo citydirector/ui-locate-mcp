@@ -124,6 +124,23 @@ def diff(
     }
 
 
+def dilate(mask: np.ndarray, n: int = 1) -> np.ndarray:
+    """布尔格子掩码向八邻域外扩 n 格。"""
+    out = mask.copy()
+    for _ in range(max(n, 0)):
+        grown = out.copy()
+        grown[1:, :] |= out[:-1, :]
+        grown[:-1, :] |= out[1:, :]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        grown[1:, 1:] |= out[:-1, :-1]
+        grown[1:, :-1] |= out[:-1, 1:]
+        grown[:-1, 1:] |= out[1:, :-1]
+        grown[:-1, :-1] |= out[1:, 1:]
+        out = grown
+    return out
+
+
 def public(result: dict) -> dict:
     """去掉内部字段（掩码）再给调用方。"""
     return {k: v for k, v in result.items() if not k.startswith("_")}

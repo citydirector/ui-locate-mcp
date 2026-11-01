@@ -81,7 +81,7 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 ### 等待与验证
 
-`verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 不给文字 = 等画面静止。
+`verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 不给文字 = 等画面静止。动作前会先静置约 80ms 量一下画面自己在动多少（水面、粒子、视频）；这类画面（`verify.noise.animated`）上阈值随噪声抬高，本来就在动的格子不计，点空白动态背景不会再报 `verified: true`。
 
 ## 配置与数据目录
 

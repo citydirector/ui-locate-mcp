@@ -81,7 +81,7 @@ Pass `window=` (title or part of it, or a handle) to `ui_locate_marks`, `ui_loca
 
 ### Waiting and verifying
 
-With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` without text waits for a still screen.
+With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` without text waits for a still screen. Before acting, about 80 ms of idle frames measure how much the scene moves by itself (water, particles, video); on such scenes (`verify.noise.animated`) the threshold rises with the noise and cells that were already moving are ignored, so clicking empty animated background no longer reports `verified: true`.
 
 ## Configuration and data
 
