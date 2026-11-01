@@ -395,6 +395,7 @@ def find_all(
 @mcp.tool()
 def ui_locate_marks(
     monitor: str = "primary",
+    window: str = "",
     box: str = "",
     conf: float = 0.2,
     text: bool = True,
@@ -422,6 +423,9 @@ def ui_locate_marks(
 
     参数：
       monitor    哪块屏："primary"（默认）/ "0" / "1" / 设备名 / "all"
+      window     只看一个窗口：标题（或其中一段）/ 句柄。**游戏被别的窗口挡住也能抓**
+                 （PrintWindow；抓黑了自动改按屏裁）。给了就忽略 monitor；之后用这张图
+                 的编号去点时，会自动先把这个窗口切到前台。窗口列表见 `ui_locate_windows`
       box        只看这块："x1,y1,x2,y2"（**屏幕绝对坐标**），或上一张图的网格
                  名如 "D3"。留空 = 整块屏。
       conf       检测置信度下限，默认 0.2（偏低，宁可多标几个）
@@ -444,7 +448,7 @@ def ui_locate_marks(
     认不出它，改用坐标。
     """
     payload: dict[str, Any] = {
-        "monitor": monitor or "primary",
+        "monitor": _window_spec(window) or monitor or "primary",
         "conf": conf,
         "text": bool(text),
         "max_marks": int(max_marks),
@@ -481,7 +485,9 @@ def ui_locate_act(
     y: int | None = None,
     verify: str = "screen",
     monitor: str = "",
-    settle_ms: int = 220,
+    window: str = "",
+    focus: str = "auto",
+    settle_ms: int = 0,
     count: int = 1,
     button: str = "left",
     delivery: str = "auto",
@@ -514,13 +520,21 @@ def ui_locate_act(
       mark_set    可选，标注时返回的集合号；画面已被重新标注过就拒绝执行
       action      click（默认）/ double_click / right_click / middle_click /
                   hover / drag / scroll / type / press / hold / hotkey / wait
+                  wait 不给 text = 等画面静止（加载完、动画放完），时限 verify_timeout_ms
                   hold = 按住 key/keys 一段时间（游戏里走路、蓄力），时长见 duration_ms
       verify      动作后怎么确认生效：
                     "screen"（默认）—— 点击点周围像素变了没有
                     "text"          —— 指定时间内有没有出现 verify_text
                     "none"          —— 不验证，快，但也就不知道成没成
       monitor     ""（整个虚拟桌面）/ "primary" / "0" / "1" / 设备名
-      settle_ms   动作后等多久再验证，默认 220 毫秒（等界面切换动画）
+      window      目标窗口：标题（或其中一段）/ 句柄。动手前先把它**切到前台**
+                  （SendInput 只送给前台窗口；模型所在的聊天窗口在前台时，按键会打进
+                  聊天框），验证时也只抓这个窗口（被挡住也能抓）。纯键盘动作强烈建议给
+      focus       "auto"（默认：有 window 用它，否则切到点击点下面的那个窗口）/
+                  "off"（不碰前台）。结果里 performed.focus 报告切没切成功
+      settle_ms   0（默认）= 自动：verify="screen" 时**等画面停下来**再比对（最多 1.5 秒，
+                  结果里 settle.stable / elapsed_ms），其它情况固定等 220ms。
+                  给正数 = 固定等这么多毫秒
       count       连点次数（action=click 时）
       button      鼠标键 left / right / middle
       delivery    输入通道 send_input（系统队列，要求前台）/ message（投窗口
@@ -542,7 +556,9 @@ def ui_locate_act(
       ok        流程是否走完（**不代表动作生效了**）
       verified  动作是否被确认生效（true / false / null=没验证）
       target    实际点的位置 {text, cx, cy, w, h, conf}
-      verify    验证细节 {kind, changed, changed_enough} 或 {kind, found, ...}
+      verify    验证细节 {kind, changed, changed_enough, by, regions} 或 {kind, found, ...}
+                regions = 动作前后变了的区域（屏幕坐标，按大小排序）；by="region" 表示
+                平均差不够但点击点旁边有一块明显变化（小按钮变色常见）
       timings   find_ms / act_ms / verify_ms / total_ms
       stage     失败时在哪一步：find / act / verify
 
@@ -550,8 +566,15 @@ def ui_locate_act(
     目标可能没吃到这次点击，也可能界面本来就不会变（比如点空白处）。
     这种情况换 delivery="message" 或改用 hotkey 更可靠。
     """
-    payload: dict[str, Any] = {"action": action, "verify": verify,
-                               "settle_ms": settle_ms}
+    payload: dict[str, Any] = {"action": action, "verify": verify}
+    if settle_ms and int(settle_ms) > 0:
+        payload["settle_ms"] = int(settle_ms)
+    if window:
+        payload["window"] = window
+    if focus and focus != "auto":
+        payload["focus"] = False if focus in ("off", "false", "no", "none") else focus
+    if action == "wait" and not text:
+        payload["timeout_ms"] = int(verify_timeout_ms)
     if text:
         payload["text"] = text
     if mark:
@@ -596,6 +619,59 @@ def ui_locate_act(
     return json.dumps(_post_any("/act", payload), ensure_ascii=False)
 
 
+def _window_spec(window: str) -> str:
+    if not window:
+        return ""
+    w = str(window).strip()
+    low = w.lower()
+    if low.startswith(("window:", "hwnd:")):
+        return w
+    if w.isdecimal() or low.startswith("0x"):
+        return f"hwnd:{w}"
+    return f"window:{w}"
+
+
+@mcp.tool()
+def ui_locate_windows(title: str = "") -> str:
+    """列出可见的顶层窗口（标题、句柄、客户区位置、是否在前台）。
+
+    拿到的标题或句柄可以给 `ui_locate_marks(window=…)` / `ui_locate_act(window=…)` /
+    `ui_locate_diff(window=…)`；其它工具的 monitor 参数也接受 "window:标题" / "hwnd:句柄"。
+
+    参数：title  只列标题里含这段文字的窗口（不分大小写），留空 = 全部
+    返回 JSON：{count, windows:[{hwnd, title, class, pid, x, y, w, h, foreground, minimized}]}
+    """
+    ensure_ready()
+    params = {"title": title} if title else {}
+    r = _http().get("/windows", params=params)
+    return json.dumps(r.json(), ensure_ascii=False)
+
+
+@mcp.tool()
+def ui_locate_diff(monitor: str = "primary", window: str = "", cell: int = 32,
+                   reset: bool = False) -> str:
+    """上次调用之后，屏幕**哪里变了** —— 回几个矩形，不回图，不花视觉 token（几十毫秒）。
+
+    用法：做完一件事（或等了一会儿）后调一次，看变化落在哪：弹窗出现在哪、哪个格子
+    亮了、角色走到哪。只在有变化、而且需要看清是什么时，再用 `ui_locate_marks(box=…)`
+    放大那一块。第一次调用（或 reset=true）只建立基准帧。
+
+    参数：
+      monitor  哪块屏，默认 "primary"；也可 "window:标题"
+      window   只看一个窗口（标题或句柄），给了就忽略 monitor
+      cell     网格边长（像素），默认 32；越小越细，噪声也越多
+      reset    true = 丢掉旧基准，从现在重新开始
+    返回 JSON：{first, since_ms, changed_cells, total_cells, changed_frac,
+               regions:[{x, y, w, h, cx, cy, cells, strength}], grab_ms, diff_ms}
+      regions 是屏幕绝对坐标，按大小排序；strength 是格内平均像素差（0~255，>15 是明显变化）
+    """
+    payload: dict[str, Any] = {"monitor": _window_spec(window) or monitor or "primary",
+                               "cell": int(cell)}
+    if reset:
+        payload["reset"] = True
+    return json.dumps(_post_any("/diff", payload), ensure_ascii=False)
+
+
 @mcp.tool()
 def ui_locate_steps(steps: str) -> str:
     """顺序执行一串动作，任一步失败即停。
@@ -609,7 +685,7 @@ def ui_locate_steps(steps: str) -> str:
       wait_before  动作前先等某段文字出现（比固定 sleep 靠谱）
                    写成 "确认购买" 或 {"text": "...", "timeout_ms": 8000}
       on_fail      "abort"（默认，失败即停）| "continue"（失败继续下一步）
-      action:"wait" 时是纯等待步骤：不动手，只等 text 出现
+      action:"wait" 时是纯等待步骤：不动手，只等 text 出现；不给 text 就等画面静止
       mark         标注图上的编号（同 ui_locate_act 的 mark）。整串步骤里的编号都
                    指**调用时**最新那张标注图；中途画面变了，后面的编号可能已不准，
                    这种流程请拆开调用、每次重新标注。

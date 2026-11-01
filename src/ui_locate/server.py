@@ -54,9 +54,11 @@ cuda_dlls.register()
 from ui_locate import act as act_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
+from ui_locate import griddiff  # noqa: E402
 from ui_locate import marks as marks_mod  # noqa: E402
 from ui_locate import proposals  # noqa: E402
 from ui_locate import screen  # noqa: E402
+from ui_locate import window as window_mod  # noqa: E402
 from ui_locate.detect import Detector, default_model  # noqa: E402
 from ui_locate.locate import grab_screen  # noqa: E402
 from ui_locate.mosaic import build_mosaic, map_back  # noqa: E402
@@ -219,8 +221,9 @@ def make_marks(body: dict) -> dict:
         box = tuple(int(round(v)) for v in cell)
 
     if box is not None:
-        # box 是屏幕绝对坐标，可能跨屏，所以从整个虚拟桌面裁
-        full, (vx, vy) = screen.grab("all")
+        # box 是屏幕绝对坐标，可能跨屏，所以从整个虚拟桌面裁；
+        # 按窗口工作时从窗口图里裁（窗口被挡住时屏幕上那块是别的东西）
+        full, (vx, vy) = screen.grab(monitor if window_mod.is_window_spec(monitor) else "all")
         x1, y1 = max(box[0], vx), max(box[1], vy)
         x2 = min(box[2], vx + full.shape[1])
         y2 = min(box[3], vy + full.shape[0])
@@ -288,7 +291,7 @@ def make_marks(body: dict) -> dict:
                   "cell_w": round(bgr.shape[1] / len({k[0] for k in cells}), 1),
                   "cell_h": round(bgr.shape[0] / len({k[1:] for k in cells}), 1)}
                  if cells else None),
-        "capture": _capture_last(),
+        "capture": _capture_last(monitor),
         "timings": {
             "grab_ms": round(grab_ms, 1),
             "detect_ms": res["detect_ms"],
@@ -302,9 +305,14 @@ def make_marks(body: dict) -> dict:
     }
 
 
-def _capture_last() -> dict:
+def _capture_last(monitor: object = None) -> dict:
     from ui_locate.capture import CAPTURER
 
+    if monitor is not None and window_mod.is_window_spec(monitor):
+        last = window_mod.LAST
+        return {"backend": last.get("backend"), "ms": last.get("ms"),
+                "hwnd": last.get("hwnd"), "title": last.get("title"),
+                **({"notes": last["notes"]} if last.get("notes") else {})} if last else {}
     last = CAPTURER.last
     return {"backend": last.get("backend"), "ms": last.get("ms")} if last else {}
 
@@ -327,6 +335,7 @@ def apply_marks(spec: dict) -> dict:
             if not out.get("text"):
                 out["at"] = m.as_target()
             out["_mark"] = {"id": m.id, "set": mset.id, "age_s": MARKS.age_s()}
+            _inherit_monitor(out, mset)
         elif marks_mod.is_cell_ref(out.get("cell")):
             cell_name = str(out.pop("cell")).strip().upper()
             (gx1, gy1, gx2, gy2), mset = MARKS.resolve_cell(cell_name, set_id)
@@ -336,6 +345,7 @@ def apply_marks(spec: dict) -> dict:
                 out["at"] = {"text": None, "cx": (gx1 + gx2) / 2, "cy": (gy1 + gy2) / 2,
                              "w": gx2 - gx1, "h": gy2 - gy1, "conf": 1.0}
             out["_mark"] = {"cell": cell_name, "set": mset.id, "age_s": MARKS.age_s()}
+            _inherit_monitor(out, mset)
         else:
             out.pop("mark", None)
         out.pop("cell", None)
@@ -345,6 +355,68 @@ def apply_marks(spec: dict) -> dict:
                 out[key] = {"cx": m.cx, "cy": m.cy, "text": m.text}
     except KeyError as error:
         raise act_mod.ActError(str(error.args[0] if error.args else error)) from None
+    return out
+
+
+def _inherit_monitor(spec: dict, mset: object) -> None:
+    """标注时是按窗口抓的，点的时候也按那个窗口验证、切前台 —— 除非调用方另给了。"""
+    mon = getattr(mset, "monitor", None)
+    if not spec.get("monitor") and window_mod.is_window_spec(mon):
+        spec["monitor"] = mon
+
+
+def _window_monitor(spec: object) -> object:
+    """``window: "原神"`` → 同时把 monitor 设成 ``window:原神``：抓图、验证都只看这个窗口。"""
+    if not isinstance(spec, dict) or not spec.get("window"):
+        return spec
+    out = dict(spec)
+    out["window"] = window_mod.as_spec(out["window"])
+    if not out.get("monitor"):
+        out["monitor"] = out["window"]
+    return out
+
+
+def _differ(before: object, after: object) -> dict | None:
+    """act 用的网格差分：两帧 (bgr, origin) → 变化区域（屏幕坐标）。尺寸 / 原点不同返回 None。"""
+    try:
+        img_a, org_a = before  # type: ignore[misc]
+        img_b, org_b = after   # type: ignore[misc]
+    except (TypeError, ValueError):
+        return None
+    if img_a.shape != img_b.shape or tuple(org_a) != tuple(org_b):
+        return None
+    return griddiff.public(griddiff.diff(img_a, img_b, origin=tuple(org_a)))
+
+
+# /diff 的基准帧：每个 monitor 写法一张，问一次换一次
+_DIFF_BASE: dict[str, tuple[np.ndarray, tuple[int, int], float]] = {}
+_DIFF_LOCK = threading.Lock()
+
+
+def diff_since(body: dict) -> dict:
+    """「上次问过之后屏幕哪里变了」。第一次问只建基准。"""
+    monitor = body.get("monitor") or "primary"
+    cell = max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256))
+    threshold = float(body.get("threshold") or griddiff.DEFAULT_THRESHOLD)
+    key = str(monitor)
+    t0 = time.perf_counter()
+    bgr, origin = screen.grab(monitor)
+    grab_ms = (time.perf_counter() - t0) * 1000
+    now = time.monotonic()
+    with _DIFF_LOCK:
+        base = None if _as_bool(body.get("reset"), False) else _DIFF_BASE.get(key)
+        _DIFF_BASE[key] = (bgr, origin, now)
+    out: dict = {"ok": True, "monitor": key, "origin": list(origin),
+                 "size": [bgr.shape[1], bgr.shape[0]], "capture": _capture_last(monitor)}
+    if base is None or base[0].shape != bgr.shape or tuple(base[1]) != tuple(origin):
+        out.update(first=True, note="已建立基准帧；再调一次就会报告这之后的变化")
+    else:
+        t1 = time.perf_counter()
+        d = griddiff.diff(base[0], bgr, origin=tuple(origin), cell=cell, threshold=threshold,
+                          max_regions=int(body.get("max_regions") or 8))
+        out.update(first=False, since_ms=round((now - base[2]) * 1000), **griddiff.public(d))
+        out["diff_ms"] = round((time.perf_counter() - t1) * 1000, 1)
+    out["grab_ms"] = round(grab_ms, 1)
     return out
 
 
@@ -386,6 +458,23 @@ def detect_monitors(
     mon_spec 为 None / "all" 时遍历全部屏；否则只处理指定的那一块。
     """
     assert ENGINE is not None
+
+    if window_mod.is_window_spec(mon_spec):
+        # 只看一个窗口：抓它的客户区，按一块「屏」处理
+        bgr, origin = screen.grab(mon_spec)
+        res = ENGINE.run(
+            bgr, conf=conf, iou=iou, tiled=tiled, max_side=max_side,
+            overlap=overlap, text=text, text_mode=text_mode, smart=smart,
+            origin=origin,
+        )
+        labeled = [it for it in res["elements"] if it.get("text")]
+        ordered = labeled + [it for it in res["elements"] if not it.get("text")]
+        return ordered, {
+            "monitors": [{"window": str(mon_spec), "size": res["size"], "origin": res["origin"],
+                          "elements": len(res["elements"]), "detect_ms": res["detect_ms"]}],
+            "detect_ms": res["detect_ms"], "ocr_ms": res["ocr_ms"],
+            "total_ms": round(res["detect_ms"] + res["ocr_ms"], 2),
+        }
 
     target = screen.resolve_monitor(mon_spec)
     mons = [target] if target is not None else screen.list_monitors()
@@ -603,8 +692,47 @@ class Handler(BaseHTTPRequestHandler):
             ENGINE.frames.put(turn, bgr, origin, label)
         return bgr, origin
 
+    def _focus(self, action_name: str, params: dict) -> dict | None:
+        """SendInput 只送给前台窗口：动手前先把目标窗口切到前台。
+
+        目标窗口怎么定：params 里有窗口写法（来自 window= / monitor="window:…"）就用它；
+        否则用点击点下面那个顶层窗口；纯键盘动作又没给窗口 → 不动前台。
+        focus=false 关掉；delivery=message 不需要前台，也跳过。
+        """
+        want = params.pop("focus", "auto")
+        win = params.pop("window", None)
+        if want in (False, "false", "off", "no", "0", "none"):
+            return None
+        if str(params.get("delivery") or "") == "message":
+            return None
+        if not actions.available():
+            return None
+        try:
+            if isinstance(want, str) and window_mod.is_window_spec(want):
+                win = want
+            if win:
+                hwnd = window_mod.resolve(window_mod.as_spec(win)).hwnd
+            else:
+                x = params.get("x", params.get("x1"))
+                y = params.get("y", params.get("y1"))
+                if x is None or y is None:
+                    return None
+                hwnd = window_mod.root_at(int(x), int(y))
+                if not hwnd or window_mod.is_shell(hwnd):
+                    return None
+            return window_mod.focus(hwnd)
+        except Exception as exc:  # noqa: BLE001 - 切前台失败不拦输入，只报告
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     def _perform(self, action_name: str, params: dict) -> dict:
-        """把动作名分派到输入层（`ui_locate.actions`）。"""
+        """把动作名分派到输入层（`ui_locate.actions`），之前先确保目标窗口在前台。"""
+        focus = self._focus(action_name, params)
+        out = self._dispatch(action_name, params)
+        if focus is not None and isinstance(out, dict):
+            out["focus"] = focus
+        return out
+
+    def _dispatch(self, action_name: str, params: dict) -> dict:
         if action_name in ("click", "double_click", "right_click", "middle_click"):
             return actions.click(
                 int(params["x"]), int(params["y"]),
@@ -697,8 +825,12 @@ class Handler(BaseHTTPRequestHandler):
             "capture": self._capture,
             "perform": self._perform,
             "compare": self._compare,
+            "differ": _differ,
         }
         mark_info = None
+        data = _window_monitor(data)
+        if "steps" in data and isinstance(data["steps"], list):
+            data = {**data, "steps": [_window_monitor(s) for s in data["steps"]]}
         if "steps" in data:
             if isinstance(data["steps"], list):
                 data = {**data, "steps": [apply_marks(s) for s in data["steps"]]}
@@ -848,6 +980,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/monitors":
             self._send(200, screen.describe())
+            return
+
+        if u.path == "/windows":
+            try:
+                title = (q.get("title") or [""])[0]
+                wins = [w.as_dict() for w in window_mod.list_windows(title)]
+                self._send(200, {"ok": True, "count": len(wins), "windows": wins})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return
 
         if u.path == "/frames":
@@ -1059,6 +1200,26 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._send(200, make_marks(body))
             except ValueError as e:
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path in ("/diff", "/focus"):
+            try:
+                body = json.loads(self._body() or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+                if u.path == "/diff":
+                    self._send(200, diff_since(body))
+                else:
+                    spec = window_mod.as_spec(body.get("window"))
+                    if not spec:
+                        raise ValueError("要给 window（标题或句柄）")
+                    win = window_mod.resolve(spec)
+                    self._send(200, {"ok": True, "window": win.as_dict(),
+                                     "focus": window_mod.focus(win.hwnd)})
+            except (ValueError, window_mod.WindowError) as e:
                 self._send(400, {"ok": False, "error": str(e)})
             except Exception as e:
                 self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
