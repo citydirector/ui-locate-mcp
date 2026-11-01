@@ -1,0 +1,1635 @@
+"""常驻视觉定位服务：启动时付一次预热代价，之后每次请求只要十几毫秒。
+
+为什么必须常驻：
+  CUDA 后端下，每个**新进程**的首次 Conv 都要约 35 秒（cuDNN 要为 113 个
+  卷积层逐一枚举算法，8GB 卡上无法跳过；EXHAUSTIVE/HEURISTIC、workspace
+  开关都不影响这个数字）。同一进程内第二次建 session 只花约 1 秒，因为
+  cuDNN 的算法选择结果在进程级缓存。
+  DirectML 后端没有这个问题（建会话 1.5 秒，首次推理直接就是稳态速度），
+  但常驻的结构照旧 —— 换后端不该改架构，而且常驻还顺带省掉了每次调用重新
+  读 77MB 模型的 IO。
+
+端点（全部 JSON）：
+  GET  /health                     存活与预热状态
+  POST /detect   {"path": "..."}   检测指定图片
+  POST /detect                    body 直接是 PNG/JPEG 字节
+  GET  /find?text=保存             按文字找元素（服务内部先检测+OCR）
+  POST /locate   {"text": "保存"}  只返回坐标，不点击
+  POST /act      {"text": "...", "action": "click", "verify": "screen"}
+                                   定位 → 动作 → 验证，一次请求走完
+  POST /steps    {"steps": [ ... ]} 一串 act 顺序执行，任一步失败即停
+  POST /marks    {"monitor": "primary", "box": "x1,y1,x2,y2"}
+                                   编号标注图 + 编号列表；之后 /act {"mark": 17}
+
+关于「谁来做动作」：本服务确实会调 SendInput / PostMessage（`actions.py`），
+但**不保证生效**。实测两种截然不同的情况：桌面程序在前台时光标移动通道正常
+（`cursor_moved: true`），而全屏游戏捕获鼠标时 SetCursorPos 全部失败——所以
+「锁光标」是前台那个程序造成的，不是本进程的权限问题，换一个前台就可能变。
+每个动作都可以用 `delivery` 指定通道，并且 `/act` 一律回带独立的验证结果 ——
+调用方据 `verified` 判断到底成没成，而不是信 `ok`。
+
+启动：
+  uv run python -m ui_locate.server --port 7788
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Callable
+from urllib.parse import parse_qs, urlparse
+
+import cv2
+import numpy as np
+
+from collections import Counter
+
+from ui_locate import config, cuda_dlls
+
+cuda_dlls.register()
+
+from ui_locate import act as act_mod  # noqa: E402
+from ui_locate import capture as capture_mod  # noqa: E402
+from ui_locate import actions  # noqa: E402
+from ui_locate import frames as frames_mod  # noqa: E402
+from ui_locate import griddiff  # noqa: E402
+from ui_locate import marks as marks_mod  # noqa: E402
+from ui_locate import proposals  # noqa: E402
+from ui_locate import screen  # noqa: E402
+from ui_locate import watch as watch_mod  # noqa: E402
+from ui_locate import window as window_mod  # noqa: E402
+from ui_locate.detect import Detector, default_model  # noqa: E402
+from ui_locate.locate import grab_screen  # noqa: E402
+from ui_locate.mosaic import build_mosaic, map_back  # noqa: E402
+from ui_locate.ocr_match import attach_text, find  # noqa: E402
+from ui_locate.tiled import detect_tiled  # noqa: E402
+
+
+class Engine:
+    """检测 + OCR 的常驻封装。所有 GPU 调用串行化（一把锁）。"""
+
+    def __init__(self, model: Path | None, provider: str, use_ocr: bool) -> None:
+        self.lock = threading.Lock()
+        self.provider = provider
+        self.use_ocr = use_ocr
+        self.ready = False
+        self.warmup_ms = 0.0
+
+        # 无损帧记忆。和检测器一样是常驻状态，但**不放同一把锁里** ——
+        # 存一帧只是内存操作（微秒级），不该排在几十毫秒的推理后面。
+        self.frames = frames_mod.FrameStore()
+
+        t0 = time.perf_counter()
+        self.det = Detector(model, provider)
+        self.ocr = None
+        if use_ocr:
+            from ui_locate.locate import Ocr
+
+            # OCR 固定走 CPU：PP-OCR 模型小，在 CUDA 上每帧搬运开销
+            # 远大于算力收益（实测 2135ms vs 442ms，慢 5 倍）。
+            self.ocr = Ocr(cuda=False)
+
+        # 预热：这一步会吃掉首次 Conv 的算法搜索成本
+        blank = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.det.detect(blank, 0.3, 0.5)
+        if self.ocr is not None:
+            self.ocr.lines(blank)
+
+        self.warmup_ms = (time.perf_counter() - t0) * 1000
+        self.ready = True
+
+    def run(
+        self,
+        bgr: np.ndarray,
+        conf: float = 0.3,
+        iou: float = 0.5,
+        tiled: bool = False,
+        max_side: int | None = None,
+        overlap: float = 0.15,
+        text: bool = True,
+        text_mode: str = "mosaic",
+        smart: bool = True,
+        origin: tuple[int, int] = (0, 0),
+    ) -> dict:
+        """text_mode: mosaic = 只 OCR 检测框裁片（默认，快、省）；full = 整页 OCR（召回高、慢）
+
+        origin：这张图左上角的屏幕绝对坐标。检测器给的是图内坐标，加 origin
+        之后才是能交给 cua_driver 点击的坐标 —— 副屏原点为负，这一步不能省。
+        """
+        if max_side is None:
+            max_side = config.max_side()
+
+        with self.lock:
+            t0 = time.perf_counter()
+            if tiled:
+                items, tstats = detect_tiled(
+                    self.det.sess, self.det.iname, self.det.onames, bgr,
+                    conf, iou, max_side=max_side, overlap=overlap, smart=smart,
+                )
+            else:
+                items, _ = self.det.detect(bgr, conf, iou)
+                tstats = None
+            det_ms = (time.perf_counter() - t0) * 1000
+
+            ocr_ms = 0.0
+            if text and self.ocr is not None:
+                t1 = time.perf_counter()
+                if text_mode == "mosaic":
+                    sheet, slots, scale = build_mosaic(bgr, items, 1.2)
+                    # 没有裁片就没有字可认。以前照样把 1 像素高的空拼图送进 OCR，
+                    # 1200:1 的长宽比让 OCR 预处理跑了 97~108 秒（实测）
+                    lines = map_back(self.ocr.lines(sheet), slots, scale) if slots else []
+                else:
+                    lines = self.ocr.lines(bgr)
+                attach_text(items, lines)
+                ocr_ms = (time.perf_counter() - t1) * 1000
+
+        # 图内坐标 → 屏幕绝对坐标。所有下游（find / locate / 调用方）拿到的
+        # 都是绝对坐标，不必再自己加偏移 —— 少一层换算就少一次出错机会。
+        ox, oy = origin
+        if ox or oy:
+            for it in items:
+                for k in ("x1", "x2"):
+                    it[k] = round(it[k] + ox, 1)
+                for k in ("y1", "y2"):
+                    it[k] = round(it[k] + oy, 1)
+                it["cx"] = round(it["cx"] + ox, 1)
+                it["cy"] = round(it["cy"] + oy, 1)
+
+        labeled = [it for it in items if it.get("text")]
+        unlabeled = [it for it in items if not it.get("text")]
+        ordered = labeled + unlabeled
+        out = {
+            "size": [bgr.shape[1], bgr.shape[0]],
+            "origin": [ox, oy],
+            "provider": self.det.active,
+            "tiled": tiled,
+            "text_mode": text_mode,
+            "detect_ms": round(det_ms, 2),
+            "ocr_ms": round(ocr_ms, 2),
+            "total_ms": round(det_ms + ocr_ms, 2),
+            "elements": ordered,
+        }
+        if tstats is not None:
+            out["tiles"] = tstats
+        return out
+
+
+ENGINE: Engine | None = None
+MARKS = marks_mod.MarkStore()
+
+
+def _parse_box(value: object) -> tuple[int, int, int, int] | None:
+    """"x1,y1,x2,y2" / [x1,y1,x2,y2] → 整数元组；空值返回 None。"""
+    if value in (None, "", []):
+        return None
+    parts = value.split(",") if isinstance(value, str) else list(value)  # type: ignore[arg-type]
+    if len(parts) != 4:
+        raise ValueError(f"box 需要 x1,y1,x2,y2 四个数：{value!r}")
+    x1, y1, x2, y2 = (int(round(float(v))) for v in parts)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"box 的右下角必须在左上角右下方：{value!r}")
+    return x1, y1, x2, y2
+
+
+def make_marks(body: dict) -> dict:
+    """抓屏 → 检测（+OCR）→ 编号 → 画标注图。
+
+    给了 ``box`` 时只看这一块，并且**放大后再检测**：专业软件里 16px 的小按钮
+    在整屏检测里经常被漏掉或并成一个框，放大 2~3 倍后检测器就能一个个分开，
+    标注图也跟着放大，编号不会糊在一起。
+    """
+    with capture_mod.choose(body.get("capture")):
+        return _make_marks(body)
+
+
+def _make_marks(body: dict) -> dict:
+    assert ENGINE is not None
+    t0 = time.perf_counter()
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor", "primary")
+    if monitor in (None, ""):
+        monitor = "primary"
+    box = None if marks_mod.is_cell_ref(body.get("box")) else _parse_box(body.get("box"))
+    conf = float(body.get("conf", 0.2))
+    want_text = _as_bool(body.get("text", True), True)
+    text_mode = str(body.get("text_mode") or "mosaic")
+    max_marks = int(body.get("max_marks", 200))
+    max_side = int(body.get("max_side", 1600))
+    grid = int(body.get("grid") or 0)
+    want_cells = _as_bool(body.get("cells", True), True)
+    fmt = "png" if str(body.get("format") or "").lower() == "png" else "jpeg"
+    # box 也可以写成上一张图的网格名（"C4"）：这就是「选格 → 放大」的第二轮
+    if marks_mod.is_cell_ref(body.get("box")):
+        try:
+            cell, _ = MARKS.resolve_cell(body["box"], body.get("mark_set"))
+        except KeyError as error:
+            raise ValueError(str(error.args[0])) from None
+        box = tuple(int(round(v)) for v in cell)
+
+    if box is not None:
+        # box 是屏幕绝对坐标，可能跨屏，所以从整个虚拟桌面裁；
+        # 按窗口工作时从窗口图里裁（窗口被挡住时屏幕上那块是别的东西）
+        full, (vx, vy) = screen.grab(monitor if window_mod.is_window_spec(monitor) else "all")
+        x1, y1 = max(box[0], vx), max(box[1], vy)
+        x2 = min(box[2], vx + full.shape[1])
+        y2 = min(box[3], vy + full.shape[0])
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            raise ValueError(f"box {box} 不在任何显示器上")
+        bgr = np.ascontiguousarray(full[y1 - vy:y2 - vy, x1 - vx:x2 - vx])
+        origin = (x1, y1)
+    else:
+        bgr, origin = screen.grab(monitor)
+    grab_ms = (time.perf_counter() - t0) * 1000
+
+    # 小区域放大后检测；坐标再缩回去
+    up = 1.0
+    if box is not None:
+        long_side = max(bgr.shape[:2])
+        if long_side < 900:
+            up = min(3.0, 1280 / long_side)
+    det_img = cv2.resize(bgr, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC) if up > 1 else bgr
+    # 始终是对象：下游可以放心读 d["incremental"]["mode"]
+    incremental: dict = {"mode": "full", "forced": True} if box is None else \
+        {"mode": "full", "forced": True, "reason": "box"}
+    if box is None and _as_bool(body.get("incremental", True), True):
+        res, incremental = _detect_incremental(
+            (str(monitor), round(conf, 3), want_text, text_mode), det_img, origin,
+            conf=conf, want_text=want_text, text_mode=text_mode)
+    else:
+        res = ENGINE.run(det_img, conf=conf, tiled=True, text=want_text,
+                         text_mode=text_mode, origin=(0, 0))
+    elements = res["elements"]
+    cells_ms = 0.0
+    if want_cells:
+        # 检测器认不出的物品格 / 标签页 / 槽位：按「成排成列、同尺寸」的几何规则补
+        tc = time.perf_counter()
+        extra = proposals.drop_inside_text(proposals.structured_boxes(det_img), elements)
+        elements = elements + extra
+        cells_ms = (time.perf_counter() - tc) * 1000
+    ox, oy = origin
+    for it in elements:
+        for k in ("x1", "x2", "cx"):
+            it[k] = it[k] / up + ox
+        for k in ("y1", "y2", "cy"):
+            it[k] = it[k] / up + oy
+        it["w"] = it["w"] / up
+        it["h"] = it["h"] / up
+
+    t1 = time.perf_counter()
+    mstats: dict = {}
+    elements = marks_mod.drop_blank(elements, bgr, origin, stats=mstats)
+    marks = marks_mod.build_marks(
+        elements, frame_area=float(bgr.shape[0] * bgr.shape[1]), max_marks=max_marks,
+        stats=mstats)
+    cells = marks_mod.grid_cells(origin, (bgr.shape[1], bgr.shape[0]), grid)
+    image, scale = marks_mod.render(
+        bgr, marks, origin, max_side=max_side,
+        upscale_max=4.0 if box is not None else 1.0, fmt=fmt, cells=cells)
+    render_ms = (time.perf_counter() - t1) * 1000
+
+    turn = ENGINE.frames.begin_turn()
+    ENGINE.frames.put(turn, bgr, origin, label="marks")
+    mset = MARKS.put(marks, origin, box=box, monitor=monitor, cells=cells,
+                     meta={"turn": turn, "size": [bgr.shape[1], bgr.shape[0]]})
+
+    import base64
+
+    return {
+        "ok": True,
+        "mark_set": mset.id,
+        "turn": turn,
+        "origin": [ox, oy],
+        "size": [bgr.shape[1], bgr.shape[0]],
+        "box": list(box) if box else None,
+        "scale": round(scale, 4),
+        "count": len(marks),
+        # truncated：候选比 max_marks 多、被截掉了（不是「正好这么多」）
+        "truncated": bool(mstats.get("truncated")),
+        "candidates": mstats.get("candidates", len(marks)),
+        # 框里没有边缘也没有文字、被当成空白误检丢掉的个数
+        "blank_dropped": mstats.get("blank_dropped", 0),
+        "kinds": dict(Counter(m.kind for m in marks)),
+        "marks": [m.brief() for m in marks],
+        "grid": ({"cols": len({k[0] for k in cells}), "rows": len({k[1:] for k in cells}),
+                  "cell_w": round(bgr.shape[1] / len({k[0] for k in cells}), 1),
+                  "cell_h": round(bgr.shape[0] / len({k[1:] for k in cells}), 1)}
+                 if cells else None),
+        "capture": _capture_last(monitor),
+        "incremental": incremental,
+        "timings": {
+            "grab_ms": round(grab_ms, 1),
+            "detect_ms": res["detect_ms"],
+            "ocr_ms": res["ocr_ms"],
+            "cells_ms": round(cells_ms, 1),
+            "render_ms": round(render_ms, 1),
+            "total_ms": round((time.perf_counter() - t0) * 1000, 1),
+        },
+        "image_format": fmt,
+        "image_b64": base64.b64encode(image).decode("ascii"),
+    }
+
+
+def _capture_last(monitor: object = None) -> dict:
+    from ui_locate.capture import CAPTURER
+
+    if monitor is not None and window_mod.is_window_spec(monitor):
+        last = window_mod.LAST
+        return {"backend": last.get("backend"), "ms": last.get("ms"),
+                "hwnd": last.get("hwnd"), "title": last.get("title"),
+                **({"notes": last["notes"]} if last.get("notes") else {})} if last else {}
+    last = CAPTURER.last
+    return {"backend": last.get("backend"), "ms": last.get("ms")} if last else {}
+
+
+def apply_marks(spec: dict) -> dict:
+    """把 spec 里的编号引用换成坐标引用（act 认得的 ``at`` / ``{cx, cy}``）。
+
+    认三处：``mark: 17``（目标）、``to: "#17"``（拖拽终点）、``from: "#17"``（拖拽起点）。
+    to / from 必须写 ``#``：裸数字可能就是屏幕上的文字（页码、数量）。
+    """
+    if not isinstance(spec, dict):
+        return spec
+    out = dict(spec)
+    set_id = out.pop("mark_set", None)
+    try:
+        if out.get("mark") not in (None, "", 0):
+            m, mset = MARKS.resolve(out.pop("mark"), set_id)
+            out.pop("x", None)
+            out.pop("y", None)
+            if not out.get("text"):
+                out["at"] = m.as_target()
+            out["_mark"] = {"id": m.id, "set": mset.id, "age_s": MARKS.age_s()}
+            _inherit_monitor(out, mset)
+        elif marks_mod.is_cell_ref(out.get("cell")):
+            cell_name = str(out.pop("cell")).strip().upper()
+            (gx1, gy1, gx2, gy2), mset = MARKS.resolve_cell(cell_name, set_id)
+            out.pop("x", None)
+            out.pop("y", None)
+            if not out.get("text"):
+                out["at"] = {"text": None, "cx": (gx1 + gx2) / 2, "cy": (gy1 + gy2) / 2,
+                             "w": gx2 - gx1, "h": gy2 - gy1, "conf": 1.0}
+            out["_mark"] = {"cell": cell_name, "set": mset.id, "age_s": MARKS.age_s()}
+            _inherit_monitor(out, mset)
+        else:
+            out.pop("mark", None)
+        out.pop("cell", None)
+        for key in ("to", "from"):
+            if marks_mod.is_mark_ref(out.get(key)):
+                m, _ = MARKS.resolve(out[key], set_id)
+                out[key] = {"cx": m.cx, "cy": m.cy, "text": m.text}
+    except KeyError as error:
+        raise act_mod.ActError(str(error.args[0] if error.args else error)) from None
+    return out
+
+
+def _inherit_monitor(spec: dict, mset: object) -> None:
+    """标注时是按窗口抓的，点的时候也按那个窗口验证、切前台 —— 除非调用方另给了。"""
+    mon = getattr(mset, "monitor", None)
+    if not spec.get("monitor") and window_mod.is_window_spec(mon):
+        spec["monitor"] = mon
+
+
+def _window_monitor(spec: object) -> object:
+    """``window: "原神"`` → 同时把 monitor 设成 ``window:原神``：抓图、验证都只看这个窗口。"""
+    if not isinstance(spec, dict) or not spec.get("window"):
+        return spec
+    out = dict(spec)
+    out["window"] = window_mod.as_spec(out["window"])
+    if not out.get("monitor"):
+        out["monitor"] = out["window"]
+    return out
+
+
+def _differ(before: object, after: object, ignore: object = None) -> dict | None:
+    """act 用的网格差分：两帧 (bgr, origin) → 变化区域（屏幕坐标）。尺寸 / 原点不同返回 None。
+
+    结果里保留 ``_mask``（变化格的布尔掩码），act 量噪声时要用；对外报告前会剥掉。
+    ignore：忽略这些格子（动作前就在动的地方）。
+    """
+    try:
+        img_a, org_a = before  # type: ignore[misc]
+        img_b, org_b = after   # type: ignore[misc]
+    except (TypeError, ValueError):
+        return None
+    if img_a.shape != img_b.shape or tuple(org_a) != tuple(org_b):
+        return None
+    mask = ignore if isinstance(ignore, np.ndarray) else None
+    return griddiff.diff(img_a, img_b, origin=tuple(org_a), ignore=mask)
+
+
+# /diff 的基准帧：每个 monitor 写法一张，问一次换一次
+_DIFF_BASE: dict[str, tuple[np.ndarray, tuple[int, int], float]] = {}
+_DIFF_LOCK = threading.Lock()
+
+
+def diff_since(body: dict) -> dict:
+    """「上次问过之后屏幕哪里变了」。第一次问只建基准。"""
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor") or "primary"
+    cell = max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256))
+    threshold = float(body.get("threshold") or griddiff.DEFAULT_THRESHOLD)
+    key = str(monitor)
+    t0 = time.perf_counter()
+    bgr, origin = screen.grab(monitor)
+    grab_ms = (time.perf_counter() - t0) * 1000
+    now = time.monotonic()
+    with _DIFF_LOCK:
+        base = None if _as_bool(body.get("reset"), False) else _DIFF_BASE.get(key)
+        _DIFF_BASE[key] = (bgr, origin, now)
+    out: dict = {"ok": True, "monitor": key, "origin": list(origin),
+                 "size": [bgr.shape[1], bgr.shape[0]], "capture": _capture_last(monitor)}
+    if base is None or base[0].shape != bgr.shape or tuple(base[1]) != tuple(origin):
+        out.update(first=True, note="已建立基准帧；再调一次就会报告这之后的变化")
+    else:
+        t1 = time.perf_counter()
+        d = griddiff.diff(base[0], bgr, origin=tuple(origin), cell=cell, threshold=threshold,
+                          max_regions=int(body.get("max_regions") or 8))
+        out.update(first=False, since_ms=round((now - base[2]) * 1000), **griddiff.public(d))
+        out["diff_ms"] = round((time.perf_counter() - t1) * 1000, 1)
+    out["grab_ms"] = round(grab_ms, 1)
+    return out
+
+
+# 增量标注：每块屏 / 窗口记住上一次的画面和检测结果（图内坐标、补格子之前）。
+# 下一次标注先做网格差分：没变 → 直接复用；变了一小块 → 只对变化区域重跑
+# 检测 + OCR，其余元素沿用；变了一大片（切场景）→ 全量。整屏 OCR 2~3 秒，
+# 大多数操作只改动画面的一小块，这一步省掉的是大头。
+_MARKS_CACHE: dict[tuple, dict] = {}
+_MARKS_CACHE_LOCK = threading.Lock()
+INCREMENTAL_MAX_FRAC = 0.3
+INCREMENTAL_MAX_AGE_S = 120.0
+INCREMENTAL_PAD = 24
+
+
+def _rects_overlap(a: tuple, b: tuple) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def plan_incremental(regions: list[dict], cached: list[dict], size: tuple[int, int],
+                     pad: int = INCREMENTAL_PAD) -> tuple[list[tuple], list[dict]]:
+    """变化区域（图内坐标）→ (要重跑的矩形, 可沿用的旧元素)。
+
+    矩形先外扩 pad，再吞掉和它相交的旧元素（元素跨在边界上会被切半），
+    互相重叠的矩形合并。和任何矩形相交的旧元素都丢掉、交给重跑。
+    """
+    W, H = size
+    rects = [(max(0, r["x"] - pad), max(0, r["y"] - pad),
+              min(W, r["x"] + r["w"] + pad), min(H, r["y"] + r["h"] + pad)) for r in regions]
+    for _ in range(3):
+        grown = []
+        for r in rects:
+            x1, y1, x2, y2 = r
+            for e in cached:
+                eb = (e["x1"], e["y1"], e["x2"], e["y2"])
+                if _rects_overlap(r, eb):
+                    x1, y1 = min(x1, int(eb[0])), min(y1, int(eb[1]))
+                    x2, y2 = max(x2, int(np.ceil(eb[2]))), max(y2, int(np.ceil(eb[3])))
+            grown.append((max(0, x1), max(0, y1), min(W, x2), min(H, y2)))
+        merged: list[tuple] = []
+        for r in sorted(grown):
+            for i, m in enumerate(merged):
+                if _rects_overlap(r, m):
+                    merged[i] = (min(r[0], m[0]), min(r[1], m[1]), max(r[2], m[2]), max(r[3], m[3]))
+                    break
+            else:
+                merged.append(r)
+        if merged == rects:
+            break
+        rects = merged
+    keep = [e for e in cached
+            if not any(_rects_overlap(r, (e["x1"], e["y1"], e["x2"], e["y2"])) for r in rects)]
+    return rects, keep
+
+
+# partial 预估耗时 ≥ full 的这个比例就直接 full
+INCREMENTAL_MIN_SAVING = 0.8
+
+
+def estimate_partial_cost(rects: list[tuple], cached: dict, size: tuple[int, int]) -> dict:
+    """预估这次 partial 要花多少（对比上一次 full 的实测）。
+
+    检测 ≈ full_detect × min(1, 重跑面积占比 + 每块 5% 固定开销)；
+    OCR  ≈ full_ocr × 重跑矩形里旧文字元素的占比（OCR 开销跟着文字走，不跟面积走）。
+    没有 full 的实测（缓存来自旧版本）→ 只给占比，不给毫秒。
+    """
+    W, H = size
+    area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects) / float(max(1, W * H))
+    texts = [e for e in cached["elements"] if (e.get("text") or "").strip()]
+    hit = [e for e in texts
+           if any(_rects_overlap(r, (e["x1"], e["y1"], e["x2"], e["y2"])) for r in rects)]
+    text_frac = len(hit) / len(texts) if texts else 0.0
+    out: dict = {"area_frac": round(area, 4), "text_frac": round(text_frac, 4),
+                 "rects": len(rects)}
+    fc = cached.get("full_cost")
+    if fc:
+        det = fc["detect_ms"] * min(1.0, area + 0.05 * len(rects))
+        ocr = fc["ocr_ms"] * text_frac
+        # 上一次 partial 的「实测 / 预估」：OCR 每块有固定开销等预估不到的部分，
+        # 用实测校准（EMA），同一页面第二次起就准了
+        calib = float(cached.get("calib") or 1.0)
+        out.update(full_ms=round(fc["detect_ms"] + fc["ocr_ms"], 1),
+                   raw_partial_ms=round(det + ocr, 1), calibration=round(calib, 3),
+                   partial_ms=round((det + ocr) * calib, 1))
+        out["saving"] = round(1 - out["partial_ms"] / out["full_ms"], 3) if out["full_ms"] else 0.0
+    return out
+
+
+def _detect_incremental(key: tuple, img: np.ndarray, origin: tuple[int, int], *,
+                        conf: float, want_text: bool, text_mode: str) -> tuple[dict, dict]:
+    assert ENGINE is not None
+    import copy
+
+    now = time.monotonic()
+    with _MARKS_CACHE_LOCK:
+        cached = _MARKS_CACHE.get(key)
+    info: dict = {"mode": "full"}
+    res = None
+    rects = keep = None
+    d = {"changed_cells": 0, "changed_frac": 1.0}
+    calib = float((cached or {}).get("calib") or 1.0)
+    if cached and cached["bgr"].shape == img.shape and tuple(cached["origin"]) == tuple(origin) \
+            and now - cached["t"] < INCREMENTAL_MAX_AGE_S:
+        t0 = time.perf_counter()
+        d = griddiff.diff(cached["bgr"], img, max_regions=10_000)
+        info.update(changed_frac=d["changed_frac"], diff_ms=round((time.perf_counter() - t0) * 1000, 1))
+        if d["changed_cells"] == 0:
+            info["mode"] = "reuse"
+            info["reused"] = len(cached["elements"])
+            res = {"elements": copy.deepcopy(cached["elements"]), "detect_ms": 0.0, "ocr_ms": 0.0}
+        elif d["changed_frac"] <= INCREMENTAL_MAX_FRAC:
+            rects, keep = plan_incremental(d["regions"], cached["elements"],
+                                           (img.shape[1], img.shape[0]))
+            est = estimate_partial_cost(rects, cached, (img.shape[1], img.shape[0]))
+            info["estimated_cost"] = est
+            if est.get("partial_ms") is not None and est["partial_ms"] >= \
+                    INCREMENTAL_MIN_SAVING * est["full_ms"]:
+                # 文字密集页上变化压在文字上：重跑的 OCR 和整页差不多，partial 只多一层
+                # 拼接的风险，直接 full
+                info["reason"] = "partial_not_cheaper"
+                rects = None
+        if d["changed_cells"] and d["changed_frac"] <= INCREMENTAL_MAX_FRAC and rects is not None:
+            elements = copy.deepcopy(keep)
+            det_ms = ocr_ms = 0.0
+            for (x1, y1, x2, y2) in rects:
+                if x2 - x1 < 8 or y2 - y1 < 8:
+                    continue
+                crop = np.ascontiguousarray(img[y1:y2, x1:x2])
+                r = ENGINE.run(crop, conf=conf, tiled=True, text=want_text,
+                               text_mode=text_mode, origin=(x1, y1))
+                det_ms += r["detect_ms"]
+                ocr_ms += r["ocr_ms"]
+                elements.extend(r["elements"])
+            info.update(mode="partial", regions=len(rects), reused=len(keep),
+                        redone_frac=round(sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects)
+                                          / float(img.shape[0] * img.shape[1]), 4))
+            res = {"elements": elements, "detect_ms": round(det_ms, 2), "ocr_ms": round(ocr_ms, 2)}
+            raw = info.get("estimated_cost", {}).get("raw_partial_ms")
+            if raw:
+                actual = det_ms + ocr_ms
+                info["actual_ms"] = round(actual, 1)
+                calib = 0.5 * float(cached.get("calib") or 1.0) + 0.5 * actual / max(raw, 1.0)
+    full_cost = (cached or {}).get("full_cost")
+    if res is None:
+        res = ENGINE.run(img, conf=conf, tiled=True, text=want_text, text_mode=text_mode,
+                         origin=(0, 0))
+        full_cost = {"detect_ms": float(res.get("detect_ms") or 0.0),
+                     "ocr_ms": float(res.get("ocr_ms") or 0.0)}
+    with _MARKS_CACHE_LOCK:
+        _MARKS_CACHE[key] = {"bgr": img, "origin": tuple(origin), "t": now,
+                             "elements": copy.deepcopy(res["elements"]), "full_cost": full_cost,
+                             "calib": calib}
+    return res, info
+
+
+def _monitor_at(x: object, y: object) -> str:
+    """屏幕点所在的那块显示器（index 字符串）；找不到 → primary。"""
+    try:
+        for i, m in enumerate(screen.list_monitors()):
+            if m.x <= int(x) < m.x + m.w and m.y <= int(y) < m.y + m.h:
+                return str(i)
+    except Exception:  # noqa: BLE001
+        pass
+    return "primary"
+
+
+def _watch_params(body: dict) -> dict:
+    return {
+        "mode": "full" if str(body.get("mode") or "") == "full" else "regions",
+        "max_keyframes": max(1, min(int(body.get("max_keyframes") or 6), 12)),
+        "cell": max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256)),
+    }
+
+
+def _watch_result(monitor: object, frames: list, body: dict, record_ms: float) -> dict:
+    """帧 → 关键帧 + 拼图 → 返回体。/watch 和 act 的 watch_ms 共用，结构一致。"""
+    from ui_locate.marks import encode_jpeg
+    import base64
+
+    info, sheet = watch_mod.summarize(frames, record_ms=record_ms, **_watch_params(body))
+    # 最后一帧当 /diff 的基准（之后的 diff 可以接着比）
+    _, last_img, last_org = frames[-1]
+    with _DIFF_LOCK:
+        _DIFF_BASE[str(monitor)] = (last_img, last_org, time.monotonic())
+    t0 = time.perf_counter()
+    ok, buf = encode_jpeg(sheet)
+    tm = info.setdefault("timings", {})
+    tm["encode_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    tm["total_ms"] = round(sum(tm.get(k, 0.0) for k in ("record_ms", "analyze_ms", "render_ms",
+                                                          "encode_ms")), 1)
+    info.update(ok=True, monitor=str(monitor), capture=_capture_last(monitor),
+                image_format="jpeg", image_size=[sheet.shape[1], sheet.shape[0]])
+    info["image_b64"] = base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
+    return info
+
+
+def watch_screen(body: dict) -> dict:
+    """录一小段 → 关键帧 → 只拼变化区域的一张图。见 ui_locate.watch。"""
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor") or "primary"
+    t0 = time.perf_counter()
+    frames = watch_mod.record(lambda: screen.grab(monitor),
+                              duration_ms=int(body.get("duration_ms") or 3000),
+                              fps=float(body.get("fps") or 5))
+    return _watch_result(monitor, frames, body, (time.perf_counter() - t0) * 1000)
+
+
+def _watch_monitor_for_act(data: dict) -> object:
+    """act 前就得决定录哪块屏（目标还没找）：window > monitor > 坐标所在屏 > primary。"""
+    spec = window_mod.as_spec(data.get("window"))
+    if spec:
+        return spec
+    if data.get("monitor"):
+        return data["monitor"]
+    try:
+        if data.get("x") is not None and data.get("y") is not None:
+            return _monitor_at(data["x"], data["y"])
+    except Exception:  # noqa: BLE001
+        pass
+    return "primary"
+
+
+def act_with_watch(data: dict, run: "Callable[[], dict]") -> dict:
+    """动作**发出之前**开录，动作 + settle 结束后再收帧分析（不再丢掉动作过程）。
+
+    录制时长 = max(watch_ms, 动作 + settle 实际用时)。
+    """
+    mon = _watch_monitor_for_act(data)
+    params = {"mode": data.get("watch_mode"), "max_keyframes": data.get("watch_max_keyframes")}
+    rec = watch_mod.Recorder(lambda: screen.grab(mon), min_ms=int(data["watch_ms"]),
+                             fps=float(data.get("watch_fps") or 5)).start()
+    try:
+        res = run()
+    except BaseException:
+        rec.finish()
+        raise
+    if isinstance(res, dict):
+        try:
+            frames = rec.finish()
+            w = _watch_result(mon, frames, params, rec.record_ms)
+            w["started"] = "before_action"
+        except Exception as e:  # noqa: BLE001 —— 录像失败不该把已经做完的动作报成失败
+            w = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        res["watch"] = w
+    else:
+        rec.finish()
+    return res
+
+
+def _as_bool(v: object, default: bool) -> bool:
+    """把 JSON / query 里各种写法判成布尔。
+
+    必须单独写：`bool("0")` 是 True，query 传 `tiled=0` 会被当成开启。
+    """
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def detect_monitors(
+    mon_spec: object,
+    conf: float,
+    iou: float,
+    tiled: bool,
+    max_side: int,
+    overlap: float,
+    text: bool,
+    text_mode: str,
+    smart: bool,
+) -> tuple[list[dict], dict]:
+    """按**真实显示器几何**逐个检测，不是在整个虚拟桌面的外接矩形上铺网格。
+
+    为什么这个区别重要：虚拟桌面的外接矩形往往远大于各屏实际像素之和。
+    开发机上实测过一个双屏布局 —— 外接矩形 1184 万像素，两块屏合计只有
+    726 万像素，**38.7% 是显示器之间根本不存在的空白**。在整块矩形上均匀
+    切块，这些空白照样要被切成块送进模型，纯属白烧算力。
+
+    按屏分别切，每块屏都从 (0,0) 开始规划，网格不会跨屏错位，也不会碰到空白；
+    各屏结果各自加上自己的 origin（副屏是负数）就得到统一的屏幕绝对坐标。
+
+    mon_spec 为 None / "all" 时遍历全部屏；否则只处理指定的那一块。
+    """
+    assert ENGINE is not None
+
+    if window_mod.is_window_spec(mon_spec):
+        # 只看一个窗口：抓它的客户区，按一块「屏」处理
+        bgr, origin = screen.grab(mon_spec)
+        res = ENGINE.run(
+            bgr, conf=conf, iou=iou, tiled=tiled, max_side=max_side,
+            overlap=overlap, text=text, text_mode=text_mode, smart=smart,
+            origin=origin,
+        )
+        labeled = [it for it in res["elements"] if it.get("text")]
+        ordered = labeled + [it for it in res["elements"] if not it.get("text")]
+        return ordered, {
+            "monitors": [{"window": str(mon_spec), "size": res["size"], "origin": res["origin"],
+                          "elements": len(res["elements"]), "detect_ms": res["detect_ms"]}],
+            "detect_ms": res["detect_ms"], "ocr_ms": res["ocr_ms"],
+            "total_ms": round(res["detect_ms"] + res["ocr_ms"], 2),
+        }
+
+    target = screen.resolve_monitor(mon_spec)
+    mons = [target] if target is not None else screen.list_monitors()
+
+    all_items: list[dict] = []
+    per: list[dict] = []
+    detect_ms = ocr_ms = 0.0
+
+    for m in mons:
+        bgr, origin = screen.grab(m.index)
+        res = ENGINE.run(
+            bgr, conf=conf, iou=iou, tiled=tiled, max_side=max_side,
+            overlap=overlap, text=text, text_mode=text_mode, smart=smart,
+            origin=origin,
+        )
+        all_items.extend(res["elements"])
+        detect_ms += res["detect_ms"]
+        ocr_ms += res["ocr_ms"]
+        entry = {
+            "index": m.index,
+            "device": m.device,
+            "size": res["size"],
+            "origin": res["origin"],
+            "elements": len(res["elements"]),
+            "detect_ms": res["detect_ms"],
+        }
+        if "tiles" in res:
+            entry["tiles"] = res["tiles"]
+        per.append(entry)
+
+    # 全量元素按置信度重排，带文字的优先（下游 find 只看顺序，不关心屏）
+    labeled = [it for it in all_items if it.get("text")]
+    unlabeled = [it for it in all_items if not it.get("text")]
+    ordered = labeled + unlabeled
+
+    stats = {
+        "monitors": per,
+        "detect_ms": round(detect_ms, 2),
+        "ocr_ms": round(ocr_ms, 2),
+        "total_ms": round(detect_ms + ocr_ms, 2),
+    }
+    return ordered, stats
+
+
+def _attach_uipi(out: dict, hwnd: int) -> None:
+    try:
+        gate = window_mod.uipi(hwnd)
+    except Exception:  # noqa: BLE001 - 权限查不到不影响动作
+        return
+    if gate.get("blocked") is not None:
+        out["uipi"] = gate
+
+
+def _foreground_uipi() -> dict | None:
+    """没切前台（纯键盘、focus=off）时，按当前前台窗口判断。"""
+    if not actions.available():
+        return None
+    try:
+        return window_mod.uipi(window_mod.foreground())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args) -> None:  # 静默访问日志
+        pass
+
+    def handle_one_request(self) -> None:
+        """每条请求开始时清掉上一条读到的 body。
+
+        `BaseHTTPRequestHandler` 在 keep-alive 连接上**复用同一个实例**跑
+        `handle_one_request()` 的循环，所以挂在 `self` 上的 `_body_cache`
+        会跨请求活着。不清就会拿到上一条请求的体：实测形态是同一条连接上
+        `POST /nope {"a":1}` 之后再 `POST /act {"action":"wait"}`，后者报
+        「需要 text（按文字找）或 x 与 y（直接给坐标）」—— 它读到的是
+        `{"a": 1}`。
+
+        这类 bug 很难从表象推回去：连接没坏、状态码也正常（400 而非 501），
+        只有内容对不上。放在这里重置，是因为这是**唯一**保证每条请求都经过
+        且在所有 `do_*` 之前的入口。
+        """
+        self._body_done = False
+        self._body_cache = b""
+        super().handle_one_request()
+
+    def _send(self, code: int, obj: dict) -> None:
+        # 回包前一律把请求体读干净。放在出口上而不是各个分支里，是因为
+        # 「记得每个分支都要读」这种事迟早会漏 —— 而漏一次就让连接坏掉。
+        # 已经读过的话 _body() 直接返回缓存，不会二次读流，代价为零。
+        # 细节与实测形态见 _drain()。
+        self._drain()
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_click(self, data: dict) -> dict:
+        """按文字或坐标返回目标位置——只负责「找到」，不碰输入。
+
+        与 `/act` 的分工：`/act` 会真的按下去，`/locate` 只回坐标。留着这条
+        只查不动的路，是因为它的成本低得多（不做 full 回退、接受 contains
+        档），适合「人看着屏幕，只想让工具告诉我在哪」的场合。
+
+        至于为什么 `/act` 不直接复用这里的宽松匹配：实测过一次掉到 contains
+        档、点中任务栏上另一个窗口，屏幕确实变了、`verified: true` —— 报告
+        成功但点错了地方。会动手的路径宁可报「没找到」，所以 `_probe_hit`
+        单独收紧到 starts 以上，并在 mosaic 空手时回退到 full。
+        """
+        assert ENGINE is not None
+        conf = float(data.get("conf", 0.3))
+        text_mode = str(data.get("text_mode", "mosaic"))
+        smart = _as_bool(data.get("smart"), True)
+
+        text = data.get("text")
+        if text:
+            elements, stats = detect_monitors(
+                data.get("monitor"), conf, 0.5, True, config.max_side(), 0.15,
+                True, text_mode, smart,
+            )
+            # min_tier 由调用方给：`/locate` 只回坐标、由人看着点，所以宽松
+            # 一些也无妨；但 `/act` 会真的点下去，必须收紧到 starts 以上，
+            # 否则会像实测那次——掉到 contains 档点中任务栏上另一个窗口，
+            # 还得回一个 verified:true。详见 ocr_match.find 的 docstring。
+            hits = find(elements, str(text), min_tier=str(data.get("min_tier") or "contains"))
+            if not hits:
+                return {
+                    "ok": False,
+                    "error": f"没找到 {text!r}",
+                    "elements": len(elements),
+                    "monitors": stats["monitors"],
+                }
+            target = hits[0]
+            return {
+                "ok": True,
+                "matched": target.get("text"),
+                "match_tier": target.get("match_tier"),
+                "score": round(float(target.get("conf", 0)), 3),
+                "x": int(target["cx"]),
+                "y": int(target["cy"]),
+                "w": int(target["w"]),
+                "h": int(target["h"]),
+                "elements": len(elements),
+                "total_ms": stats["total_ms"],
+                "monitors": stats["monitors"],
+            }
+
+        if "x" in data and "y" in data:
+            return {"ok": True, "x": int(data["x"]), "y": int(data["y"])}
+
+        return {"ok": False, "error": "需要 text，或 x 与 y"}
+
+    # ── act 层的四个注入点 ──────────────────────────────────────────────────
+    #
+    # act.py 是全纯的编排逻辑（定位 → 动作 → 验证），外部世界一律靠参数注入。
+    # 这里就是把「参数」接成「真东西」的地方。分成四个小方法而不是一个大函数，
+    # 是因为它们的失败语义完全不同：probe 找不到只是没命中，perform 抛异常
+    # 说明输入通道不可用，compare 拿不到图说明抓屏出了问题。
+
+    def _probe_hit(self, text: str, spec: dict) -> dict | None:
+        """按文字找元素，返回 act 层认的那几个字段（找不到就 None）。
+
+        注意返回的是**归一化**过的字典，不是 find() 的原始元素：act 层只关心
+        「中心点 + 尺寸 + 置信度 + 实际匹配到的文字 + 靠哪一档命中」，多给它
+        字段只会让两边的耦合变紧。
+
+        **动手前比只查时更严**，两处收紧：
+
+          1. 不接受 contains 档。实测过一次查「插件」，那一帧 OCR 恰好没认出
+             侧栏按钮，于是掉到 contains 档命中任务栏上「视觉定位MCP插件开发」
+             ——点下去、窗口获得焦点、屏幕确实变了、`verified: true`。工具报告
+             成功，实际点错了地方。会动手的路径宁可报「没找到」。
+          2. mosaic 没找到就自动退回 full 再找一遍。mosaic 只对**检测框内**的
+             裁片做 OCR，检测器一旦漏框，那段文字就根本没进 OCR —— 这正是上面
+             那次漏掉按钮的原因。full 是整页扫描，召回更全但慢三倍；只在
+             「马上要动手、而省的那点时间会换来点错」时才值得付这个代价。
+             只查不点的 `/locate` 不做这个回退，快更重要。
+        """
+        def scan(text_mode: str) -> dict | None:
+            elements, _stats = detect_monitors(
+                spec.get("monitor"),
+                float(spec.get("conf", 0.25)),
+                0.5,
+                _as_bool(spec.get("tiled"), True),
+                int(spec.get("max_side") or config.max_side()),
+                0.15,
+                True,
+                text_mode,
+                _as_bool(spec.get("smart"), True),
+            )
+            hits = find(elements, text, min_tier="starts")
+            if not hits:
+                return None
+            top = hits[0]
+            return {
+                "matched": top.get("text"),
+                "match_tier": top.get("match_tier"),
+                "cx": top["cx"],
+                "cy": top["cy"],
+                "w": top.get("w") or 0,
+                "h": top.get("h") or 0,
+                "conf": float(top.get("conf") or 0.0),
+            }
+
+        wanted = str(spec.get("text_mode") or "mosaic")
+        hit = scan(wanted)
+        if hit is None and wanted != "full":
+            hit = scan("full")
+        return hit
+
+    def _capture(self, monitor: object) -> tuple[np.ndarray, tuple[int, int]]:
+        """抓一张图，连同它的屏幕原点一起返回。
+
+        origin 必须跟着图走：验证阶段要在图里找「点击点周围那一小片」，
+        而点击点是屏幕绝对坐标、图内坐标是相对坐标，副屏原点为负时差得
+        很远。把它和图绑成一个不透明值传给 compare，act 层不必知道这件事。
+
+        **顺便存进帧记忆**。这一步是有意的副作用：抓屏本来就是 act 流程里
+        最贵的一环（2880x1800 一次 20~40ms），既然图已经在手上，扔掉就等于
+        下次要用时再抓一遍。存一帧是纯内存操作，微秒级，不会拖慢它。
+        """
+        bgr, origin = screen.grab(monitor)
+        turn = getattr(self, "_turn", None)
+        if turn is not None:
+            # 回合内第 0 帧是「动作之前」、第 1 帧是「动作之后」—— 这是 act
+            # 流程的固定形状，标上省得调用方自己数。再往后只是「又抓了一张」
+            # （steps 里每步都可能抓），不再硬套 before/after 的名字。
+            seq = getattr(self, "_frame_seq", 0)
+            self._frame_seq = seq + 1
+            label = "before" if seq == 0 else "after" if seq == 1 else f"frame{seq}"
+            ENGINE.frames.put(turn, bgr, origin, label)
+        return bgr, origin
+
+    def _focus(self, action_name: str, params: dict) -> dict | None:
+        """SendInput 只送给前台窗口：动手前先把目标窗口切到前台。
+
+        目标窗口怎么定：params 里有窗口写法（来自 window= / monitor="window:…"）就用它；
+        否则用点击点下面那个顶层窗口；纯键盘动作又没给窗口 → 不动前台。
+        focus=false 关掉；delivery=message 不需要前台，也跳过。
+        """
+        want = params.pop("focus", "auto")
+        win = params.pop("window", None)
+        if want in (False, "false", "off", "no", "0", "none"):
+            return None
+        if str(params.get("delivery") or "") == "message":
+            return None
+        if not actions.available():
+            return None
+        try:
+            if isinstance(want, str) and window_mod.is_window_spec(want):
+                win = want
+            if win:
+                hwnd = window_mod.resolve(window_mod.as_spec(win)).hwnd
+            else:
+                x = params.get("x", params.get("x1"))
+                y = params.get("y", params.get("y1"))
+                if x is None or y is None:
+                    return None
+                hwnd = window_mod.root_at(int(x), int(y))
+                if not hwnd or window_mod.is_shell(hwnd):
+                    return None
+            out = window_mod.focus(hwnd)
+            _attach_uipi(out, hwnd)
+            return out
+        except Exception as exc:  # noqa: BLE001 - 切前台失败不拦输入，只报告
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _perform(self, action_name: str, params: dict) -> dict:
+        """把动作名分派到输入层（`ui_locate.actions`），之前先确保目标窗口在前台。"""
+        focus = self._focus(action_name, params)
+        out = self._dispatch(action_name, params)
+        if isinstance(out, dict):
+            if focus is not None:
+                out["focus"] = focus
+            gate = (focus or {}).get("uipi") or _foreground_uipi()
+            if gate and gate.get("blocked"):
+                # 系统照样回「送出了 N 条」，实际被丢了 —— 必须显式说出来
+                out["uipi"] = gate
+                out["warning"] = gate.get("hint")
+        return out
+
+    def _dispatch(self, action_name: str, params: dict) -> dict:
+        if action_name in ("click", "double_click", "right_click", "middle_click"):
+            return actions.click(
+                int(params["x"]), int(params["y"]),
+                button=str(params.get("button") or "left"),
+                count=int(params.get("count") or 1),
+                delivery=str(params.get("delivery") or "auto"),
+                delay_ms=int(params.get("delay_ms") or 40),
+                pointer=params.get("pointer"),
+            )
+        if action_name in ("hover", "move"):
+            return actions.move(int(params["x"]), int(params["y"]),
+                                pointer=params.get("pointer"))
+        if action_name == "drag":
+            return actions.drag(
+                int(params["x1"]), int(params["y1"]),
+                int(params["x2"]), int(params["y2"]),
+                button=str(params.get("button") or "left"),
+                steps=int(params.get("steps") or 12),
+                duration_ms=int(params.get("duration_ms") or 300),
+                pointer=params.get("pointer"),
+            )
+        if action_name == "scroll":
+            return actions.scroll(
+                int(params["x"]), int(params["y"]),
+                delta=int(params.get("delta") or -3),
+                horizontal=bool(params.get("horizontal")),
+                pointer=params.get("pointer"),
+            )
+        if action_name == "type":
+            return actions.type_text(str(params.get("text") or ""),
+                                     delay_ms=int(params.get("delay_ms") or 12))
+        if action_name == "press":
+            return actions.press(str(params.get("key") or ""),
+                                 keys_mode=params.get("keys_mode"),
+                                 hold_ms=int(params.get("hold_ms") or 0))
+        if action_name == "hold":
+            return actions.hold(str(params.get("keys") or ""),
+                                duration_ms=int(params.get("duration_ms") or 500),
+                                keys_mode=params.get("keys_mode"))
+        if action_name == "hotkey":
+            return actions.hotkey(str(params.get("keys") or ""),
+                                  keys_mode=params.get("keys_mode"))
+        raise actions.InputError(f"服务端不认识的动作 {action_name!r}")
+
+    def _compare(self, before: object, after: object, x: int, y: int,
+                 radius: int) -> float | None:
+        """比对点击点周围 `radius` 像素的方块，返回平均绝对差（0~255）。
+
+        为什么只看一小片：整屏里有太多与本次动作无关的变化 —— 时钟跳秒、
+        光标闪烁、背景粒子。实测游戏里什么都不做连抓两张，整屏平均差就有
+        2.8；敲一次 ESC 才 4.3。框住点击点附近，信噪比才够。
+        """
+        try:
+            img_a, org_a = before  # type: ignore[misc]
+            img_b, org_b = after   # type: ignore[misc]
+        except (TypeError, ValueError):
+            return None
+        if img_a.shape != img_b.shape or org_a != org_b:
+            return None
+
+        if x is None or y is None:
+            # 没有目标点（纯键盘动作，比如在游戏里按 ESC / I）：整屏比。
+            # 隔点采样，4K 也只算几十万个像素
+            a = img_a[::4, ::4].astype(np.float32)
+            b = img_b[::4, ::4].astype(np.float32)
+            return float(np.abs(a - b).mean())
+
+        ox, oy = org_a
+        h, w = img_a.shape[:2]
+        x0 = max(0, min(w, x - ox - radius))
+        x1 = max(0, min(w, x - ox + radius))
+        y0 = max(0, min(h, y - oy - radius))
+        y1 = max(0, min(h, y - oy + radius))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        a = img_a[y0:y1, x0:x1].astype(np.float32)
+        b = img_b[y0:y1, x0:x1].astype(np.float32)
+        return float(np.abs(a - b).mean())
+
+    def _act(self, data: dict, multi: bool | None = None) -> dict:
+        """跑一次 act / steps。两个端点共用，差别只在 spec 的形状。
+
+        开一个回合：本次调用里抓到的每一帧都记到同一个 turn 下，结果里带回
+        `turn`。这样调用方之后想「回看刚才那一下到底发生了什么」，只要拿
+        turn 号去 `/frame` 取，不必自己保管截图 —— 它手里本来也没有。
+        """
+        common = {
+            "probe": self._probe_hit,
+            "capture": self._capture,
+            "perform": self._perform,
+            "compare": self._compare,
+            "differ": _differ,
+        }
+        mark_info = None
+        # /steps 的 steps 是步骤数组；/act 里 drag 的 steps 是插值步数（整数）。
+        # 以前只看「有没有 steps 这个键」，drag 带 steps:12 就被当成多步请求。
+        if multi is None:
+            multi = isinstance(data.get("steps"), list)
+        if multi and not isinstance(data.get("steps"), list):
+            raise act_mod.ActError("steps 需要一个非空数组")
+        data = _window_monitor(data)
+        if multi:
+            data = {**data, "steps": [_window_monitor(s) for s in data["steps"]]}
+        if multi:
+            if isinstance(data["steps"], list):
+                data = {**data, "steps": [apply_marks(s) for s in data["steps"]]}
+        else:
+            data = apply_marks(data)
+            mark_info = data.pop("_mark", None)
+        if multi:
+            for step in data["steps"]:
+                if isinstance(step, dict):
+                    step.pop("_mark", None)
+
+        turn = ENGINE.frames.begin_turn()
+        self._turn = turn
+        self._frame_seq = 0
+        try:
+            if multi:
+                out = act_mod.run_steps(data["steps"], **common)
+            else:
+                out = act_mod.act(data, **common)
+                if mark_info is not None:
+                    out["mark"] = mark_info
+        finally:
+            self._turn = None
+            self._frame_seq = 0
+
+        # 每个回合至少留一张牌：没有 verify:"screen" 的动作（纯 move、滚动、
+        # 纯按键）本来一帧都不会抓，于是「刚才那一下之后屏幕长什么样」事后
+        # 完全问不到 —— 而这正是 VISTA 那条经验里最值钱的部分：存帧，不存结论。
+        # 只在**这一回合确实一帧都没有**时才补抓一次，所以带验证的动作不会
+        # 多付一次抓屏开销。
+        if not ENGINE.frames.turns_of(turn):
+            try:
+                ENGINE.frames.put(
+                    turn, *self._capture(data.get("monitor")), label="after")
+            except Exception:  # noqa: BLE001 - 补抓失败不该把已完成的结果变成错误
+                pass
+
+        out["turn"] = turn
+        return out
+
+    def _body(self) -> bytes:
+        """读请求体。**必须读干净**，理由见 `_drain` 的注释。
+
+        支持 `Transfer-Encoding: chunked`：只看 `Content-Length` 的话，分块
+        编码的请求体会被当成「没有 body」，于是 `json.loads(b"")` 抛
+        JSONDecodeError、同时那些 chunk 字节全留在 socket 里 —— 与 404 分支
+        不读 body 是同一种污染，只是入口不同。
+
+        读到的东西缓存住：`_send` 会再看一眼有没有读完，而 `rfile` 是流，
+        第二次 `read(n)` 会一直等到下一条请求的数据才返回。
+        """
+        if getattr(self, "_body_done", False):
+            return getattr(self, "_body_cache", b"")
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            data = self._read_chunked()
+        else:
+            n = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(n) if n > 0 else b""
+        self._body_done = True
+        self._body_cache = data
+        return data
+
+    def _read_chunked(self) -> bytes:
+        """按 chunked 编码逐块读到 0 长度块为止。"""
+        out: list[bytes] = []
+        while True:
+            line = self.rfile.readline(65537)
+            if not line:
+                break
+            size_text = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_text, 16)
+            except ValueError:
+                break
+            if size == 0:
+                # 吃掉 trailer（如果有）直到空行
+                while True:
+                    tail = self.rfile.readline(65537)
+                    if tail in (b"\r\n", b"\n", b""):
+                        break
+                break
+            out.append(self.rfile.read(size))
+            self.rfile.read(2)  # 每块后面跟一个 CRLF
+        return b"".join(out)
+
+    def _drain(self) -> None:
+        """把请求体读掉再回包。
+
+        为什么非做不可：本类 `protocol_version = "HTTP/1.1"`，响应带
+        `Content-Length`，于是连接会被 keep-alive 复用。只要有一条请求的
+        body 没读完，那些字节就留在 socket 里，**下一条请求的请求行会从它们
+        中间开始**。
+
+        实测形态非常迷惑：同一条连接上先 `POST /nope`（带 body `{}`）拿到
+        404，再 `POST /act` 就会收到
+        `501 Unsupported method ('{}POST')` —— 方法名里混着上一条的 body。
+        httpx 默认复用连接，所以这不是边角情况，任何客户端都会踩到。
+
+        代价是 404 分支会多读几个字节；换来的是连接可以安全复用。
+        """
+        try:
+            self._body()
+        except Exception:  # noqa: BLE001 - 读不干净也不能把回包挡住
+            self.close_connection = True
+
+    def _image_from(self, raw: bytes) -> np.ndarray:
+        """从 JSON {"path"} 或原始图片字节取图。"""
+        if raw[:1] in (b"\x89", b"\xff", b"G") or raw[:2] == b"\xff\xd8":
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError("图片字节解码失败")
+            return img
+
+        try:
+            data = json.loads(raw or b"{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"请求体既不是图片也不是合法 JSON: {e}") from e
+
+        path = data.get("path")
+        if path:
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"无法读取: {path}")
+            return img
+
+        from ui_locate.locate import grab_screen
+
+        return grab_screen()
+
+    def do_GET(self) -> None:
+        assert ENGINE is not None
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+
+        if u.path == "/health":
+            self._send(200, {
+                "ok": True,
+                "ready": ENGINE.ready,
+                "provider": ENGINE.provider,
+                "active": ENGINE.det.active,
+                "ocr": ENGINE.use_ocr,
+                "warmup_ms": round(ENGINE.warmup_ms, 1),
+                "screen": screen.describe(),
+                # 本服务的完整性级别：medium 时操作不了以管理员运行的窗口（UIPI）
+                "integrity": window_mod.self_integrity(),
+            })
+            return
+
+        if u.path == "/monitors":
+            self._send(200, screen.describe())
+            return
+
+        if u.path == "/windows":
+            try:
+                title = (q.get("title") or [""])[0]
+                wins = [{**w.as_dict(), "integrity": window_mod.process_integrity(w.pid)}
+                        for w in window_mod.list_windows(title)]
+                self._send(200, {"ok": True, "count": len(wins), "windows": wins})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path == "/frames":
+            # 只报「有哪些帧可取」，不报像素。模型得先知道有什么才能决定
+            # 取哪一帧，而这个摘要本身不该变成新的上下文负担。
+            self._send(200, {
+                "turns": ENGINE.frames.turns(limit=int((q.get("limit") or ["20"])[0])),
+                "stats": ENGINE.frames.stats(),
+            })
+            return
+
+        if u.path == "/frame":
+            code, meta, png = self._frame_bytes(q)
+            if png is None:
+                self._send(code, meta)
+                return
+            # 图片响应不能走 _send（那个只发 JSON）。但请求体还是要读干净，
+            # 否则 keep-alive 上会污染下一条请求。
+            self._drain()
+            self.send_response(code)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            # 元信息塞进响应头：客户端拿得到图，也就该拿得到「这块对应屏幕
+            # 哪一段、放大了几倍」，否则它没法把图里的位置换算回屏幕坐标。
+            self.send_header("X-Frame-Turn", str(meta.get("turn", "")))
+            self.send_header("X-Frame-Index", str(meta.get("frame", "")))
+            self.send_header("X-Frame-Box", ",".join(str(v) for v in meta.get("box", [])))
+            self.send_header("X-Frame-Scale", str(meta.get("scale", "")))
+            self.end_headers()
+            self.wfile.write(png)
+            return
+
+        if u.path == "/find":
+            text = (q.get("text") or [""])[0]
+            if not text:
+                self._send(400, {"error": "缺少 text 参数"})
+                return
+            try:
+                mon = (q.get("monitor") or [None])[0]
+                elements, stats = detect_monitors(
+                    mon,
+                    float((q.get("conf") or ["0.3"])[0]),
+                    0.5,
+                    True,
+                    int((q.get("max_side") or [str(config.max_side())])[0]),
+                    0.15,
+                    True,
+                    str((q.get("text_mode") or ["mosaic"])[0]),
+                    _as_bool((q.get("smart") or ["1"])[0], True),
+                )
+                hits = find(elements, text)
+                self._send(200, {
+                    "query": text,
+                    "hits": hits,
+                    "monitors": stats["monitors"],
+                    "total_ms": stats["total_ms"],
+                    "elements": len(elements),
+                })
+            except Exception as e:
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+
+        self._send(404, {"error": "unknown path"})
+
+    def _frame_bytes(self, q: dict) -> tuple[int, dict, bytes | None]:
+        """按 query 取一帧或它的一块，返回 (状态码, 元信息, PNG 字节)。
+
+        单独抽出来是因为它有两套输出：正常情况回图片，出错时回 JSON。
+        `_send` 只会发 JSON，所以这里自己写响应。
+
+        参数检查放在查帧之前：`box=1,2,3` 这种写错的请求，不管那一帧存不存在
+        都是「请求本身有错」，该回 400 而不是 404。反过来先查帧，调用方就得先
+        猜对 turn 才能看到自己的参数写错了。
+        """
+        try:
+            turn = int((q.get("turn") or [str(ENGINE.frames.latest_turn())])[0])
+        except ValueError:
+            return 400, {"error": "turn 必须是整数"}, None
+
+        try:
+            frame_index = int((q.get("frame") or ["-1"])[0])
+        except ValueError:
+            return 400, {"error": "frame 必须是整数"}, None
+
+        box = None
+        raw_box = (q.get("box") or [""])[0]
+        if raw_box:
+            parts = [p for p in raw_box.replace(" ", "").split(",") if p]
+            if len(parts) != 4:
+                return 400, {"error": "box 需要四个数：x1,y1,x2,y2（屏幕绝对坐标）"}, None
+            try:
+                box = tuple(int(float(p)) for p in parts)  # type: ignore[assignment]
+            except ValueError:
+                return 400, {"error": "box 的四个值必须是数字"}, None
+
+        raw_scale = (q.get("scale") or [""])[0]
+        scale = None
+        if raw_scale:
+            try:
+                scale = float(raw_scale)
+            except ValueError:
+                return 400, {"error": "scale 必须是数字"}, None
+
+        frame = ENGINE.frames.get(turn, frame_index)
+        if frame is None:
+            return 404, {
+                "error": "没有这一帧",
+                "turn": turn,
+                "frame": frame_index,
+                "available": [t["turn"] for t in ENGINE.frames.turns(limit=50)],
+                "stats": ENGINE.frames.stats(),
+            }, None
+
+        piece, meta = ENGINE.frames.crop(frame, box=box, scale=scale)
+        if piece is None:
+            return 400, meta, None
+
+        ok, buf = cv2.imencode(".png", piece)
+        if not ok:
+            return 500, {"error": "PNG 编码失败"}, None
+        return 200, meta, buf.tobytes()
+
+
+    def do_POST(self) -> None:
+        assert ENGINE is not None
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+
+        if u.path == "/detect":
+            try:
+                raw = self._body()
+                # 参数既可以从 URL query 给，也可以放进 JSON body —— MCP 客户端习惯
+                # 后者，而 URL 里塞长参数很别扭。body 优先，query 兜底。
+                try:
+                    body = json.loads(raw or b"{}") if raw[:1] in (b"{", b"\n", b" ") else {}
+                except json.JSONDecodeError:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {}
+
+                def pick(key: str, default):
+                    if key in body:
+                        return body[key]
+                    return (q.get(key) or [default])[0]
+
+                conf = float(pick("conf", "0.3"))
+                iou = float(pick("iou", "0.5"))
+                tiled = _as_bool(pick("tiled", "1"), True)
+                max_side = int(pick("max_side", config.max_side()))
+                overlap = float(pick("overlap", "0.15"))
+                want_text = _as_bool(pick("text", "1"), True)
+                text_mode = str(pick("text_mode", "mosaic"))
+                smart = _as_bool(pick("smart", "1"), True)
+
+                # 给了 path 就读文件：图内坐标即文件坐标，origin 为 0，
+                # 也不涉及「哪块屏」——直接走单图检测。
+                if body.get("path") or (q.get("path") or [None])[0]:
+                    bgr = self._image_from(raw)
+                    res = ENGINE.run(
+                        bgr, conf=conf, iou=iou, tiled=tiled, max_side=max_side,
+                        overlap=overlap, text=want_text, text_mode=text_mode,
+                        smart=smart, origin=(0, 0),
+                    )
+                    res["monitor"] = None
+                    self._send(200, res)
+                    return
+
+                mon = body.get("monitor") if "monitor" in body else (q.get("monitor") or [None])[0]
+                with capture_mod.choose(pick("capture", None)):
+                    elements, stats = detect_monitors(
+                        mon, conf, iou, tiled, max_side, overlap,
+                        want_text, text_mode, smart,
+                    )
+                self._send(200, {
+                    "size": stats["monitors"][0]["size"] if len(stats["monitors"]) == 1
+                    else None,
+                    "origin": stats["monitors"][0]["origin"] if len(stats["monitors"]) == 1
+                    else None,
+                    "provider": ENGINE.det.active,
+                    "tiled": tiled,
+                    "text_mode": text_mode,
+                    "monitors": stats["monitors"],
+                    "detect_ms": stats["detect_ms"],
+                    "ocr_ms": stats["ocr_ms"],
+                    "total_ms": stats["total_ms"],
+                    # 与 /marks、/act 同构。顶层 detect_ms / ocr_ms / total_ms 已废弃，
+                    # 只为旧调用方保留，下个大版本移除 —— 请读 timings
+                    "deprecated": ["detect_ms", "ocr_ms", "total_ms"],
+                    "timings": {"detect_ms": stats["detect_ms"], "ocr_ms": stats["ocr_ms"],
+                                "total_ms": stats["total_ms"]},
+                    "elements": elements,
+                })
+            except Exception as e:
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path == "/locate":
+            # 只给坐标，不点。
+            try:
+                data = json.loads(self._body() or b"{}")
+                self._send(200, self._handle_click(data))
+            except Exception as e:
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path == "/marks":
+            try:
+                raw = self._body()
+                body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+            except Exception as e:
+                self._send(400, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                return
+            try:
+                self._send(200, make_marks(body))
+            except ValueError as e:
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path == "/watch":
+            try:
+                body = json.loads(self._body() or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+                with capture_mod.choose(body.get("capture")):
+                    self._send(200, watch_screen(body))
+            except (ValueError, window_mod.WindowError) as e:
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path in ("/diff", "/focus"):
+            try:
+                body = json.loads(self._body() or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+                if u.path == "/diff":
+                    with capture_mod.choose(body.get("capture")):
+                        self._send(200, diff_since(body))
+                else:
+                    spec = window_mod.as_spec(body.get("window"))
+                    if not spec:
+                        raise ValueError("要给 window（标题或句柄）")
+                    win = window_mod.resolve(spec)
+                    focus = window_mod.focus(win.hwnd)
+                    _attach_uipi(focus, win.hwnd)
+                    self._send(200, {"ok": True, "window": win.as_dict(), "focus": focus})
+            except (ValueError, window_mod.WindowError) as e:
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path in ("/act", "/steps"):
+            # 定位 + 动作 + 验证一次走完。act.py 会重试、等待、比对，
+            # 但**不会**替调用方判断成败 —— 结果里的 verified 才是判据。
+            try:
+                data = json.loads(self._body() or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+            except Exception as e:
+                self._send(400, {"error": f"{type(e).__name__}: {e}"})
+                return
+            try:
+                with capture_mod.choose(data.get("capture")):
+                    multi = u.path == "/steps"
+                    if data.get("watch_ms"):
+                        # 动作前开录、动作后收：过程（拖动、弹窗、角色移动）都在里面
+                        res = act_with_watch(data, lambda: self._act(data, multi=multi))
+                    else:
+                        res = self._act(data, multi=multi)
+                    self._send(200, res)
+            except act_mod.ActError as e:
+                # 指令本身写错了，重试没有意义 → 400 而不是 500
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        self._send(404, {"error": "unknown path"})
+
+
+def main() -> None:
+    global ENGINE
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default=config.host(), help="监听地址，缺省读 UI_LOCATE_HOST")
+    ap.add_argument("--port", type=int, default=config.port(), help="监听端口，缺省读 UI_LOCATE_PORT")
+    ap.add_argument("--model", type=Path, default=None, help="模型文件；缺省按 ui_locate.config 规则查找")
+    ap.add_argument(
+        "--provider",
+        choices=["auto", "cuda", "dml", "cpu"],
+        default=config.provider(),
+        help="auto 按 cuda → dml → cpu 的顺序取第一个可用的 provider",
+    )
+    ap.add_argument("--no-ocr", action="store_true")
+    args = ap.parse_args()
+
+    print(f"[ui-locate] 加载模型并预热（CUDA 首次约 35 秒；DirectML 约 2 秒）…", flush=True)
+    ENGINE = Engine(args.model, config.resolve_provider(args.provider), not args.no_ocr)
+    print(f"[ui-locate] 就绪，预热耗时 {ENGINE.warmup_ms / 1000:.1f}s，"
+          f"provider={ENGINE.det.active}", flush=True)
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.daemon_threads = True
+    print(f"[ui-locate] 监听 http://{args.host}:{args.port}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[ui-locate] 停止", flush=True)
+    finally:
+        from ui_locate import capture, window_wgc
+
+        capture.release()
+        window_wgc.POOL.release()
+
+
+if __name__ == "__main__":
+    main()

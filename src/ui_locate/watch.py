@@ -118,7 +118,20 @@ class Recorder:
                 wait = self.t0 + n * self._interval - self._clock()
                 if wait > 0:
                     # stop 只是「可以停了」；没录满 min_ms 照样按节拍继续
-                    self._stop.wait(wait) if el + wait * 1000 >= self._min_ms else time.sleep(wait)
+                    if el + wait * 1000 >= self._min_ms:
+                        # 这一觉醒来就到 min_ms 了。必须处理 wait() 返回 True 的
+                        # 情况：`_stop` 已经 set 时 wait() **立即返回**，不 break
+                        # 就会在最后这段时间里空转 —— WGC 抓一帧只要 1ms，实测
+                        # 2000ms 的 watch_ms 录出 223 帧（825MB），PrintWindow
+                        # 一帧 15ms 才把它掩住了。
+                        if self._stop.wait(wait):
+                            # finish() 已经来了：补够 min_ms 就走，不再空转
+                            remaining = self._min_ms / 1000.0 - (self._clock() - self.t0)
+                            if remaining > 0:
+                                time.sleep(remaining)
+                            break
+                    else:
+                        time.sleep(wait)
         except BaseException as e:  # noqa: BLE001
             self.error = e
         finally:
