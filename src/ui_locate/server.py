@@ -1625,9 +1625,10 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[ui-locate] 停止", flush=True)
     finally:
-        from ui_locate import capture
+        from ui_locate import capture, window_wgc
 
         capture.release()
+        window_wgc.POOL.release()
 
 
 if __name__ == "__main__":

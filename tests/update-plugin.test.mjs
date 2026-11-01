@@ -363,13 +363,21 @@ check("syncPythonToBundle：版本不同就重装并复查", async () => {
     exec,
     exists: () => true,
   })
-  // 版本同步之后会补装 SYNC_EXTRA_DEPS（dxcam），旧环境里没有它。
-  assert.deepEqual(answer, { state: "updated", version: want, extras: [{ spec: "dxcam>=0.3,<0.4", ok: true }] })
+  // 版本同步之后会补装 SYNC_EXTRA_DEPS（dxcam、windows-capture），旧环境里没有它们。
+  assert.deepEqual(answer, {
+    state: "updated",
+    version: want,
+    extras: [{ spec: "dxcam>=0.3,<0.4", ok: true }, { spec: "windows-capture>=2.0,<3", ok: true }],
+  })
   const install = exec.calls.find((call) => call.command === "uv")
   assert.ok(install, "应当用 uv 装")
   const extra = exec.calls.filter((call) => call.command === "uv")[1]
   assert.ok(extra && extra.args.includes("dxcam>=0.3,<0.4"), "应当补装 dxcam")
   assert.ok(!extra.args.includes("--no-deps"), "补装的包要带上它自己的依赖")
+  // windows-capture 的元数据要 opencv-python，和 headless 冲突：只装它自己
+  const wc = exec.calls.filter((call) => call.command === "uv")[2]
+  assert.ok(wc && wc.args.includes("windows-capture>=2.0,<3"), "应当补装 windows-capture")
+  assert.ok(wc.args.includes("--no-deps"), "windows-capture 必须 --no-deps")
   // ROOT 是目录 URL 转来的，末尾带斜杠；target 是去掉斜杠之后拼的。
   assert.equal(install.args.at(-1), ROOT.replace(/[\\/]+$/, ""), "只装代码目录，不带任何 extras")
 })
@@ -754,6 +762,43 @@ test("runtime：ensureRuntime 在 pip 已可用时扫掉遗留的 pip wheel", as
     assert.equal(result.ok, true, JSON.stringify(result))
     assert.equal(existsSync(join(home, "pip-26.2.2.whl")), false, "遗留的 wheel 应该被删掉")
     assert.equal(existsSync(join(home, "keep-me.txt")), true, "别的文件不能碰")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("runtime：Windows 上 windows-capture 用 --no-deps 单独装，失败也不中断", async () => {
+  const { ensureRuntime, venvPython } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    const home = join(dir, "home")
+    const python = venvPython(home)   // runtimePlan 按宿主平台算路径
+    mkdirSync(join(python, ".."), { recursive: true })
+    writeFileSync(python, "")
+    const calls = []
+    const exec = (file, args, options, callback) => {
+      const done = typeof options === "function" ? options : callback
+      calls.push(args)
+      let text = ""
+      if (args.includes("--version")) text = "pip 26.2.2\n"
+      else if (args.join(" ").includes("sys.version")) text = "3.12.13\n"
+      if (args.some((a) => String(a).startsWith("windows-capture"))) {
+        setTimeout(() => done(Object.assign(new Error("no wheel"), { code: 1 }), "", "no wheel"), 0)
+        return
+      }
+      setTimeout(() => done(null, text, ""), 0)
+    }
+    const result = await ensureRuntime({
+      home, modelDir: join(dir, "models"), pythonExe: python, packageRoot: dir,
+      backend: "cpu", exec, platform: "win32",
+      exists: (path) => path === python || path.endsWith(".onnx"),
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    const wc = calls.find((a) => a.some((x) => String(x).startsWith("windows-capture")))
+    assert.ok(wc, "应当装 windows-capture")
+    assert.ok(wc.includes("--no-deps"), wc.join(" "))
+    const deps = calls.find((a) => a.includes("opencv-python-headless"))
+    assert.ok(deps && !deps.some((x) => String(x).startsWith("windows-capture")), "不能混进主依赖那一步")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

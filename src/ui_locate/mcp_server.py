@@ -425,7 +425,7 @@ def ui_locate_marks(
     参数：
       monitor    哪块屏："primary"（默认）/ "0" / "1" / 设备名 / "all"
       window     只看一个窗口：标题（或其中一段）/ 句柄。**游戏被别的窗口挡住也能抓**
-                 （PrintWindow；抓黑了自动改按屏裁）。给了就忽略 monitor；之后用这张图
+                 （WGC → PrintWindow → 按屏裁，抓不到或全黑就往下退）。给了就忽略 monitor；之后用这张图
                  的编号去点时，会自动先把这个窗口切到前台。窗口列表见 `ui_locate_windows`
       box        只看这块："x1,y1,x2,y2"（**屏幕绝对坐标**），或上一张图的网格
                  名如 "D3"。留空 = 整块屏。

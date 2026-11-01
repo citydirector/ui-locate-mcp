@@ -23,8 +23,9 @@
 所以定位、点击、验证都不用改。
 
 **抓窗方式**（先命中者胜）：环境变量 ``UI_LOCATE_WINDOW_CAPTURE`` /
-``runtime.json`` 的 ``"window_capture"``：``auto``（默认：PrintWindow，黑了再按屏
-裁）/ ``printwindow`` / ``screen``。
+``runtime.json`` 的 ``"window_capture"``：``auto``（默认：WGC → PrintWindow →
+按屏裁，抓不到或全黑就往下退）/ ``wgc`` / ``printwindow`` / ``screen``。
+WGC 见 ``window_wgc``：从合成器直接拿窗口画面，被挡住、GPU 渲染都能抓。
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ import numpy as np
 
 _IS_WINDOWS = sys.platform == "win32"
 
-WINDOW_CAPTURE = ("auto", "printwindow", "screen")
+WINDOW_CAPTURE = ("auto", "wgc", "printwindow", "screen")
 
 # 这些是桌面、任务栏这类「壳」窗口：点到它们时不该去抢前台。
 _SHELL_CLASSES = {"progman", "workerw", "shell_traywnd", "shell_secondarytraywnd"}
@@ -579,7 +580,23 @@ def grab(spec: object, method: str | None = None) -> tuple[np.ndarray, tuple[int
     t0 = time.perf_counter()
     bgr = None
     used = None
-    if method in ("auto", "printwindow"):
+    origin = (win.rect[0], win.rect[1])
+    if method in ("auto", "wgc"):
+        from ui_locate import window_wgc
+
+        try:
+            img, org, extra = window_wgc.grab_client(win.hwnd, win.rect)
+            if method == "wgc" or not is_black(img):
+                bgr, used, origin = img, "wgc", org
+                if not extra.get("cropped"):
+                    notes.append("wgc: 帧和窗口外框对不上，用了整帧（含标题栏）")
+            else:
+                notes.append("wgc: 全黑帧（受保护内容 / 反作弊常见），改 PrintWindow")
+        except Exception as error:  # noqa: BLE001
+            if method == "wgc":
+                raise WindowError(f"WGC 抓窗失败：{error}") from error
+            notes.append(f"wgc: {error}")
+    if bgr is None and method in ("auto", "printwindow"):
         try:
             img = print_window(win.hwnd)
             if method == "printwindow" or not is_black(img):
@@ -592,7 +609,8 @@ def grab(spec: object, method: str | None = None) -> tuple[np.ndarray, tuple[int
             notes.append(f"printwindow: {error}")
     if bgr is None:
         bgr, used = _screen_crop(win.rect), "screen"
+        origin = (win.rect[0], win.rect[1])
     LAST.clear()
     LAST.update({"backend": f"window/{used}", "hwnd": win.hwnd, "title": win.title,
                  "ms": round((time.perf_counter() - t0) * 1000, 1), "notes": notes})
-    return bgr, (win.rect[0], win.rect[1])
+    return bgr, origin

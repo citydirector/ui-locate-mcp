@@ -76,7 +76,7 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 给 `ui_locate_marks`、`ui_locate_act`、`ui_locate_diff` 传 `window=`（标题或其中一段，或句柄）：
 
-- 抓图走 `PrintWindow`，游戏被聊天窗口盖住也能抓到（只有客户区）。抓成全黑（独占全屏、部分 Vulkan 游戏）时自动改为按屏抓再裁。`UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`：`auto`（默认）、`printwindow`、`screen`。
+- 抓图先走 Windows Graphics Capture：直接从合成器拿窗口画面，游戏被聊天窗口盖住也能抓到，GPU 渲染的内容也在，裁成客户区。每个窗口保持一个常驻会话（空闲 15 秒关闭），watch / wait 连续抓几乎零开销。WGC 失败或全黑时退到 `PrintWindow`，再退到按屏抓再裁。`UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`：`auto`（默认）、`wgc`、`printwindow`、`screen`。WGC 需要 `windows-capture` 包，插件用 `--no-deps` 安装（它的元数据要求 `opencv-python`，和 `opencv-python-headless` 冲突）。Win10 上窗口周围可能出现黄色捕获边框，Win11 会关掉。
 - 发输入前先把目标窗口切到前台（SendInput 只送给前台窗口）。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
 - 用 `window=` 标注的编号会记住这个窗口，之后 `ui_locate_act(mark=…)` 自动切前台、按窗口验证。
 

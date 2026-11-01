@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url"
  * 版本同步（`--no-deps`）之后另外补装的依赖：不碰 ORT、旧环境里可能没有的包。
  * 失败不算同步失败 —— Python 侧缺了它们会自己降级（dxcam 缺了退回 GDI 抓屏）。
  */
-export const SYNC_EXTRA_DEPS = ["dxcam>=0.3,<0.4"]
+export const SYNC_EXTRA_DEPS = ["dxcam>=0.3,<0.4", { spec: "windows-capture>=2.0,<3", noDeps: true }]
 
 /** Python 包名，用来问 venv 里装的是哪个版本。 */
 export const PYTHON_PACKAGE = "ui-locate-mcp"
@@ -258,9 +258,12 @@ export async function syncPythonToBundle({
 async function installSyncExtras(python, { exec, platform }) {
   if (platform !== "win32" || SYNC_EXTRA_DEPS.length === 0) return undefined
   const done = []
-  for (const spec of SYNC_EXTRA_DEPS) {
+  for (const entry of SYNC_EXTRA_DEPS) {
+    // 字符串 = 正常装；{ spec, noDeps } = 只装它自己（依赖声明和我们冲突的包）
+    const spec = typeof entry === "string" ? entry : entry.spec
+    const noDeps = typeof entry === "string" ? false : Boolean(entry.noDeps)
     try {
-      await installIntoVenv(python, spec, { exec })
+      await installIntoVenv(python, spec, { exec, noDeps })
       done.push({ spec, ok: true })
     } catch (error) {
       done.push({ spec, ok: false, error: String(error?.message ?? error).split("\n")[0].slice(0, 200) })

@@ -71,6 +71,13 @@ export const COMMON_DEPS = [
 ]
 
 
+/**
+ * 只在 Windows 上、用 `--no-deps` 单独装的包。windows-capture（WGC 抓窗口）的
+ * 元数据要求 `opencv-python`，和 `opencv-python-headless` 冲突；它运行时只要
+ * numpy 和 cv2，headless 已满足。装失败不算失败：Python 侧会退回 PrintWindow。
+ */
+export const NO_DEPS_WIN_DEPS = ["windows-capture>=2.0,<3"]
+
 /** CUDA 后端额外要的 nvidia 运行库（与 `pyproject.toml` 的 [cuda] 对齐）。 */
 export const CUDA_RUNTIME_DEPS = [
   "nvidia-cublas-cu12",
@@ -441,6 +448,15 @@ export async function ensureRuntime({
   const depsInstalled = await run(exec, python, depsArgs, { env })
   if (!depsInstalled.ok) return fail("依赖", `装依赖失败：${brief(depsInstalled)}`)
   done("依赖", { ok: true, backend, packages: deps.length })
+
+  // ── 3b. 只在 Windows、--no-deps 的可选包（失败不中断）────────────────────
+  if (platform === "win32" && NO_DEPS_WIN_DEPS.length) {
+    const optArgs = ["-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check", "--no-deps"]
+    if (force) optArgs.push("--force-reinstall", "--upgrade")
+    optArgs.push(...NO_DEPS_WIN_DEPS)
+    const opt = await run(exec, python, optArgs, { env })
+    done("可选依赖", opt.ok ? { ok: true, packages: NO_DEPS_WIN_DEPS } : { ok: false, optional: true, error: brief(opt) })
+  }
 
   // ── 4. 本包 ────────────────────────────────────────────────────────────────
   // `--no-deps` 是有意的：上面已经把依赖按选定的后装好了，这里再让 pip 解一遍

@@ -76,7 +76,7 @@ Coordinates are absolute screen coordinates and may be negative on secondary dis
 
 Pass `window=` (title or part of it, or a handle) to `ui_locate_marks`, `ui_locate_act` or `ui_locate_diff`:
 
-- Capture uses `PrintWindow`, so a game covered by the chat window is still captured (client area only). An all-black result (exclusive fullscreen, some Vulkan games) falls back to cropping a monitor capture. `UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`: `auto` (default), `printwindow`, `screen`.
+- Capture tries Windows Graphics Capture first: it reads the window from the compositor, so a game covered by the chat window is still captured, GPU-rendered content included, cropped to the client area. One session per window stays open while frames are being requested (closed after 15 s idle), so repeated grabs during watch/wait are nearly free. If WGC fails or returns black it falls back to `PrintWindow`, then to cropping a monitor capture. `UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`: `auto` (default), `wgc`, `printwindow`, `screen`. WGC needs the `windows-capture` package; the plugin installs it with `--no-deps` (its metadata asks for `opencv-python`, which clashes with `opencv-python-headless`). On Windows 10 a yellow capture border may show around the window; Windows 11 turns it off.
 - Before sending input, the target window is brought to the foreground (SendInput only reaches the foreground window). Without `window=`, mouse actions focus the window under the point; `focus="off"` disables it. `performed.focus` reports whether it worked.
 - Marks taken with `window=` keep it, so `ui_locate_act(mark=…)` later focuses and verifies that window.
 
