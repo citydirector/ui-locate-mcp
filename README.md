@@ -44,6 +44,7 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `ui_locate_steps` | Run ordered steps and identify failures |
 | `ui_locate_windows` | List top-level windows (title, handle, client rect, foreground) |
 | `ui_locate_diff` | Where the screen changed since the last call, as rectangles (no image, no vision tokens) |
+| `ui_locate_watch` | Record a few seconds and return one image of the keyframes, cropped to what changed |
 | `ui_locate_frames` / `ui_locate_frame` | List or retrieve recent action frames |
 | `list_monitors` | Display sizes, origins and indices |
 | `health` | Check service readiness |
@@ -82,6 +83,12 @@ Pass `window=` (title or part of it, or a handle) to `ui_locate_marks`, `ui_loca
 ### Waiting and verifying
 
 With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` without text waits for a still screen. Before acting, about 80 ms of idle frames measure how much the scene moves by itself (water, particles, video); on such scenes (`verify.noise.animated`) the threshold rises with the noise and cells that were already moving are ignored, so clicking empty animated background no longer reports `verified: true`.
+
+### Watch, then act
+
+Many actions have effects you cannot predict from one screenshot (does the map pan, which way does the enemy walk, is the skill on cooldown). `ui_locate_watch` records a few seconds (`duration_ms`, `fps`), picks keyframes with the grid diff, and returns **one** image: the first frame as an overview, then for each later keyframe only crops of what changed, labelled with time and screen coordinates. A still screen returns a single frame; cells that change in nearly every frame (water, particles, clocks) are treated as ambient and ignored (`ambient` in the result). `ui_locate_act(..., watch_ms=2000)` does the action and then watches, so "look, act, look" is one call.
+
+`ui_locate_marks` is incremental by default: for the same monitor or window it diffs against the previous call, reuses everything when nothing changed, and re-runs detection and OCR only on the changed regions (plus any element straddling them) when less than 30% changed. `incremental.mode` is `reuse`, `partial` or `full`; mark numbers are always reassigned.
 
 ## Configuration and data
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
+import cv2
 import numpy as np
 
 DEFAULT_CELL = 32
@@ -34,24 +35,22 @@ QUIET_MIN_CELLS = 2
 
 
 def cell_scores(a: np.ndarray, b: np.ndarray, cell: int = DEFAULT_CELL) -> np.ndarray:
-    """每格的平均差，形状 (rows, cols)。边上不满一格的部分并进最后一格之外 —— 丢掉。
+    """每格的平均差，形状 (rows, cols)。边上不满一格的部分丢掉。
 
-    为了快先隔点采样（步长 2），4K 一帧也只算 200 万像素。
+    用 OpenCV：absdiff（SIMD）→ 三通道取最大 → INTER_AREA 缩到格子数（正好是块均值）。
+    1080p 一次约 3ms；以前纯 numpy 隔点采样要 15~40ms。
     """
     if a.shape != b.shape:
         raise ValueError(f"两帧尺寸不同：{a.shape} vs {b.shape}")
-    step = 2 if min(a.shape[:2]) >= 4 * cell else 1
-    sa = a[::step, ::step]
-    sb = b[::step, ::step]
-    d = np.abs(sa.astype(np.int16) - sb.astype(np.int16))
+    d = cv2.absdiff(a, b)
     if d.ndim == 3:
-        d = d.max(axis=2)
-    c = max(1, cell // step)
-    rows, cols = d.shape[0] // c, d.shape[1] // c
+        d = cv2.max(cv2.max(d[:, :, 0], d[:, :, 1]), d[:, :, 2])
+    rows, cols = d.shape[0] // cell, d.shape[1] // cell
     if rows == 0 or cols == 0:
         return np.array([[float(d.mean())]], dtype=np.float32)
-    d = d[:rows * c, :cols * c].reshape(rows, c, cols, c)
-    return d.mean(axis=(1, 3)).astype(np.float32)
+    d = np.ascontiguousarray(d[:rows * cell, :cols * cell])
+    # uint8 直接做 INTER_AREA：块均值四舍五入到整数，对 8 这种阈值足够
+    return cv2.resize(d, (cols, rows), interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
 def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:

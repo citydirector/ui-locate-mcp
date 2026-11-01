@@ -61,6 +61,7 @@ from ui_locate import griddiff  # noqa: E402
 from ui_locate import marks as marks_mod  # noqa: E402
 from ui_locate import proposals  # noqa: E402
 from ui_locate import screen  # noqa: E402
+from ui_locate import watch as watch_mod  # noqa: E402
 from ui_locate import window as window_mod  # noqa: E402
 from ui_locate.detect import Detector, default_model  # noqa: E402
 from ui_locate.locate import grab_screen  # noqa: E402
@@ -252,8 +253,14 @@ def _make_marks(body: dict) -> dict:
         if long_side < 900:
             up = min(3.0, 1280 / long_side)
     det_img = cv2.resize(bgr, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC) if up > 1 else bgr
-    res = ENGINE.run(det_img, conf=conf, tiled=True, text=want_text,
-                     text_mode=text_mode, origin=(0, 0))
+    incremental = None
+    if box is None and _as_bool(body.get("incremental", True), True):
+        res, incremental = _detect_incremental(
+            (str(monitor), round(conf, 3), want_text, text_mode), det_img, origin,
+            conf=conf, want_text=want_text, text_mode=text_mode)
+    else:
+        res = ENGINE.run(det_img, conf=conf, tiled=True, text=want_text,
+                         text_mode=text_mode, origin=(0, 0))
     elements = res["elements"]
     cells_ms = 0.0
     if want_cells:
@@ -308,6 +315,7 @@ def _make_marks(body: dict) -> dict:
                   "cell_h": round(bgr.shape[0] / len({k[1:] for k in cells}), 1)}
                  if cells else None),
         "capture": _capture_last(monitor),
+        "incremental": incremental,
         "timings": {
             "grab_ms": round(grab_ms, 1),
             "detect_ms": res["detect_ms"],
@@ -439,6 +447,138 @@ def diff_since(body: dict) -> dict:
         out["diff_ms"] = round((time.perf_counter() - t1) * 1000, 1)
     out["grab_ms"] = round(grab_ms, 1)
     return out
+
+
+# 增量标注：每块屏 / 窗口记住上一次的画面和检测结果（图内坐标、补格子之前）。
+# 下一次标注先做网格差分：没变 → 直接复用；变了一小块 → 只对变化区域重跑
+# 检测 + OCR，其余元素沿用；变了一大片（切场景）→ 全量。整屏 OCR 2~3 秒，
+# 大多数操作只改动画面的一小块，这一步省掉的是大头。
+_MARKS_CACHE: dict[tuple, dict] = {}
+_MARKS_CACHE_LOCK = threading.Lock()
+INCREMENTAL_MAX_FRAC = 0.3
+INCREMENTAL_MAX_AGE_S = 120.0
+INCREMENTAL_PAD = 24
+
+
+def _rects_overlap(a: tuple, b: tuple) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def plan_incremental(regions: list[dict], cached: list[dict], size: tuple[int, int],
+                     pad: int = INCREMENTAL_PAD) -> tuple[list[tuple], list[dict]]:
+    """变化区域（图内坐标）→ (要重跑的矩形, 可沿用的旧元素)。
+
+    矩形先外扩 pad，再吞掉和它相交的旧元素（元素跨在边界上会被切半），
+    互相重叠的矩形合并。和任何矩形相交的旧元素都丢掉、交给重跑。
+    """
+    W, H = size
+    rects = [(max(0, r["x"] - pad), max(0, r["y"] - pad),
+              min(W, r["x"] + r["w"] + pad), min(H, r["y"] + r["h"] + pad)) for r in regions]
+    for _ in range(3):
+        grown = []
+        for r in rects:
+            x1, y1, x2, y2 = r
+            for e in cached:
+                eb = (e["x1"], e["y1"], e["x2"], e["y2"])
+                if _rects_overlap(r, eb):
+                    x1, y1 = min(x1, int(eb[0])), min(y1, int(eb[1]))
+                    x2, y2 = max(x2, int(np.ceil(eb[2]))), max(y2, int(np.ceil(eb[3])))
+            grown.append((max(0, x1), max(0, y1), min(W, x2), min(H, y2)))
+        merged: list[tuple] = []
+        for r in sorted(grown):
+            for i, m in enumerate(merged):
+                if _rects_overlap(r, m):
+                    merged[i] = (min(r[0], m[0]), min(r[1], m[1]), max(r[2], m[2]), max(r[3], m[3]))
+                    break
+            else:
+                merged.append(r)
+        if merged == rects:
+            break
+        rects = merged
+    keep = [e for e in cached
+            if not any(_rects_overlap(r, (e["x1"], e["y1"], e["x2"], e["y2"])) for r in rects)]
+    return rects, keep
+
+
+def _detect_incremental(key: tuple, img: np.ndarray, origin: tuple[int, int], *,
+                        conf: float, want_text: bool, text_mode: str) -> tuple[dict, dict]:
+    assert ENGINE is not None
+    import copy
+
+    now = time.monotonic()
+    with _MARKS_CACHE_LOCK:
+        cached = _MARKS_CACHE.get(key)
+    info: dict = {"mode": "full"}
+    res = None
+    if cached and cached["bgr"].shape == img.shape and tuple(cached["origin"]) == tuple(origin) \
+            and now - cached["t"] < INCREMENTAL_MAX_AGE_S:
+        t0 = time.perf_counter()
+        d = griddiff.diff(cached["bgr"], img, max_regions=10_000)
+        info.update(changed_frac=d["changed_frac"], diff_ms=round((time.perf_counter() - t0) * 1000, 1))
+        if d["changed_cells"] == 0:
+            info["mode"] = "reuse"
+            info["reused"] = len(cached["elements"])
+            res = {"elements": copy.deepcopy(cached["elements"]), "detect_ms": 0.0, "ocr_ms": 0.0}
+        elif d["changed_frac"] <= INCREMENTAL_MAX_FRAC:
+            rects, keep = plan_incremental(d["regions"], cached["elements"],
+                                           (img.shape[1], img.shape[0]))
+            elements = copy.deepcopy(keep)
+            det_ms = ocr_ms = 0.0
+            for (x1, y1, x2, y2) in rects:
+                if x2 - x1 < 8 or y2 - y1 < 8:
+                    continue
+                crop = np.ascontiguousarray(img[y1:y2, x1:x2])
+                r = ENGINE.run(crop, conf=conf, tiled=True, text=want_text,
+                               text_mode=text_mode, origin=(x1, y1))
+                det_ms += r["detect_ms"]
+                ocr_ms += r["ocr_ms"]
+                elements.extend(r["elements"])
+            info.update(mode="partial", regions=len(rects), reused=len(keep),
+                        redone_frac=round(sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects)
+                                          / float(img.shape[0] * img.shape[1]), 4))
+            res = {"elements": elements, "detect_ms": round(det_ms, 2), "ocr_ms": round(ocr_ms, 2)}
+    if res is None:
+        res = ENGINE.run(img, conf=conf, tiled=True, text=want_text, text_mode=text_mode,
+                         origin=(0, 0))
+    with _MARKS_CACHE_LOCK:
+        _MARKS_CACHE[key] = {"bgr": img, "origin": tuple(origin), "t": now,
+                             "elements": copy.deepcopy(res["elements"])}
+    return res, info
+
+
+def _monitor_at(x: object, y: object) -> str:
+    """屏幕点所在的那块显示器（index 字符串）；找不到 → primary。"""
+    try:
+        for i, m in enumerate(screen.list_monitors()):
+            if m.x <= int(x) < m.x + m.w and m.y <= int(y) < m.y + m.h:
+                return str(i)
+    except Exception:  # noqa: BLE001
+        pass
+    return "primary"
+
+
+def watch_screen(body: dict) -> dict:
+    """录一小段 → 关键帧 → 只拼变化区域的一张图。见 ui_locate.watch。"""
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor") or "primary"
+    info, sheet, frames = watch_mod.watch(
+        lambda: screen.grab(monitor),
+        duration_ms=int(body.get("duration_ms") or 3000),
+        fps=float(body.get("fps") or 5),
+        mode="full" if str(body.get("mode") or "") == "full" else "regions",
+        max_keyframes=max(1, min(int(body.get("max_keyframes") or 6), 12)),
+        cell=max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256)),
+    )
+    # 最后一帧当 /diff 的基准，也进帧缓存（之后的 marks / act 可以接着比）
+    last_t, last_img, last_org = frames[-1]
+    with _DIFF_LOCK:
+        _DIFF_BASE[str(monitor)] = (last_img, last_org, time.monotonic())
+    ok, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    import base64
+
+    info.update(ok=True, monitor=str(monitor), capture=_capture_last(monitor),
+                image_format="jpeg", image_size=[sheet.shape[1], sheet.shape[0]])
+    info["image_b64"] = base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
+    return info
 
 
 def _as_bool(v: object, default: bool) -> bool:
@@ -1266,6 +1406,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return
 
+        if u.path == "/watch":
+            try:
+                body = json.loads(self._body() or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+                with capture_mod.choose(body.get("capture")):
+                    self._send(200, watch_screen(body))
+            except (ValueError, window_mod.WindowError) as e:
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
         if u.path in ("/diff", "/focus"):
             try:
                 body = json.loads(self._body() or b"{}")
@@ -1300,7 +1453,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 with capture_mod.choose(data.get("capture")):
-                    self._send(200, self._act(data, multi=u.path == "/steps"))
+                    res = self._act(data, multi=u.path == "/steps")
+                    if data.get("watch_ms") and isinstance(res, dict):
+                        # 动手之后接着看一小段：结果怎么演变的（弹窗、角色移动、冷却）
+                        tgt = res.get("target") or {}
+                        mon = window_mod.as_spec(data.get("window")) or data.get("monitor") \
+                            or (_monitor_at(tgt["cx"], tgt["cy"]) if tgt.get("cx") is not None
+                                else "primary")
+                        res["watch"] = watch_screen({
+                            "monitor": mon, "duration_ms": data["watch_ms"],
+                            "fps": data.get("watch_fps") or 5, "mode": data.get("watch_mode")})
+                    self._send(200, res)
             except act_mod.ActError as e:
                 # 指令本身写错了，重试没有意义 → 400 而不是 500
                 self._send(400, {"ok": False, "error": str(e)})
