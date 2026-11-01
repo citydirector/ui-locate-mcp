@@ -230,13 +230,19 @@ def grab(monitor: object = None) -> tuple[np.ndarray, tuple[int, int]]:
     origin 是这张图左上角的**屏幕绝对坐标**。调用方算出的图内坐标加上
     origin 才是能交给 cua_driver 的坐标。
 
-    参数 monitor：见 `resolve_monitor`。默认整个虚拟桌面。
+    参数 monitor：见 `resolve_monitor`。默认整个虚拟桌面。也可以写
+    ``"window:标题"`` / ``"hwnd:123"`` 只抓一个窗口（见 `ui_locate.window`）。
 
     抓屏后端由 `ui_locate.capture` 决定（默认 auto：DXGI → WGC → GDI）。
     整个虚拟桌面按屏分别抓、再贴进一张画布：DXGI / WGC 本来就是一块输出
     一台相机，显示器之间不存在的空白保持全黑，和 GDI 抓出来的样子一致。
     """
     set_dpi_aware()
+    from ui_locate import window
+
+    if window.is_window_spec(monitor):
+        # "window:标题" / "hwnd:123"：只抓这个窗口的客户区（被挡住也能抓）
+        return window.grab(monitor)
     m = resolve_monitor(monitor)
     if m is not None:
         return _grab_monitor(m), (m.x, m.y)

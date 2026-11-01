@@ -37,6 +37,8 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
+from ui_locate import griddiff
+
 # 一次动作结束后到「画面稳定」的默认等待。200ms 覆盖大多数界面切换动画的
 # 首帧到可见变化；再长就是白等 —— 需要更久的场景由调用方显式给 settle_ms。
 _DEFAULT_SETTLE_MS = 220
@@ -49,6 +51,18 @@ _DEFAULT_POLL_MS = 150
 # 参考实测：游戏里静止画面连抓两张差 2.8（背景动画/粒子），敲 ESC 差 4.3。
 # 所以阈值必须高于纯噪声，又不能高到把「按钮变灰」这种小变化漏掉。
 _DEFAULT_CHANGE_THRESHOLD = 3.5
+
+# 「等画面停下来」的上限。多数界面动画 100~400ms；过场 / 加载更久的由调用方给
+# settle_timeout_ms，或者用 verify_text 等具体的字。
+_DEFAULT_STABLE_TIMEOUT_MS = 1500
+_STABLE_MIN_MS = 60
+_STABLE_POLL_MS = 50
+
+# 网格差分里「点击点附近有一块变化」算生效的强度下限（格内平均差，0~255）。
+# 远高于粒子/水面的 3~6，按钮高亮、弹出面板一般 15 以上。
+_REGION_STRENGTH = 16.0
+# 整屏比对（纯键盘动作）时，变化格占比超过它也算生效：开关菜单、切换页签。
+_SCREEN_FRAC = 0.05
 
 
 class ActError(RuntimeError):
@@ -176,7 +190,23 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
         params["pointer"] = str(spec["pointer"])
     if spec.get("keys_mode") and action in ("press", "hotkey", "hold"):
         params["keys_mode"] = str(spec["keys_mode"])
+    # 前台：输入层发 SendInput 前把目标窗口切到前台（见 server._focus）
+    if action != "none":
+        win = spec.get("window")
+        if not win and _is_window_spec(spec.get("monitor")):
+            win = spec.get("monitor")
+        if win:
+            params["window"] = win
+        if spec.get("focus") not in (None, "", "auto"):
+            params["focus"] = spec["focus"]
     return action, params
+
+
+def _is_window_spec(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    low = value.strip().lower()
+    return low.startswith("window:") or low.startswith("hwnd:")
 
 
 def _build(action: str, spec: dict, target: dict) -> tuple[str, dict]:
@@ -382,6 +412,7 @@ def act(
     compare: Callable[..., float | None],
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    differ: Callable[[Any, Any], dict | None] | None = None,
 ) -> dict:
     """定位 → 动作 → 验证，一次调用完成。
 
@@ -390,7 +421,12 @@ def act(
       action        动作名，默认 click
       text          按文字找目标（推荐）；或给 x / y
       verify        None（不验证）| "screen" | {"text": "...", "timeout_ms": n}
-      settle_ms     动作后等多久再验证，默认 220
+      settle        "auto"（默认）| "stable" | "fixed" | "none"
+                    auto：verify="screen" 且有 differ 时等画面停下来（stable），
+                    否则固定等 settle_ms。给了 settle_ms 而没给 settle 时按 fixed
+      settle_ms     固定等待的毫秒数，默认 220
+      settle_timeout_ms  stable 最多等多久，默认 1500
+      focus         "auto"（默认）| 窗口写法 | false —— 见输入层，act 只是透传
       on_fail       "abort"（默认）| "continue"，只在 steps 里有意义
 
     返回的 ``ok`` 只表示流程走完；``verified`` 才表示「确实生效了」。
@@ -404,10 +440,25 @@ def act(
     # 而它明明是合法的一步（"等界面加载完"）。
     if str(spec.get("action") or "").strip().lower() in ("wait", "none", "noop") \
             and not spec.get("text") and spec.get("x") is None:
+        settle_info = None
+        ok = True
+        if str(spec.get("action")).strip().lower() == "wait" and differ is not None \
+                and str(spec.get("until") or "stable").lower() == "stable":
+            # 不给文字的 wait = 等画面停下来（加载完、动画放完）
+            try:
+                settle_info, _ = wait_stable(
+                    lambda: capture(monitor), differ, sleep=sleep, clock=clock,
+                    timeout_ms=int(spec.get("timeout_ms") or spec.get("settle_timeout_ms") or 3000),
+                    min_ms=0)
+                ok = bool(settle_info["stable"])
+            except Exception as exc:  # noqa: BLE001
+                settle_info = {"stable": None, "error": f"{type(exc).__name__}: {exc}"}
+                ok = False
+            timings["settle_ms"] = settle_info.get("elapsed_ms", 0.0)
         timings["total_ms"] = _ms(t_all, clock)
-        return {
-            "ok": True,
-            "stage": "done",
+        out = {
+            "ok": ok,
+            "stage": "done" if ok else "wait",
             "action": "none",
             "target": None,
             "target_source": None,
@@ -415,6 +466,11 @@ def act(
             "verified": None,
             "timings": timings,
         }
+        if settle_info is not None:
+            out["settle"] = {"mode": "stable", **settle_info}
+            if not ok:
+                out["error"] = "画面在时限内一直在变（动画 / 过场 / 视频），没等到静止"
+        return out
 
     act_name = str(spec.get("action") or "click").strip().lower()
     has_target = bool(spec.get("text")) or spec.get("x") is not None or isinstance(spec.get("at"), dict)
@@ -497,23 +553,42 @@ def act(
     timings["act_ms"] = _ms(t0, clock)
     result["performed"] = performed
 
-    settle = int(spec.get("settle_ms") or _DEFAULT_SETTLE_MS)
-    if settle > 0:
-        sleep(settle / 1000.0)
+    mode = settle_mode(spec, verify, can_diff=differ is not None and before is not None)
+    after = None
+    if mode == "stable":
+        t1 = _now(clock)
+        try:
+            report, after = wait_stable(
+                lambda: capture(monitor), differ, sleep=sleep, clock=clock,
+                timeout_ms=int(spec.get("settle_timeout_ms") or _DEFAULT_STABLE_TIMEOUT_MS))
+            result["settle"] = {"mode": "stable", **report}
+        except Exception as exc:  # noqa: BLE001
+            capture_error = capture_error or f"{type(exc).__name__}: {exc}"
+            result["settle"] = {"mode": "stable", "stable": None}
+        timings["settle_ms"] = _ms(t1, clock)
+    elif mode == "fixed":
+        settle = int(spec.get("settle_ms") or _DEFAULT_SETTLE_MS)
+        if settle > 0:
+            sleep(settle / 1000.0)
 
     checks: list[dict] = []
     if verify == "screen" and before is not None:
         t1 = _now(clock)
-        try:
-            after = capture(monitor)
-        except Exception as exc:  # noqa: BLE001
-            capture_error = capture_error or f"{type(exc).__name__}: {exc}"
-            after = None
+        if after is None:
+            try:
+                after = capture(monitor)
+            except Exception as exc:  # noqa: BLE001
+                capture_error = capture_error or f"{type(exc).__name__}: {exc}"
+                after = None
         if after is not None:
-            checks.append(verify_screen(
+            check = verify_screen(
                 before, after, x=target["cx"], y=target["cy"], compare=compare,
                 radius=int(spec.get("verify_radius") or 90),
-            ))
+            )
+            if differ is not None:
+                _add_regions(check, before, after, differ, target,
+                             radius=int(spec.get("verify_radius") or 90))
+            checks.append(check)
         timings["verify_ms"] = _ms(t1, clock)
 
     elif isinstance(verify, dict) and verify.get("text"):
@@ -543,6 +618,94 @@ def act(
     return result
 
 
+def settle_mode(spec: dict, verify: Any, *, can_diff: bool) -> str:
+    """动作之后怎么等：stable（等画面停）/ fixed（固定毫秒）/ none。"""
+    raw = str(spec.get("settle") or "").strip().lower()
+    if raw in ("none", "no", "off", "0"):
+        return "none"
+    if raw == "fixed":
+        return "fixed"
+    if raw == "stable":
+        return "stable" if can_diff else "fixed"
+    if spec.get("settle_ms") not in (None, "", 0):
+        return "fixed"       # 老写法：显式给了毫秒数就照办
+    if verify == "screen" and can_diff:
+        return "stable"
+    return "fixed"
+
+
+def wait_stable(
+    grab: Callable[[], Any],
+    differ: Callable[[Any, Any], dict | None],
+    *,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    timeout_ms: int = _DEFAULT_STABLE_TIMEOUT_MS,
+    min_ms: int = _STABLE_MIN_MS,
+    poll_ms: int = _STABLE_POLL_MS,
+    quiet_frames: int = 2,
+) -> tuple[dict, Any]:
+    """反复抓帧直到连续 ``quiet_frames`` 次相邻两帧几乎不变。返回 (报告, 最后一帧)。
+
+    最后一帧直接当「动作之后」那张用，不必再抓。一直在动就到时限为止，
+    ``stable: false`` —— 这不算失败，验证照常做，只是调用方该知道画面还在动。
+    """
+    t0 = _now(clock)
+    if min_ms > 0:
+        sleep(min_ms / 1000.0)
+    prev = grab()
+    frames, quiet, last_cells = 1, 0, None
+    deadline = t0 + max(timeout_ms, 0) / 1000.0
+    while quiet < quiet_frames and _now(clock) < deadline:
+        sleep(max(poll_ms, 5) / 1000.0)
+        cur = grab()
+        frames += 1
+        d = differ(prev, cur)
+        if d is None:                 # 尺寸变了（切全屏 / 改分辨率）：重新数
+            quiet = 0
+        else:
+            last_cells = d.get("changed_cells")
+            quiet = quiet + 1 if griddiff.is_quiet(d) else 0
+        prev = cur
+    return {
+        "stable": quiet >= quiet_frames,
+        "elapsed_ms": _ms(t0, clock),
+        "frames": frames,
+        "last_changed_cells": last_cells,
+    }, prev
+
+
+def _add_regions(check: dict, before: Any, after: Any,
+                 differ: Callable[[Any, Any], dict | None], target: dict, *, radius: int) -> None:
+    """给 screen 验证补上网格差分：哪些区域变了，以及据此能不能判定生效。
+
+    平均差只看点击点周围 180px 的方块：小按钮变色被方块里不变的部分稀释，
+    常常过不了阈值。网格差分按 32px 格子算，按钮那一格的变化不会被摊薄。
+    """
+    try:
+        d = differ(before, after)
+    except Exception:  # noqa: BLE001 - 差分只是补充信息，失败不影响原判定
+        return
+    if not d:
+        return
+    check["changed_cells"] = d.get("changed_cells")
+    check["changed_frac"] = d.get("changed_frac")
+    check["regions"] = d.get("regions", [])[:5]
+    if check.get("changed_enough"):
+        check["by"] = "mean"
+        return
+    cx, cy = target.get("cx"), target.get("cy")
+    if cx is not None and cy is not None:
+        hit = griddiff.near(d, cx, cy, radius)
+        if hit is not None and hit["strength"] >= _REGION_STRENGTH:
+            check["changed_enough"] = True
+            check["by"] = "region"
+            check["region"] = hit
+    elif (d.get("changed_frac") or 0) >= _SCREEN_FRAC:
+        check["changed_enough"] = True
+        check["by"] = "region"
+
+
 def _checks_pass(checks: list[dict]) -> bool:
     """所有检查都通过才算 verified。无法判定（None）一律算不通过 —— 宁可多说一句
     「没验证上」，也不要让调用方以为已经生效。
@@ -568,6 +731,7 @@ def run_steps(
     compare: Callable[..., float | None],
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    differ: Callable[[Any, Any], dict | None] | None = None,
 ) -> dict:
     """按顺序跑一串 ``act``，任一步失败即停（除非该步写了 ``on_fail: "continue"``）。
 
@@ -623,13 +787,11 @@ def run_steps(
                         continue
                     return _steps_failure(done, i, t_all, clock, "wait_before")
 
-        if str(step.get("action") or "").lower() == "wait":
+        if str(step.get("action") or "").lower() == "wait" and (step.get("text") or pre_result):
             # 纯等待步骤：不动作，只等某段文字出现。
             # 这是「等界面加载完」最靠谱的写法 —— 比 sleep 固定秒数准得多。
             wait = pre_result
             if wait is None:
-                if not step.get("text"):
-                    raise ActError(f"第 {i + 1} 步是 wait，但没给 text")
                 wait = wait_for_text(
                     str(step["text"]), step,
                     probe=probe, timeout_ms=int(step.get("timeout_ms") or 8000),
@@ -644,8 +806,10 @@ def run_steps(
                 return _steps_failure(done, i, t_all, clock, "wait")
             continue
 
+        if str(step.get("action") or "").lower() == "wait" and differ is None:
+            raise ActError(f"第 {i + 1} 步是 wait，但没给 text（等画面静止需要抓屏比对）")
         out = act(step, probe=probe, capture=capture, perform=perform,
-                  compare=compare, sleep=sleep, clock=clock)
+                  compare=compare, sleep=sleep, clock=clock, differ=differ)
         entry = {"index": i, **out}
         if pre_result is not None:
             entry["wait_before"] = pre_result

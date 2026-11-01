@@ -42,12 +42,14 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `ui_locate_marks` | Screenshot with numbered marks (and an optional named grid) so the model picks a number instead of guessing pixels |
 | `ui_locate_act` | Locate, perform an action and attempt verification |
 | `ui_locate_steps` | Run ordered steps and identify failures |
+| `ui_locate_windows` | List top-level windows (title, handle, client rect, foreground) |
+| `ui_locate_diff` | Where the screen changed since the last call, as rectangles (no image, no vision tokens) |
 | `ui_locate_frames` / `ui_locate_frame` | List or retrieve recent action frames |
 | `list_monitors` | Display sizes, origins and indices |
 | `health` | Check service readiness |
 | `ui_locate_setup` | Prepare or rebuild Python dependencies and models |
 
-The first ten entries come from MCP; the last two are Host tools. The host may prefix tool names with a namespace.
+The first twelve entries come from MCP; the last two are Host tools. The host may prefix tool names with a namespace.
 
 ~~~python
 locate_text(text="Save", monitor="primary")
@@ -67,7 +69,19 @@ ui_locate_act(cell="B2")                     # click a cell's center
 
 Besides detector boxes, marks include repeated same-size cells found by geometry alone (inventory slots, tabs, skill bars, tables; `kind: "cell"`), which UI detectors usually miss in games. Numbers belong to one marked image; pass `mark_set` to refuse a stale one.
 
-Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string or `all`. Locate again after the UI moves.
+Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string, `all`, `window:<title>` or `hwnd:<handle>`. Locate again after the UI moves.
+
+### Working with one window
+
+Pass `window=` (title or part of it, or a handle) to `ui_locate_marks`, `ui_locate_act` or `ui_locate_diff`:
+
+- Capture uses `PrintWindow`, so a game covered by the chat window is still captured (client area only). An all-black result (exclusive fullscreen, some Vulkan games) falls back to cropping a monitor capture. `UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`: `auto` (default), `printwindow`, `screen`.
+- Before sending input, the target window is brought to the foreground (SendInput only reaches the foreground window). Without `window=`, mouse actions focus the window under the point; `focus="off"` disables it. `performed.focus` reports whether it worked.
+- Marks taken with `window=` keep it, so `ui_locate_act(mark=…)` later focuses and verifies that window.
+
+### Waiting and verifying
+
+With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` without text waits for a still screen.
 
 ## Configuration and data
 

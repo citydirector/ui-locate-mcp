@@ -42,12 +42,14 @@ dsh plugin --profile web add ui-locate-mcp
 | `ui_locate_marks` | 带编号框（可叠加带名字的网格）的截图，让模型选编号而不是估像素 |
 | `ui_locate_act` | 定位后执行点击、输入、滚动等动作，并尝试验证 |
 | `ui_locate_steps` | 串行执行一组步骤，返回失败位置 |
+| `ui_locate_windows` | 列出顶层窗口（标题、句柄、客户区、是否前台） |
+| `ui_locate_diff` | 上次调用之后屏幕哪里变了，回矩形（不回图、不花视觉 token） |
 | `ui_locate_frames` / `ui_locate_frame` | 列出或取回近期动作帧 |
 | `list_monitors` | 显示器尺寸、原点和索引 |
 | `health` | 检查服务是否就绪 |
 | `ui_locate_setup` | 准备或重建 Python 环境与模型 |
 
-前十项由 MCP 服务提供，最后两项由 Host 插件提供；实际调用名称可能带宿主添加的命名空间。
+前十二项由 MCP 服务提供，最后两项由 Host 插件提供；实际调用名称可能带宿主添加的命名空间。
 
 ~~~python
 locate_text(text="保存", monitor="primary")
@@ -67,7 +69,19 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 除了检测器的框，编号还包括纯几何规则找出的「成排成列、同尺寸」格子（物品栏、标签页、技能栏、表格，`kind: "cell"`），这类东西 UI 检测器在游戏里通常认不出。编号只属于生成它的那张图；带上 `mark_set` 可拒绝过期的编号。
 
-坐标使用屏幕绝对位置，多显示器可能返回负坐标。`monitor` 可为 `primary`、索引字符串或 `all`。界面移动后应重新定位，不要长期复用旧坐标。
+坐标使用屏幕绝对位置，多显示器可能返回负坐标。`monitor` 可为 `primary`、索引字符串、`all`、`window:<标题>` 或 `hwnd:<句柄>`。界面移动后应重新定位，不要长期复用旧坐标。
+
+### 只对一个窗口操作
+
+给 `ui_locate_marks`、`ui_locate_act`、`ui_locate_diff` 传 `window=`（标题或其中一段，或句柄）：
+
+- 抓图走 `PrintWindow`，游戏被聊天窗口盖住也能抓到（只有客户区）。抓成全黑（独占全屏、部分 Vulkan 游戏）时自动改为按屏抓再裁。`UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`：`auto`（默认）、`printwindow`、`screen`。
+- 发输入前先把目标窗口切到前台（SendInput 只送给前台窗口）。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
+- 用 `window=` 标注的编号会记住这个窗口，之后 `ui_locate_act(mark=…)` 自动切前台、按窗口验证。
+
+### 等待与验证
+
+`verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 不给文字 = 等画面静止。
 
 ## 配置与数据目录
 
