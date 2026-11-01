@@ -18,6 +18,21 @@
   SendMessage  与 PostMessage 同上，但同步等目标线程处理完。目标卡住时会一起
                挂，只用于确实需要确认送达的场合。
 
+鼠标移动的两种方式（``pointer``）：
+
+  absolute   ABSOLUTE|VIRTUALDESK，一步到位。桌面程序、窗口化游戏都认。
+  relative   只送相对位移（像真鼠标那样「推」过去）。用 Raw Input / DirectInput
+             读鼠标的全屏游戏会**忽略**绝对坐标事件，只认相对位移，这时必须用它。
+             相对位移会被 Windows 的「提高指针精确度」（加速）放大，所以移动期间
+             临时把加速关掉、速度调到 1:1（只改当前会话，不写注册表，结束即恢复），
+             再按光标回读闭环修正几轮。游戏把系统光标锁死、回读不到变化时，退回
+             「开环」：按 1:1 一次推完，并在结果里标 ``tracking: false``。
+
+按键的两种方式（``keys``）：
+
+  vk         同时填虚拟键码和扫描码（默认）。普通程序认 VK，多数游戏认扫描码。
+  scancode   加 KEYEVENTF_SCANCODE，系统只看扫描码。DirectInput 游戏最稳。
+
 `delivery="auto"` 的规则：先 SendInput；若返回值显示一条都没送出去，再退回
 PostMessage。**不把「没抛异常」当作成功** —— 这两个 API 都可能返回成功而
 什么都没发生，真正的判据在 `ui_locate.act` 的验证阶段。
@@ -40,6 +55,7 @@ __all__ = [
     "drag",
     "press",
     "hotkey",
+    "hold",
     "type_text",
     "window_at",
     "describe",
@@ -118,10 +134,19 @@ _HWHEEL = 0x1000
 _ABSOLUTE = 0x8000
 _VIRTUALDESK = 0x4000
 
+_MAX_STEP = 120  # 相对移动每个事件最多推多少像素：有的游戏会截断单次过大的位移
+
 # 键盘事件标志
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
+_KEYEVENTF_SCANCODE = 0x0008
+
+# SystemParametersInfo
+_SPI_GETMOUSE = 0x0003
+_SPI_SETMOUSE = 0x0004
+_SPI_GETMOUSESPEED = 0x0070
+_SPI_SETMOUSESPEED = 0x0071
 
 # 消息参数
 _MK_LBUTTON = 0x0001
@@ -214,8 +239,45 @@ def _mouse_event(flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> _INPUT:
     return item
 
 
+def key_mode(want: str | None = None) -> str:
+    """vk / scancode。参数 > 环境变量 UI_LOCATE_KEYS > runtime.json "keys" > vk。"""
+    return _mode(want, "UI_LOCATE_KEYS", "keys", ("vk", "scancode"), "vk")
+
+
+def pointer_mode(want: str | None = None) -> str:
+    """absolute / relative。参数 > UI_LOCATE_POINTER > runtime.json "pointer" > absolute。"""
+    return _mode(want, "UI_LOCATE_POINTER", "pointer", ("absolute", "relative"), "absolute")
+
+
+def _mode(want: str | None, env: str, key: str, allowed: tuple[str, ...], default: str) -> str:
+    import os
+
+    value = str(want or "").strip().lower()
+    if not value:
+        value = os.environ.get(env, "").strip().lower()
+    if not value:
+        try:
+            from ui_locate.config import runtime_settings
+
+            raw = runtime_settings().get(key)
+            value = raw.strip().lower() if isinstance(raw, str) else ""
+        except Exception:  # noqa: BLE001
+            value = ""
+    return value if value in allowed else default
+
+
+def _scan_code(vk: int) -> int:
+    """VK → 扫描码（MAPVK_VK_TO_VSC）。拿不到就 0。"""
+    if not _IS_WINDOWS:
+        return 0
+    try:
+        return int(_user32.MapVirtualKeyW(vk, 0)) & 0xFFFF
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _key_event(vk: int, up: bool = False, *, extended: bool = False,
-               unicode: bool = False) -> _INPUT:
+               unicode: bool = False, mode: str = "vk") -> _INPUT:
     item = _INPUT()
     item.type = _INPUT_KEYBOARD
     flags = 0
@@ -225,8 +287,15 @@ def _key_event(vk: int, up: bool = False, *, extended: bool = False,
         flags |= _KEYEVENTF_EXTENDEDKEY
     if unicode:
         flags |= _KEYEVENTF_UNICODE
-    # unicode 模式下 wVk 必须为 0，字符放在 wScan 里
-    item.u.ki = _KEYBDINPUT(0 if unicode else vk, vk if unicode else 0, flags, 0, 0)
+        # unicode 模式下 wVk 必须为 0，字符放在 wScan 里
+        item.u.ki = _KEYBDINPUT(0, vk, flags, 0, 0)
+        return item
+    # 扫描码总是填上：wScan=0 时，读扫描码的游戏（DirectInput / Raw Input）
+    # 收到的是「一个不存在的键」，表现为按了没反应。
+    scan = _scan_code(vk)
+    if mode == "scancode" and scan:
+        flags |= _KEYEVENTF_SCANCODE
+    item.u.ki = _KEYBDINPUT(vk, scan, flags, 0, 0)
     return item
 
 
@@ -292,15 +361,143 @@ def window_at(x: int, y: int) -> dict:
     return {"hwnd": hwnd, "class": cls, "title": buf.value}
 
 
+# ── 相对移动 ────────────────────────────────────────────────────────────────
+
+class _NoAccel:
+    """with 块内关掉鼠标加速、速度设为 10（1:1），退出时原样恢复。
+
+    fWinIni=0：只改当前会话的内存值，不写注册表、不广播 —— 进程崩了也不会把
+    用户的鼠标设置永久改掉（重新登录即复原）。
+    """
+
+    def __init__(self) -> None:
+        self.saved_accel = None
+        self.saved_speed = None
+
+    def __enter__(self) -> "_NoAccel":
+        if not _IS_WINDOWS:
+            return self
+        try:
+            accel = (ctypes.c_int * 3)()
+            if _user32.SystemParametersInfoW(_SPI_GETMOUSE, 0, accel, 0):
+                self.saved_accel = list(accel)
+                _user32.SystemParametersInfoW(_SPI_SETMOUSE, 0, (ctypes.c_int * 3)(0, 0, 0), 0)
+            speed = ctypes.c_int()
+            if _user32.SystemParametersInfoW(_SPI_GETMOUSESPEED, 0, ctypes.byref(speed), 0):
+                self.saved_speed = int(speed.value)
+                _user32.SystemParametersInfoW(_SPI_SETMOUSESPEED, 0, ctypes.c_void_p(10), 0)
+        except Exception:  # noqa: BLE001 - 关不掉加速就带着加速走，闭环会修正
+            pass
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if not _IS_WINDOWS:
+            return
+        try:
+            if self.saved_accel is not None:
+                _user32.SystemParametersInfoW(
+                    _SPI_SETMOUSE, 0, (ctypes.c_int * 3)(*self.saved_accel), 0)
+            if self.saved_speed is not None:
+                _user32.SystemParametersInfoW(
+                    _SPI_SETMOUSESPEED, 0, ctypes.c_void_p(self.saved_speed), 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _split(d: int, limit: int = _MAX_STEP) -> list[int]:
+    """把一段位移拆成每步不超过 limit 的若干步，和等于 d。"""
+    if d == 0:
+        return []
+    n = (abs(d) + limit - 1) // limit
+    base, rest = divmod(abs(d), n)
+    sign = 1 if d > 0 else -1
+    return [sign * (base + (1 if i < rest else 0)) for i in range(n)]
+
+
+def push_relative(dx: int, dy: int, send, *, pause_s: float = 0.002) -> int:
+    """把 (dx, dy) 拆成若干个相对 MOVE 事件送出去，返回送出的条数。"""
+    xs, ys = _split(dx), _split(dy)
+    n = max(len(xs), len(ys))
+    xs += [0] * (n - len(xs))
+    ys += [0] * (n - len(ys))
+    sent = 0
+    for sx, sy in zip(xs, ys):
+        sent += send(_mouse_event(_MOVE, sx, sy))
+        if pause_s:
+            time.sleep(pause_s)
+    return sent
+
+
+def seek_relative(x: int, y: int, *, read, send, rounds: int = 6,
+                  tolerance: int = 1, pause_s: float = 0.002,
+                  settle_s: float = 0.01) -> dict:
+    """用相对位移把光标推到 (x, y)，按回读闭环修正。
+
+    ``read()`` 返回 {"x","y"} 或 None；``send(event)`` 返回送出条数。拆成参数是
+    为了不在 Windows 上也能测这段控制逻辑。
+
+    - 回读得到、而且光标真的跟着动：最多 ``rounds`` 轮，误差 ≤ tolerance 就停
+    - 第一轮推完光标纹丝不动（游戏锁死 / 隐藏了系统光标）：判定为不可追踪，
+      已经按 1:1 推过一次了，不再重复推，``tracking: false``
+    - 回读不到：只推一次，``tracking: null``
+    """
+    start = read()
+    if start is None:
+        # 不知道在哪，就没法算位移 —— 这种情况调用方应改用 absolute
+        return {"sent": 0, "tracking": None, "rounds": 0, "error": "读不到光标位置"}
+    cur = start
+    sent = 0
+    gain = [1.0, 1.0]  # 实测「推 1 像素光标走几像素」，用来抵消没关掉的加速
+    for i in range(rounds):
+        dx, dy = int(x) - int(cur["x"]), int(y) - int(cur["y"])
+        if abs(dx) <= tolerance and abs(dy) <= tolerance:
+            return {"sent": sent, "tracking": True, "rounds": i, "cursor": cur, "error_px": [dx, dy]}
+        cx_cmd = int(round(dx / gain[0]))
+        cy_cmd = int(round(dy / gain[1]))
+        sent += push_relative(cx_cmd, cy_cmd, send, pause_s=pause_s)
+        if settle_s:
+            time.sleep(settle_s)
+        nxt = read()
+        if nxt is None:
+            return {"sent": sent, "tracking": None, "rounds": i + 1, "cursor": None}
+        if (nxt["x"], nxt["y"]) == (cur["x"], cur["y"]):
+            return {"sent": sent, "tracking": False, "rounds": i + 1, "cursor": nxt,
+                    "note": "系统光标没跟着动（游戏锁定/隐藏了光标），已按 1:1 开环推完"}
+        for k, cmd, moved in ((0, cx_cmd, nxt["x"] - cur["x"]), (1, cy_cmd, nxt["y"] - cur["y"])):
+            if abs(cmd) >= 8 and moved * cmd > 0:  # 位移太小时估计不准，不更新
+                gain[k] = max(0.25, min(4.0, moved / cmd))
+        cur = nxt
+    dx, dy = int(x) - int(cur["x"]), int(y) - int(cur["y"])
+    return {"sent": sent, "tracking": True, "rounds": rounds, "cursor": cur, "error_px": [dx, dy]}
+
+
+def _goto(x: int, y: int, pointer: str) -> dict:
+    """按 pointer 模式把光标送到 (x, y)。relative 时返回 seek 报告，absolute 返回 {}。"""
+    if pointer != "relative":
+        nx, ny = _normalize(x, y)
+        _send(_mouse_event(_MOVE | _ABSOLUTE | _VIRTUALDESK, nx, ny))
+        return {}
+    with _NoAccel():
+        return seek_relative(x, y, read=_cursor_or_none, send=_send)
+
+
 # ── 鼠标 ────────────────────────────────────────────────────────────────────
 
-def move(x: int, y: int, *, settle_ms: int = 0) -> dict:
+def move(x: int, y: int, *, settle_ms: int = 0, pointer: str | None = None) -> dict:
     """把光标移到屏幕绝对坐标。
 
     `Moved` 只是「事件送出去了」；本机实测某些进程里 SendInput 返回成功但
     光标不动（被外层拦），所以这里额外回读一次光标，把两件事分开报。
     """
     _require()
+    mode = pointer_mode(pointer)
+    if mode == "relative":
+        rel = _goto(x, y, "relative")
+        if settle_ms:
+            time.sleep(max(0, settle_ms) / 1000.0)
+        return {"sent": rel.get("sent", 0), "x": x, "y": y, "pointer": "relative",
+                "relative": rel, "cursor": _cursor_or_none(),
+                "cursor_moved": rel.get("tracking")}
     nx, ny = _normalize(x, y)
     before = _cursor_or_none()
     sent = _send(_mouse_event(_MOVE | _ABSOLUTE | _VIRTUALDESK, nx, ny))
@@ -326,7 +523,7 @@ _BUTTON_FLAGS = {
 
 
 def click(x: int, y: int, *, button: str = "left", count: int = 1,
-          delivery: str = "auto", delay_ms: int = 40) -> dict:
+          delivery: str = "auto", delay_ms: int = 40, pointer: str | None = None) -> dict:
     """在屏幕绝对坐标点一下。
 
     delivery:
@@ -350,6 +547,19 @@ def click(x: int, y: int, *, button: str = "left", count: int = 1,
 
     down, up, mkflag, down_msg, up_msg = _BUTTON_FLAGS[btn]
     report: dict = {"x": x, "y": y, "button": btn, "count": count}
+
+    if pointer_mode(pointer) == "relative" and mode != "message":
+        # 全屏游戏：先「推」到位，再原地按下抬起。不退回窗口消息 ——
+        # 这类游戏本来就不认合成消息，退回去只会多一次无效点击。
+        rel = _goto(x, y, "relative")
+        events = []
+        for _ in range(count):
+            events.append(_mouse_event(down))
+            events.append(_mouse_event(up))
+        report["pointer"] = "relative"
+        report["relative"] = rel
+        report["send_input"] = {"sent": _send(*events), "cursor_moved": rel.get("tracking")}
+        return report
 
     if mode in ("send_input", "auto"):
         nx, ny = _normalize(x, y)
@@ -405,21 +615,19 @@ def _click_message(x: int, y: int, mkflag: int, down: int, up: int,
     }
 
 
-def scroll(x: int, y: int, *, delta: int = -3, horizontal: bool = False) -> dict:
+def scroll(x: int, y: int, *, delta: int = -3, horizontal: bool = False,
+           pointer: str | None = None) -> dict:
     """在坐标处滚轮。delta 为负是向下/向右滚，一档通常是 120。"""
     _require()
-    nx, ny = _normalize(x, y)
     amount = int(delta) * 120
     flag = _HWHEEL if horizontal else _WHEEL
-    sent = _send(
-        _mouse_event(_MOVE | _ABSOLUTE | _VIRTUALDESK, nx, ny),
-        _mouse_event(flag, nx, ny, amount),
-    )
+    _goto(x, y, pointer_mode(pointer))
+    sent = _send(_mouse_event(flag, 0, 0, amount))
     return {"sent": sent, "x": x, "y": y, "delta": delta, "horizontal": bool(horizontal)}
 
 
 def drag(x1: int, y1: int, x2: int, y2: int, *, button: str = "left",
-         steps: int = 12, duration_ms: int = 300) -> dict:
+         steps: int = 12, duration_ms: int = 300, pointer: str | None = None) -> dict:
     """从 (x1,y1) 拖到 (x2,y2)。
 
     中间必须插 MOUSEMOVE：只在起点按下、终点抬起，很多程序当成「没动过」
@@ -433,6 +641,26 @@ def drag(x1: int, y1: int, x2: int, y2: int, *, button: str = "left",
 
     steps = max(1, int(steps))
     pause = max(0, int(duration_ms)) / 1000.0 / steps
+
+    if pointer_mode(pointer) == "relative":
+        with _NoAccel():
+            rel = seek_relative(x1, y1, read=_cursor_or_none, send=_send)
+            sent = rel.get("sent", 0) + _send(_mouse_event(down))
+            # 按住后分段推：每段推一截，最后一段按回读修正余量
+            px, py = x1, y1
+            for i in range(1, steps + 1):
+                tx = int(round(x1 + (x2 - x1) * i / steps))
+                ty = int(round(y1 + (y2 - y1) * i / steps))
+                sent += push_relative(tx - px, ty - py, _send)
+                px, py = tx, ty
+                if pause:
+                    time.sleep(pause)
+            if rel.get("tracking"):
+                fix = seek_relative(x2, y2, read=_cursor_or_none, send=_send, rounds=3)
+                sent += fix.get("sent", 0)
+            sent += _send(_mouse_event(up))
+        return {"sent": sent, "from": [x1, y1], "to": [x2, y2], "button": btn,
+                "steps": steps, "pointer": "relative", "tracking": rel.get("tracking")}
 
     nx1, ny1 = _normalize(x1, y1)
     nx2, ny2 = _normalize(x2, y2)
@@ -486,30 +714,61 @@ def _parse_combo(keys: str) -> list[str]:
     return parts
 
 
-def press(key: str) -> dict:
-    """敲一下某个键（按下再抬起）。"""
+def press(key: str, *, keys_mode: str | None = None, hold_ms: int = 0) -> dict:
+    """敲一下某个键（按下再抬起）。
+
+    hold_ms > 0 时按住这么久再抬起。游戏按帧轮询键盘状态，按下抬起挨在一起
+    （同一帧内）常常整个漏掉；默认也会在中间留 30ms，约两帧。
+    """
     _require()
+    mode = key_mode(keys_mode)
     code, extended = _parse_key(key)
-    sent = _send(_key_event(code, extended=extended), _key_event(code, up=True, extended=extended))
-    return {"sent": sent, "key": key, "vk": code}
+    sent = _send(_key_event(code, extended=extended, mode=mode))
+    time.sleep(max(30, int(hold_ms or 0)) / 1000.0)
+    sent += _send(_key_event(code, up=True, extended=extended, mode=mode))
+    return {"sent": sent, "key": key, "vk": code, "keys_mode": mode,
+            "hold_ms": max(30, int(hold_ms or 0))}
 
 
-def hotkey(keys: str) -> dict:
+def hold(keys: str, *, duration_ms: int = 500, keys_mode: str | None = None) -> dict:
+    """按住一个键或一组键一段时间（"w"、"shift+w"），再一起松开。
+
+    游戏里走路、蓄力、长按确认都要这个：敲一下只走半步。
+    """
+    _require()
+    mode = key_mode(keys_mode)
+    parsed = [_parse_key(p) for p in _parse_combo(keys)]
+    duration = max(0, min(30000, int(duration_ms)))
+    sent = 0
+    try:
+        for code, extended in parsed:
+            sent += _send(_key_event(code, extended=extended, mode=mode))
+        time.sleep(duration / 1000.0)
+    finally:
+        # 无论如何都要松开：卡住的 W 键会让角色一直走下去
+        for code, extended in reversed(parsed):
+            sent += _send(_key_event(code, up=True, extended=extended, mode=mode))
+    return {"sent": sent, "keys": keys, "duration_ms": duration, "keys_mode": mode}
+
+
+def hotkey(keys: str, *, keys_mode: str | None = None) -> dict:
     """敲一组组合键，如 "ctrl+shift+s"。
 
     修饰键先按、后放，且**逆序**抬起：先放主键再放修饰键，否则在浏览器里
     常会触发「修饰键单独按下」的其他行为。
     """
     _require()
+    mode = key_mode(keys_mode)
     parts = _parse_combo(keys)
     parsed = [(_parse_key(p)) for p in parts]
 
     sent = 0
     for code, extended in parsed:
-        sent += _send(_key_event(code, extended=extended))
+        sent += _send(_key_event(code, extended=extended, mode=mode))
+    time.sleep(0.03)  # 同 press：给按帧轮询的游戏留出至少一帧
     for code, extended in reversed(parsed):
-        sent += _send(_key_event(code, up=True, extended=extended))
-    return {"sent": sent, "keys": keys, "vk": [c for c, _e in parsed]}
+        sent += _send(_key_event(code, up=True, extended=extended, mode=mode))
+    return {"sent": sent, "keys": keys, "vk": [c for c, _e in parsed], "keys_mode": mode}
 
 
 def type_text(text: str, *, delay_ms: int = 12) -> dict:
@@ -541,7 +800,8 @@ def type_text(text: str, *, delay_ms: int = 12) -> dict:
 
 def describe() -> dict:
     """当前平台的输入能力概况，给排障用。"""
-    info: dict = {"platform": sys.platform, "inject": _IS_WINDOWS}
+    info: dict = {"platform": sys.platform, "inject": _IS_WINDOWS,
+                  "pointer": pointer_mode(), "keys": key_mode()}
     if not _IS_WINDOWS:
         return info
     try:

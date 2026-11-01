@@ -97,6 +97,17 @@ The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCA
 
 `health` reports the backend each monitor last used under `screen.capture`.
 
+### Input for games
+
+Fullscreen games often read the mouse and keyboard through Raw Input / DirectInput and ignore what desktop apps accept. Each can be set per call (`pointer=`, `keys_mode=`) or globally:
+
+| Setting | Values | Use it when |
+| --- | --- | --- |
+| `UI_LOCATE_POINTER` / `"pointer"` | `absolute` (default), `relative` | Clicks land nowhere and the cursor does not move in a fullscreen game. `relative` pushes the cursor like a real mouse, with acceleration turned off for the move and closed-loop correction; `tracking: false` in the result means the game locked the system cursor and the position is a 1:1 estimate |
+| `UI_LOCATE_KEYS` / `"keys"` | `vk` (default, fills scan codes too), `scancode` | Keys do nothing in a DirectInput game |
+
+`action="hold"` keeps keys down for `duration_ms` (walking, charging). Keyboard actions need no target; their screen check compares the whole frame.
+
 ## Updating
 
 **The plugin itself is updated by the DSH plugin page; this package no longer ships
