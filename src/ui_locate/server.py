@@ -42,6 +42,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 import cv2
@@ -253,7 +254,9 @@ def _make_marks(body: dict) -> dict:
         if long_side < 900:
             up = min(3.0, 1280 / long_side)
     det_img = cv2.resize(bgr, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC) if up > 1 else bgr
-    incremental = None
+    # 始终是对象：下游可以放心读 d["incremental"]["mode"]
+    incremental: dict = {"mode": "full", "forced": True} if box is None else \
+        {"mode": "full", "forced": True, "reason": "box"}
     if box is None and _as_bool(body.get("incremental", True), True):
         res, incremental = _detect_incremental(
             (str(monitor), round(conf, 3), want_text, text_mode), det_img, origin,
@@ -280,6 +283,7 @@ def _make_marks(body: dict) -> dict:
 
     t1 = time.perf_counter()
     mstats: dict = {}
+    elements = marks_mod.drop_blank(elements, bgr, origin, stats=mstats)
     marks = marks_mod.build_marks(
         elements, frame_area=float(bgr.shape[0] * bgr.shape[1]), max_marks=max_marks,
         stats=mstats)
@@ -308,6 +312,8 @@ def _make_marks(body: dict) -> dict:
         # truncated：候选比 max_marks 多、被截掉了（不是「正好这么多」）
         "truncated": bool(mstats.get("truncated")),
         "candidates": mstats.get("candidates", len(marks)),
+        # 框里没有边缘也没有文字、被当成空白误检丢掉的个数
+        "blank_dropped": mstats.get("blank_dropped", 0),
         "kinds": dict(Counter(m.kind for m in marks)),
         "marks": [m.brief() for m in marks],
         "grid": ({"cols": len({k[0] for k in cells}), "rows": len({k[1:] for k in cells}),
@@ -557,30 +563,86 @@ def _monitor_at(x: object, y: object) -> str:
     return "primary"
 
 
-def watch_screen(body: dict) -> dict:
-    """录一小段 → 关键帧 → 只拼变化区域的一张图。见 ui_locate.watch。"""
-    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor") or "primary"
-    info, sheet, frames = watch_mod.watch(
-        lambda: screen.grab(monitor),
-        duration_ms=int(body.get("duration_ms") or 3000),
-        fps=float(body.get("fps") or 5),
-        mode="full" if str(body.get("mode") or "") == "full" else "regions",
-        max_keyframes=max(1, min(int(body.get("max_keyframes") or 6), 12)),
-        cell=max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256)),
-    )
-    # 最后一帧当 /diff 的基准，也进帧缓存（之后的 marks / act 可以接着比）
-    last_t, last_img, last_org = frames[-1]
-    with _DIFF_LOCK:
-        _DIFF_BASE[str(monitor)] = (last_img, last_org, time.monotonic())
-    from ui_locate.marks import encode_jpeg
+def _watch_params(body: dict) -> dict:
+    return {
+        "mode": "full" if str(body.get("mode") or "") == "full" else "regions",
+        "max_keyframes": max(1, min(int(body.get("max_keyframes") or 6), 12)),
+        "cell": max(8, min(int(body.get("cell") or griddiff.DEFAULT_CELL), 256)),
+    }
 
-    ok, buf = encode_jpeg(sheet)
+
+def _watch_result(monitor: object, frames: list, body: dict, record_ms: float) -> dict:
+    """帧 → 关键帧 + 拼图 → 返回体。/watch 和 act 的 watch_ms 共用，结构一致。"""
+    from ui_locate.marks import encode_jpeg
     import base64
 
+    info, sheet = watch_mod.summarize(frames, record_ms=record_ms, **_watch_params(body))
+    # 最后一帧当 /diff 的基准（之后的 diff 可以接着比）
+    _, last_img, last_org = frames[-1]
+    with _DIFF_LOCK:
+        _DIFF_BASE[str(monitor)] = (last_img, last_org, time.monotonic())
+    t0 = time.perf_counter()
+    ok, buf = encode_jpeg(sheet)
+    tm = info.setdefault("timings", {})
+    tm["encode_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    tm["total_ms"] = round(sum(tm.get(k, 0.0) for k in ("record_ms", "analyze_ms", "render_ms",
+                                                          "encode_ms")), 1)
     info.update(ok=True, monitor=str(monitor), capture=_capture_last(monitor),
                 image_format="jpeg", image_size=[sheet.shape[1], sheet.shape[0]])
     info["image_b64"] = base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
     return info
+
+
+def watch_screen(body: dict) -> dict:
+    """录一小段 → 关键帧 → 只拼变化区域的一张图。见 ui_locate.watch。"""
+    monitor = window_mod.as_spec(body.get("window")) or body.get("monitor") or "primary"
+    t0 = time.perf_counter()
+    frames = watch_mod.record(lambda: screen.grab(monitor),
+                              duration_ms=int(body.get("duration_ms") or 3000),
+                              fps=float(body.get("fps") or 5))
+    return _watch_result(monitor, frames, body, (time.perf_counter() - t0) * 1000)
+
+
+def _watch_monitor_for_act(data: dict) -> object:
+    """act 前就得决定录哪块屏（目标还没找）：window > monitor > 坐标所在屏 > primary。"""
+    spec = window_mod.as_spec(data.get("window"))
+    if spec:
+        return spec
+    if data.get("monitor"):
+        return data["monitor"]
+    try:
+        if data.get("x") is not None and data.get("y") is not None:
+            return _monitor_at(data["x"], data["y"])
+    except Exception:  # noqa: BLE001
+        pass
+    return "primary"
+
+
+def act_with_watch(data: dict, run: "Callable[[], dict]") -> dict:
+    """动作**发出之前**开录，动作 + settle 结束后再收帧分析（不再丢掉动作过程）。
+
+    录制时长 = max(watch_ms, 动作 + settle 实际用时)。
+    """
+    mon = _watch_monitor_for_act(data)
+    params = {"mode": data.get("watch_mode"), "max_keyframes": data.get("watch_max_keyframes")}
+    rec = watch_mod.Recorder(lambda: screen.grab(mon), min_ms=int(data["watch_ms"]),
+                             fps=float(data.get("watch_fps") or 5)).start()
+    try:
+        res = run()
+    except BaseException:
+        rec.finish()
+        raise
+    if isinstance(res, dict):
+        try:
+            frames = rec.finish()
+            w = _watch_result(mon, frames, params, rec.record_ms)
+            w["started"] = "before_action"
+        except Exception as e:  # noqa: BLE001 —— 录像失败不该把已经做完的动作报成失败
+            w = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        res["watch"] = w
+    else:
+        rec.finish()
+    return res
 
 
 def _as_bool(v: object, default: bool) -> bool:
@@ -1373,7 +1435,9 @@ class Handler(BaseHTTPRequestHandler):
                     "detect_ms": stats["detect_ms"],
                     "ocr_ms": stats["ocr_ms"],
                     "total_ms": stats["total_ms"],
-                    # 与 /marks、/act 同构；顶层三个字段保留，旧调用方不受影响
+                    # 与 /marks、/act 同构。顶层 detect_ms / ocr_ms / total_ms 已废弃，
+                    # 只为旧调用方保留，下个大版本移除 —— 请读 timings
+                    "deprecated": ["detect_ms", "ocr_ms", "total_ms"],
                     "timings": {"detect_ms": stats["detect_ms"], "ocr_ms": stats["ocr_ms"],
                                 "total_ms": stats["total_ms"]},
                     "elements": elements,
@@ -1455,16 +1519,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 with capture_mod.choose(data.get("capture")):
-                    res = self._act(data, multi=u.path == "/steps")
-                    if data.get("watch_ms") and isinstance(res, dict):
-                        # 动手之后接着看一小段：结果怎么演变的（弹窗、角色移动、冷却）
-                        tgt = res.get("target") or {}
-                        mon = window_mod.as_spec(data.get("window")) or data.get("monitor") \
-                            or (_monitor_at(tgt["cx"], tgt["cy"]) if tgt.get("cx") is not None
-                                else "primary")
-                        res["watch"] = watch_screen({
-                            "monitor": mon, "duration_ms": data["watch_ms"],
-                            "fps": data.get("watch_fps") or 5, "mode": data.get("watch_mode")})
+                    multi = u.path == "/steps"
+                    if data.get("watch_ms"):
+                        # 动作前开录、动作后收：过程（拖动、弹窗、角色移动）都在里面
+                        res = act_with_watch(data, lambda: self._act(data, multi=multi))
+                    else:
+                        res = self._act(data, multi=multi)
                     self._send(200, res)
             except act_mod.ActError as e:
                 # 指令本身写错了，重试没有意义 → 400 而不是 500

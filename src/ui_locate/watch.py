@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+import contextvars
+import threading
 import time
 from typing import Any, Callable
 
@@ -64,6 +66,73 @@ def record(
         if wait > 0:
             sleep(wait)
     return frames
+
+
+class Recorder:
+    """后台录制：动作**发出之前**开录，动作和 settle 都结束后再收。
+
+    ``ui_locate_act(..., watch_ms=)`` 用它。以前是动作做完（settle 已经等到画面
+    静止）才开始录，过程全丢，只剩一张静止帧。
+
+    停止条件：调过 :meth:`finish` **且**已录满 ``min_ms``；或到 ``MAX_DURATION_MS``。
+    抓帧在自己的线程里跑，用 ``contextvars.copy_context`` 继承请求级的 capture 选择。
+    """
+
+    def __init__(self, grab: Callable[[], tuple[np.ndarray, tuple[int, int]]], *,
+                 min_ms: int = 1500, fps: float = 5.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._grab = grab
+        self._min_ms = max(0, min(int(min_ms), MAX_DURATION_MS))
+        self._interval = 1.0 / max(0.5, min(float(fps), MAX_FPS))
+        self._clock = clock
+        self._stop = threading.Event()
+        self._first = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.frames: list[tuple[float, np.ndarray, tuple[int, int]]] = []
+        self.error: BaseException | None = None
+        self.t0 = 0.0
+        self.record_ms = 0.0
+
+    def start(self, first_timeout: float = 1.0) -> "Recorder":
+        """起线程，等到第一帧抓到（或超时）再返回 —— 保证第一帧是动作之前的画面。"""
+        ctx = contextvars.copy_context()
+        self._thread = threading.Thread(target=ctx.run, args=(self._run,),
+                                        name="ui-locate-watch", daemon=True)
+        self._thread.start()
+        self._first.wait(first_timeout)
+        return self
+
+    def _run(self) -> None:
+        self.t0 = self._clock()
+        n = 0
+        try:
+            while True:
+                t = self._clock()
+                bgr, origin = self._grab()
+                self.frames.append((round((t - self.t0) * 1000, 1), bgr, tuple(origin)))
+                self._first.set()
+                n += 1
+                el = (self._clock() - self.t0) * 1000
+                if el >= MAX_DURATION_MS or (self._stop.is_set() and el >= self._min_ms):
+                    break
+                wait = self.t0 + n * self._interval - self._clock()
+                if wait > 0:
+                    # stop 只是「可以停了」；没录满 min_ms 照样按节拍继续
+                    self._stop.wait(wait) if el + wait * 1000 >= self._min_ms else time.sleep(wait)
+        except BaseException as e:  # noqa: BLE001
+            self.error = e
+        finally:
+            self.record_ms = round((self._clock() - self.t0) * 1000, 1)
+            self._first.set()
+
+    def finish(self, timeout: float | None = None) -> list[tuple[float, np.ndarray, tuple[int, int]]]:
+        """示意可以停了，等录满 min_ms 后返回全部帧。一帧都没抓到 → 抛出抓帧的错。"""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout if timeout is not None else MAX_DURATION_MS / 1000 + 5)
+        if not self.frames:
+            raise self.error or RuntimeError("watch: 没抓到任何帧")
+        return list(self.frames)
 
 
 def _shrink_factor(w: int) -> int:
@@ -268,7 +337,28 @@ def tiles_for(frames: list, info: dict, mode: str = "regions", pad: int = 16) ->
                 continue
             crop = _fit(img[y1:y2, x1:x2], 420, 300)
             tiles.append(_label(crop, f"{tag} @{x1 + org[0]},{y1 + org[1]} {x2 - x1}x{y2 - y1}", color))
+    # regions 模式只有裁片时，连续几张裁片看不出「挪了多远、往哪走」：
+    # 最后补一张末帧整帧缩略图，变化区域用框标出来，当全局参照
+    if mode != "full" and len(keys) > 1 and tiles_need_end(keys):
+        k = keys[-1]
+        t, img, org = frames[k["index"]]
+        ref = img.copy()
+        for n, kk in enumerate(keys[1:], start=1):
+            c = _COLORS[n % len(_COLORS)]
+            for r in kk.get("regions") or []:
+                x1, y1 = r["x"] - org[0], r["y"] - org[1]
+                cv2.rectangle(ref, (x1, y1), (x1 + r["w"], y1 + r["h"]), c, max(2, img.shape[1] // 640))
+                cv2.putText(ref, f"K{n}", (x1 + 2, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+                            max(0.5, img.shape[1] / 1600), c, max(1, img.shape[1] // 960), cv2.LINE_AA)
+        tiles.append(_label(_fit(ref, SHEET_W, 720), f"K{len(keys) - 1} t={t / 1000:.1f}s end (boxes = K regions)",
+                            (255, 255, 255)))
     return tiles
+
+
+def tiles_need_end(keys: list[dict]) -> bool:
+    """最后一个关键帧已经贴了整帧就不用再补。"""
+    k = keys[-1]
+    return not (k.get("resized") or k["changed_frac"] >= FULLFRAME_FRAC or not k["regions"])
 
 
 def contact_sheet(tiles: list[np.ndarray], width: int = SHEET_W) -> np.ndarray:
@@ -296,6 +386,21 @@ def contact_sheet(tiles: list[np.ndarray], width: int = SHEET_W) -> np.ndarray:
     return sheet
 
 
+def summarize(frames: list, *, mode: str = "regions", max_keyframes: int = 6,
+              record_ms: float = 0.0, **analyze_kw: Any) -> tuple[dict, np.ndarray]:
+    """已录好的帧 → (info, 拼图)。watch() 和后台 Recorder 共用。"""
+    t1 = time.perf_counter()
+    info = analyze(frames, max_keyframes=max_keyframes, **analyze_kw)
+    t2 = time.perf_counter()
+    sheet = contact_sheet(tiles_for(frames, info, mode=mode))
+    t3 = time.perf_counter()
+    info["mode"] = mode
+    info["timings"] = {"record_ms": round(float(record_ms), 1),
+                       "analyze_ms": round((t2 - t1) * 1000, 1),
+                       "render_ms": round((t3 - t2) * 1000, 1)}
+    return info, sheet
+
+
 def watch(
     grab: Callable[[], tuple[np.ndarray, tuple[int, int]]],
     *,
@@ -310,13 +415,7 @@ def watch(
     """录 → 挑关键帧 → 拼图。返回 (info, 拼图, 原始帧)。"""
     t0 = time.perf_counter()
     frames = record(grab, duration_ms=duration_ms, fps=fps, sleep=sleep, clock=clock)
-    t1 = time.perf_counter()
-    info = analyze(frames, max_keyframes=max_keyframes, **analyze_kw)
-    t2 = time.perf_counter()
-    sheet = contact_sheet(tiles_for(frames, info, mode=mode))
-    t3 = time.perf_counter()
-    info["mode"] = mode
-    info["timings"] = {"record_ms": round((t1 - t0) * 1000, 1),
-                       "analyze_ms": round((t2 - t1) * 1000, 1),
-                       "render_ms": round((t3 - t2) * 1000, 1)}
+    record_ms = (time.perf_counter() - t0) * 1000
+    info, sheet = summarize(frames, mode=mode, max_keyframes=max_keyframes,
+                            record_ms=record_ms, **analyze_kw)
     return info, sheet, frames

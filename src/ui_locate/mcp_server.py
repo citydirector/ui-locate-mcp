@@ -566,9 +566,10 @@ def ui_locate_act(
                   身份启动 DSH 再试
       keys_mode   按键怎么送：vk（默认）/ scancode（DirectInput 游戏按键没反应时用）
       duration_ms action=hold 按住多久（毫秒，默认 500）；action=press 时表示按住多久再松
-      watch_ms    动作之后接着**看一小段**（毫秒，0=不看）：返回里多一个 watch 和一张
-                  关键帧拼图（同 ui_locate_watch），用来看结果怎么演变 —— 角色走到哪、
-                  弹窗出没出来、技能是否进了冷却。「看 → 做 → 看」一次调用走完
+      watch_ms    同时**录一小段**（毫秒，0=不录）：动作发出前开录，录满 watch_ms 且
+                  动作和 settle 都结束才停，所以拖动、弹窗、角色移动的过程都在里面。
+                  返回里多一个 watch 和一张关键帧拼图（同 ui_locate_watch）。录哪块屏：
+                  window > monitor > x,y 所在屏 > primary（目标在副屏时请给 monitor）
 
     返回 JSON：
       ok        流程是否走完（**不代表动作生效了**）
@@ -735,13 +736,15 @@ def ui_locate_watch(monitor: str = "primary", window: str = "", duration_ms: int
       window        只看一个窗口（标题或句柄），被挡住也能抓；给了就忽略 monitor
       duration_ms   录多久，默认 3000，最多 15000
       fps           每秒几帧，默认 5，最多 15
-      mode          "regions"（默认）= 第一帧全景 + 之后每个关键帧只贴变化区域裁片；
+      mode          "regions"（默认）= 第一帧全景 + 之后每个关键帧只贴变化区域裁片，
+                    最后补一张末帧全景（各关键帧的变化区域用 K 号框出，看走向和距离）；
                     "full" = 每个关键帧整帧缩略图
       max_keyframes 最多几个关键帧（含第一帧），默认 6；多了按变化量挑，保留最后一帧
 
     返回：JSON + 一张拼图。
       JSON：{static, frames, fps, keyframes:[{index, t_ms, changed_frac,
-             regions:[{x, y, w, h, cx, cy, cells, strength}]}], ambient, timings}
+             regions:[{x, y, w, h, cx, cy, cells, strength}]}], ambient,
+             timings:{record_ms, analyze_ms, render_ms, encode_ms, total_ms}}
       拼图里每块标着 K<序号> t=<秒>，裁片还标着屏幕坐标 @x,y 和尺寸。
       static=true 表示这段时间画面没变（只有第一帧）。
     """

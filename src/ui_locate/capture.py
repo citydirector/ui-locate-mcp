@@ -326,11 +326,14 @@ class Capturer:
                 if black is None:
                     black = (name, bgr, ms)
                 continue
-            with self._lock:
-                key = region.device.lower()
-                if self._sticky.get(key) != name:
-                    self._sticky_at[key] = self._clock()
-                self._sticky[key] = name
+            if choice == "auto":
+                # 只有 auto 链的结果才记成 sticky：显式 capture:"gdi" 是调用方的
+                # 一次性选择，不能把之后所有 auto 请求都提到 gdi（也绕过了 30 秒回归）
+                with self._lock:
+                    key = region.device.lower()
+                    if self._sticky.get(key) != name:
+                        self._sticky_at[key] = self._clock()
+                    self._sticky[key] = name
             shot = Shot(bgr, name, ms, tried)
             self._remember(region, shot, errors)
             return shot
