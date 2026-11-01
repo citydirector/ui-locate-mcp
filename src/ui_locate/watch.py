@@ -6,7 +6,7 @@
 
 这里的做法：
 
-1. 按 ``fps`` 连抓 ``duration_ms``（dxgi 一帧 2~3ms，PrintWindow ~28ms）。
+1. 按 ``fps`` 连抓 ``duration_ms``（dxgi 一帧 2~3ms；抓窗口走 WGC 常驻会话取最新帧，PrintWindow ~28ms）。
 2. 网格差分（griddiff）挑关键帧：和上一张关键帧相比变化格够多才算新关键帧。
    画面不动 → 只有第一帧。
 3. 先扫一遍相邻帧，找出「几乎每一帧都在变」的格子（水面、粒子、时钟）——
