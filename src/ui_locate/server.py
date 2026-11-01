@@ -506,6 +506,39 @@ def plan_incremental(regions: list[dict], cached: list[dict], size: tuple[int, i
     return rects, keep
 
 
+# partial 预估耗时 ≥ full 的这个比例就直接 full
+INCREMENTAL_MIN_SAVING = 0.8
+
+
+def estimate_partial_cost(rects: list[tuple], cached: dict, size: tuple[int, int]) -> dict:
+    """预估这次 partial 要花多少（对比上一次 full 的实测）。
+
+    检测 ≈ full_detect × min(1, 重跑面积占比 + 每块 5% 固定开销)；
+    OCR  ≈ full_ocr × 重跑矩形里旧文字元素的占比（OCR 开销跟着文字走，不跟面积走）。
+    没有 full 的实测（缓存来自旧版本）→ 只给占比，不给毫秒。
+    """
+    W, H = size
+    area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects) / float(max(1, W * H))
+    texts = [e for e in cached["elements"] if (e.get("text") or "").strip()]
+    hit = [e for e in texts
+           if any(_rects_overlap(r, (e["x1"], e["y1"], e["x2"], e["y2"])) for r in rects)]
+    text_frac = len(hit) / len(texts) if texts else 0.0
+    out: dict = {"area_frac": round(area, 4), "text_frac": round(text_frac, 4),
+                 "rects": len(rects)}
+    fc = cached.get("full_cost")
+    if fc:
+        det = fc["detect_ms"] * min(1.0, area + 0.05 * len(rects))
+        ocr = fc["ocr_ms"] * text_frac
+        # 上一次 partial 的「实测 / 预估」：OCR 每块有固定开销等预估不到的部分，
+        # 用实测校准（EMA），同一页面第二次起就准了
+        calib = float(cached.get("calib") or 1.0)
+        out.update(full_ms=round(fc["detect_ms"] + fc["ocr_ms"], 1),
+                   raw_partial_ms=round(det + ocr, 1), calibration=round(calib, 3),
+                   partial_ms=round((det + ocr) * calib, 1))
+        out["saving"] = round(1 - out["partial_ms"] / out["full_ms"], 3) if out["full_ms"] else 0.0
+    return out
+
+
 def _detect_incremental(key: tuple, img: np.ndarray, origin: tuple[int, int], *,
                         conf: float, want_text: bool, text_mode: str) -> tuple[dict, dict]:
     assert ENGINE is not None
@@ -516,6 +549,9 @@ def _detect_incremental(key: tuple, img: np.ndarray, origin: tuple[int, int], *,
         cached = _MARKS_CACHE.get(key)
     info: dict = {"mode": "full"}
     res = None
+    rects = keep = None
+    d = {"changed_cells": 0, "changed_frac": 1.0}
+    calib = float((cached or {}).get("calib") or 1.0)
     if cached and cached["bgr"].shape == img.shape and tuple(cached["origin"]) == tuple(origin) \
             and now - cached["t"] < INCREMENTAL_MAX_AGE_S:
         t0 = time.perf_counter()
@@ -528,6 +564,15 @@ def _detect_incremental(key: tuple, img: np.ndarray, origin: tuple[int, int], *,
         elif d["changed_frac"] <= INCREMENTAL_MAX_FRAC:
             rects, keep = plan_incremental(d["regions"], cached["elements"],
                                            (img.shape[1], img.shape[0]))
+            est = estimate_partial_cost(rects, cached, (img.shape[1], img.shape[0]))
+            info["estimated_cost"] = est
+            if est.get("partial_ms") is not None and est["partial_ms"] >= \
+                    INCREMENTAL_MIN_SAVING * est["full_ms"]:
+                # 文字密集页上变化压在文字上：重跑的 OCR 和整页差不多，partial 只多一层
+                # 拼接的风险，直接 full
+                info["reason"] = "partial_not_cheaper"
+                rects = None
+        if d["changed_cells"] and d["changed_frac"] <= INCREMENTAL_MAX_FRAC and rects is not None:
             elements = copy.deepcopy(keep)
             det_ms = ocr_ms = 0.0
             for (x1, y1, x2, y2) in rects:
@@ -543,12 +588,21 @@ def _detect_incremental(key: tuple, img: np.ndarray, origin: tuple[int, int], *,
                         redone_frac=round(sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects)
                                           / float(img.shape[0] * img.shape[1]), 4))
             res = {"elements": elements, "detect_ms": round(det_ms, 2), "ocr_ms": round(ocr_ms, 2)}
+            raw = info.get("estimated_cost", {}).get("raw_partial_ms")
+            if raw:
+                actual = det_ms + ocr_ms
+                info["actual_ms"] = round(actual, 1)
+                calib = 0.5 * float(cached.get("calib") or 1.0) + 0.5 * actual / max(raw, 1.0)
+    full_cost = (cached or {}).get("full_cost")
     if res is None:
         res = ENGINE.run(img, conf=conf, tiled=True, text=want_text, text_mode=text_mode,
                          origin=(0, 0))
+        full_cost = {"detect_ms": float(res.get("detect_ms") or 0.0),
+                     "ocr_ms": float(res.get("ocr_ms") or 0.0)}
     with _MARKS_CACHE_LOCK:
         _MARKS_CACHE[key] = {"bgr": img, "origin": tuple(origin), "t": now,
-                             "elements": copy.deepcopy(res["elements"])}
+                             "elements": copy.deepcopy(res["elements"]), "full_cost": full_cost,
+                             "calib": calib}
     return res, info
 
 

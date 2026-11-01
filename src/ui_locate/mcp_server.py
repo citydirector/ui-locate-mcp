@@ -510,6 +510,8 @@ def ui_locate_act(
     keys_mode: str = "",
     duration_ms: int = 0,
     watch_ms: int = 0,
+    watch_mode: str = "regions",
+    watch_max_keyframes: int = 6,
 ):
     """定位 → 动作 → 验证，**一次调用走完**。
 
@@ -570,6 +572,8 @@ def ui_locate_act(
                   动作和 settle 都结束才停，所以拖动、弹窗、角色移动的过程都在里面。
                   返回里多一个 watch 和一张关键帧拼图（同 ui_locate_watch）。录哪块屏：
                   window > monitor > x,y 所在屏 > primary（目标在副屏时请给 monitor）
+      watch_mode  "regions"（默认）| "full"，同 ui_locate_watch 的 mode
+      watch_max_keyframes  最多几个关键帧，默认 6
 
     返回 JSON：
       ok        流程是否走完（**不代表动作生效了**）
@@ -639,6 +643,8 @@ def ui_locate_act(
 
     if watch_ms:
         payload["watch_ms"] = int(watch_ms)
+        payload["watch_mode"] = watch_mode or "regions"
+        payload["watch_max_keyframes"] = int(watch_max_keyframes or 6)
     res = _post_any("/act", payload)
     watch = res.get("watch") if isinstance(res, dict) else None
     if isinstance(watch, dict) and watch.get("image_b64"):
@@ -737,7 +743,7 @@ def ui_locate_watch(monitor: str = "primary", window: str = "", duration_ms: int
       duration_ms   录多久，默认 3000，最多 15000
       fps           每秒几帧，默认 5，最多 15
       mode          "regions"（默认）= 第一帧全景 + 之后每个关键帧只贴变化区域裁片，
-                    最后补一张末帧全景（各关键帧的变化区域用 K 号框出，看走向和距离）；
+                    首帧和末帧全景并排放（末帧上各关键帧的变化区域用 K 号框出）；
                     "full" = 每个关键帧整帧缩略图
       max_keyframes 最多几个关键帧（含第一帧），默认 6；多了按变化量挑，保留最后一帧
 

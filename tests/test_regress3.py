@@ -165,5 +165,61 @@ class ServerShapeTests(unittest.TestCase):
         self.assertIn('{"mode": "full", "forced": True}', src)
 
 
+class RegionsSmallerThanFullTests(unittest.TestCase):
+    def test_many_small_changes_regions_sheet_is_smaller(self):
+        import cv2
+        base = np.full((1080, 1920, 3), 235, np.uint8)
+        for y in range(60, 1000, 28):
+            cv2.putText(base, "lorem ipsum dolor sit amet " * 3, (40, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 1)
+        frames = []
+        for i in range(15):
+            f = base.copy()
+            h = min(i, 10) * 28
+            sel = f[300:300 + h, 40:900]
+            sel[sel > 200] = 180
+            frames.append((i * 100.0, f, (0, 0)))
+        _i, reg = W.summarize(frames, mode="regions", max_keyframes=12)
+        _i, full = W.summarize(frames, mode="full", max_keyframes=12)
+        self.assertLess(reg.shape[0] * reg.shape[1], 0.75 * full.shape[0] * full.shape[1])
+
+
+@unittest.skipIf(server is None, "server 依赖不全")
+class IncrementalCostTests(unittest.TestCase):
+    def test_text_dense_page_falls_back_to_full_after_calibration(self):
+        def el(x1, y1, x2, y2, text=""):
+            return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "cx": (x1 + x2) / 2,
+                    "cy": (y1 + y2) / 2, "w": x2 - x1, "h": y2 - y1, "conf": 0.5, "text": text}
+
+        class Engine:
+            """像真机：OCR 有每次调用的大固定开销，和区域大小几乎无关。"""
+            def run(self, img, conf, tiled, text, text_mode, origin):
+                ox, oy = origin
+                els = [el(ox + x, oy + y, ox + x + 50, oy + y + 12, "t")
+                       for y in range(0, img.shape[0] - 12, 40) for x in range(0, img.shape[1] - 50, 80)]
+                return {"elements": els, "detect_ms": 10.0, "ocr_ms": 100.0}
+
+        old = server.ENGINE
+        server.ENGINE = Engine()
+        server._MARKS_CACHE.clear()
+        try:
+            key = ("0", 0.2, True, "mosaic")
+            img = np.full((480, 640, 3), 40, np.uint8)
+            server._detect_incremental(key, img, (0, 0), conf=0.2, want_text=True, text_mode="mosaic")
+            modes = []
+            for i in range(3):
+                img = img.copy()
+                img[200:230, 100 + i * 100:160 + i * 100] = 220 - i * 30
+                _r, info = server._detect_incremental(key, img, (0, 0), conf=0.2, want_text=True,
+                                                      text_mode="mosaic")
+                modes.append(info["mode"])
+                self.assertIn("estimated_cost", info)
+            self.assertEqual(modes[0], "partial")
+            self.assertIn("full", modes[1:])
+        finally:
+            server.ENGINE = old
+            server._MARKS_CACHE.clear()
+
+
 if __name__ == "__main__":
     unittest.main()
