@@ -47,11 +47,14 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
+from collections import Counter
+
 from ui_locate import config, cuda_dlls
 
 cuda_dlls.register()
 
 from ui_locate import act as act_mod  # noqa: E402
+from ui_locate import capture as capture_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
 from ui_locate import griddiff  # noqa: E402
@@ -200,6 +203,11 @@ def make_marks(body: dict) -> dict:
     在整屏检测里经常被漏掉或并成一个框，放大 2~3 倍后检测器就能一个个分开，
     标注图也跟着放大，编号不会糊在一起。
     """
+    with capture_mod.choose(body.get("capture")):
+        return _make_marks(body)
+
+
+def _make_marks(body: dict) -> dict:
     assert ENGINE is not None
     t0 = time.perf_counter()
     monitor = window_mod.as_spec(body.get("window")) or body.get("monitor", "primary")
@@ -264,8 +272,10 @@ def make_marks(body: dict) -> dict:
         it["h"] = it["h"] / up
 
     t1 = time.perf_counter()
+    mstats: dict = {}
     marks = marks_mod.build_marks(
-        elements, frame_area=float(bgr.shape[0] * bgr.shape[1]), max_marks=max_marks)
+        elements, frame_area=float(bgr.shape[0] * bgr.shape[1]), max_marks=max_marks,
+        stats=mstats)
     cells = marks_mod.grid_cells(origin, (bgr.shape[1], bgr.shape[0]), grid)
     image, scale = marks_mod.render(
         bgr, marks, origin, max_side=max_side,
@@ -288,6 +298,10 @@ def make_marks(body: dict) -> dict:
         "box": list(box) if box else None,
         "scale": round(scale, 4),
         "count": len(marks),
+        # truncated：候选比 max_marks 多、被截掉了（不是「正好这么多」）
+        "truncated": bool(mstats.get("truncated")),
+        "candidates": mstats.get("candidates", len(marks)),
+        "kinds": dict(Counter(m.kind for m in marks)),
         "marks": [m.brief() for m in marks],
         "grid": ({"cols": len({k[0] for k in cells}), "rows": len({k[1:] for k in cells}),
                   "cell_w": round(bgr.shape[1] / len({k[0] for k in cells}), 1),
@@ -526,6 +540,25 @@ def detect_monitors(
     return ordered, stats
 
 
+def _attach_uipi(out: dict, hwnd: int) -> None:
+    try:
+        gate = window_mod.uipi(hwnd)
+    except Exception:  # noqa: BLE001 - 权限查不到不影响动作
+        return
+    if gate.get("blocked") is not None:
+        out["uipi"] = gate
+
+
+def _foreground_uipi() -> dict | None:
+    """没切前台（纯键盘、focus=off）时，按当前前台窗口判断。"""
+    if not actions.available():
+        return None
+    try:
+        return window_mod.uipi(window_mod.foreground())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -727,7 +760,9 @@ class Handler(BaseHTTPRequestHandler):
                 hwnd = window_mod.root_at(int(x), int(y))
                 if not hwnd or window_mod.is_shell(hwnd):
                     return None
-            return window_mod.focus(hwnd)
+            out = window_mod.focus(hwnd)
+            _attach_uipi(out, hwnd)
+            return out
         except Exception as exc:  # noqa: BLE001 - 切前台失败不拦输入，只报告
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -735,8 +770,14 @@ class Handler(BaseHTTPRequestHandler):
         """把动作名分派到输入层（`ui_locate.actions`），之前先确保目标窗口在前台。"""
         focus = self._focus(action_name, params)
         out = self._dispatch(action_name, params)
-        if focus is not None and isinstance(out, dict):
-            out["focus"] = focus
+        if isinstance(out, dict):
+            if focus is not None:
+                out["focus"] = focus
+            gate = (focus or {}).get("uipi") or _foreground_uipi()
+            if gate and gate.get("blocked"):
+                # 系统照样回「送出了 N 条」，实际被丢了 —— 必须显式说出来
+                out["uipi"] = gate
+                out["warning"] = gate.get("hint")
         return out
 
     def _dispatch(self, action_name: str, params: dict) -> dict:
@@ -988,6 +1029,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ocr": ENGINE.use_ocr,
                 "warmup_ms": round(ENGINE.warmup_ms, 1),
                 "screen": screen.describe(),
+                # 本服务的完整性级别：medium 时操作不了以管理员运行的窗口（UIPI）
+                "integrity": window_mod.self_integrity(),
             })
             return
 
@@ -998,7 +1041,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/windows":
             try:
                 title = (q.get("title") or [""])[0]
-                wins = [w.as_dict() for w in window_mod.list_windows(title)]
+                wins = [{**w.as_dict(), "integrity": window_mod.process_integrity(w.pid)}
+                        for w in window_mod.list_windows(title)]
                 self._send(200, {"ok": True, "count": len(wins), "windows": wins})
             except Exception as e:
                 self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
@@ -1170,10 +1214,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 mon = body.get("monitor") if "monitor" in body else (q.get("monitor") or [None])[0]
-                elements, stats = detect_monitors(
-                    mon, conf, iou, tiled, max_side, overlap,
-                    want_text, text_mode, smart,
-                )
+                with capture_mod.choose(pick("capture", None)):
+                    elements, stats = detect_monitors(
+                        mon, conf, iou, tiled, max_side, overlap,
+                        want_text, text_mode, smart,
+                    )
                 self._send(200, {
                     "size": stats["monitors"][0]["size"] if len(stats["monitors"]) == 1
                     else None,
@@ -1186,6 +1231,9 @@ class Handler(BaseHTTPRequestHandler):
                     "detect_ms": stats["detect_ms"],
                     "ocr_ms": stats["ocr_ms"],
                     "total_ms": stats["total_ms"],
+                    # 与 /marks、/act 同构；顶层三个字段保留，旧调用方不受影响
+                    "timings": {"detect_ms": stats["detect_ms"], "ocr_ms": stats["ocr_ms"],
+                                "total_ms": stats["total_ms"]},
                     "elements": elements,
                 })
             except Exception as e:
@@ -1224,14 +1272,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ValueError("请求体必须是 JSON 对象")
                 if u.path == "/diff":
-                    self._send(200, diff_since(body))
+                    with capture_mod.choose(body.get("capture")):
+                        self._send(200, diff_since(body))
                 else:
                     spec = window_mod.as_spec(body.get("window"))
                     if not spec:
                         raise ValueError("要给 window（标题或句柄）")
                     win = window_mod.resolve(spec)
-                    self._send(200, {"ok": True, "window": win.as_dict(),
-                                     "focus": window_mod.focus(win.hwnd)})
+                    focus = window_mod.focus(win.hwnd)
+                    _attach_uipi(focus, win.hwnd)
+                    self._send(200, {"ok": True, "window": win.as_dict(), "focus": focus})
             except (ValueError, window_mod.WindowError) as e:
                 self._send(400, {"ok": False, "error": str(e)})
             except Exception as e:
@@ -1249,7 +1299,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": f"{type(e).__name__}: {e}"})
                 return
             try:
-                self._send(200, self._act(data, multi=u.path == "/steps"))
+                with capture_mod.choose(data.get("capture")):
+                    self._send(200, self._act(data, multi=u.path == "/steps"))
             except act_mod.ActError as e:
                 # 指令本身写错了，重试没有意义 → 400 而不是 500
                 self._send(400, {"ok": False, "error": str(e)})

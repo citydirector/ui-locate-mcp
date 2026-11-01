@@ -437,8 +437,10 @@ def ui_locate_marks(
       grid       叠加网格，长边切几格（短边按比例），0 = 不画（默认）。8 左右合适
 
     返回：一段 JSON + 一张标注图。
-      JSON：{mark_set, count, marks:[{id, text?, cx, cy, w, h}], origin, box,
-             scale, timings}
+      JSON：{mark_set, count, truncated, candidates, kinds, marks:[{id, text?, cx, cy, w, h}],
+             origin, box, scale, timings}
+             truncated=true 表示候选比 max_marks 多、被截掉了（candidates 是截前总数）：
+             要的东西可能没标上，用 box 只看那一块
       图上每个框左上角（放不下时在右上 / 下方 / 框内）有编号标签，颜色与
       框一致。
 
@@ -509,7 +511,10 @@ def ui_locate_act(
     带回来。
 
     参数：
-      text        要操作的目标文字（推荐）。界面一变坐标就变，文字不变。
+      text        要操作的**目标**文字（推荐）。界面一变坐标就变，文字不变。
+                  ⚠ text 永远是「点哪儿」，不是「输入什么」：action=type 要输入的内容
+                  写在 value。{"action":"type","text":"abc"} 的意思是「找到屏幕上叫 abc
+                  的东西，再往里打 value」
                   也可以不给 text，改用 mark（编号）或 x + y（坐标）。
                   纯键盘动作（press / hold / hotkey / type）可以什么目标都不给，
                   此时 verify="screen" 改为整屏比对
@@ -541,7 +546,7 @@ def ui_locate_act(
                   消息，后台可用）/ auto（先前者，光标没动再试后者）
       to          action=drag 的终点：文字、"x,y" 或编号 "#17"
       delta       action=scroll 的幅度，负数向下
-      value       action=type 要输入的文字
+      value       action=type 要输入的文字（不是 text！）
       key / keys  action=press 的单键，或 action=hotkey 的组合键（"ctrl+s"）
       verify_text verify="text" 时要等的文字
       verify_timeout_ms  等文字的时限，默认 3000
@@ -549,6 +554,9 @@ def ui_locate_act(
                   **全屏游戏点了没反应、光标不动时换 relative** —— 用 Raw Input 的游戏
                   只认相对位移。结果里 relative.tracking=false 表示游戏锁住了系统光标，
                   位置是按 1:1 估算的，务必看 verify 或重新截图确认
+      结果里出现 performed.uipi.blocked=true / warning：目标窗口以管理员运行而本服务
+                  不是，键鼠会被系统**静默丢弃**（SendInput 照样回「送出了」）。以管理员
+                  身份启动 DSH 再试
       keys_mode   按键怎么送：vk（默认）/ scancode（DirectInput 游戏按键没反应时用）
       duration_ms action=hold 按住多久（毫秒，默认 500）；action=press 时表示按住多久再松
 

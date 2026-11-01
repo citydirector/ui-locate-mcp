@@ -109,7 +109,9 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 | `wgc` | Windows Graphics Capture（需要 `dxcam[winrt]`） | 混合显卡笔记本上 DXGI 报 `UNSUPPORTED` 时 |
 | `gdi` | BitBlt | 兼容性最好；全屏游戏常抓成全黑 |
 
-`health` 的 `screen.capture` 会显示每块屏上次用的方式。
+`health` 的 `screen.capture` 会显示每块屏上次用的方式。记住的降级后端每 30 秒会重新试一次 DXGI，一帧抽风不会让这块屏永久降级。HTTP 请求（`/marks`、`/act`、`/steps`、`/diff`、`/detect`）也可以带 `"capture": "gdi"` 之类，只对这一次生效。
+
+目标窗口以管理员运行而服务不是时，Windows 会静默丢弃模拟输入（UIPI）。`health.integrity` 显示服务自己的级别，`/windows` 显示每个窗口的，对这种窗口的动作会返回 `uipi.blocked: true` 和 warning。
 
 ### 游戏里的输入
 
