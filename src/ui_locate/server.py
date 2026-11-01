@@ -55,6 +55,7 @@ from ui_locate import act as act_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
 from ui_locate import marks as marks_mod  # noqa: E402
+from ui_locate import proposals  # noqa: E402
 from ui_locate import screen  # noqa: E402
 from ui_locate.detect import Detector, default_model  # noqa: E402
 from ui_locate.locate import grab_screen  # noqa: E402
@@ -207,6 +208,7 @@ def make_marks(body: dict) -> dict:
     max_marks = int(body.get("max_marks", 200))
     max_side = int(body.get("max_side", 1600))
     grid = int(body.get("grid") or 0)
+    want_cells = _as_bool(body.get("cells", True), True)
     fmt = "png" if str(body.get("format") or "").lower() == "png" else "jpeg"
     # box 也可以写成上一张图的网格名（"C4"）：这就是「选格 → 放大」的第二轮
     if marks_mod.is_cell_ref(body.get("box")):
@@ -240,6 +242,13 @@ def make_marks(body: dict) -> dict:
     res = ENGINE.run(det_img, conf=conf, tiled=True, text=want_text,
                      text_mode=text_mode, origin=(0, 0))
     elements = res["elements"]
+    cells_ms = 0.0
+    if want_cells:
+        # 检测器认不出的物品格 / 标签页 / 槽位：按「成排成列、同尺寸」的几何规则补
+        tc = time.perf_counter()
+        extra = proposals.drop_inside_text(proposals.structured_boxes(det_img), elements)
+        elements = elements + extra
+        cells_ms = (time.perf_counter() - tc) * 1000
     ox, oy = origin
     for it in elements:
         for k in ("x1", "x2", "cx"):
@@ -284,6 +293,7 @@ def make_marks(body: dict) -> dict:
             "grab_ms": round(grab_ms, 1),
             "detect_ms": res["detect_ms"],
             "ocr_ms": res["ocr_ms"],
+            "cells_ms": round(cells_ms, 1),
             "render_ms": round(render_ms, 1),
             "total_ms": round((time.perf_counter() - t0) * 1000, 1),
         },
