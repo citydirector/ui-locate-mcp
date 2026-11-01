@@ -316,6 +316,8 @@ def tiles_for(frames: list, info: dict, mode: str = "regions", pad: int = 16) ->
     """每个关键帧 → 若干带标签的小图。"""
     tiles: list[np.ndarray] = []
     keys = info.get("keyframes") or []
+    end_frame = mode != "full" and len(keys) > 1 and tiles_need_end(keys)
+    end_tile = None
     for n, k in enumerate(keys):
         t, img, org = frames[k["index"]]
         color = _COLORS[n % len(_COLORS)]
@@ -323,8 +325,10 @@ def tiles_for(frames: list, info: dict, mode: str = "regions", pad: int = 16) ->
         whole = n == 0 or mode == "full" or k.get("resized") \
             or k["changed_frac"] >= FULLFRAME_FRAC or not k["regions"]
         if whole:
-            tile = _fit(img, SHEET_W if n == 0 and mode != "full" else SHEET_W // 2 - PAD,
-                        720 if n == 0 and mode != "full" else 360)
+            # regions 模式：只有一帧（静止）时首帧给大图；后面还会补末帧全景时，
+            # 首帧和末帧都用半宽并排放，细节交给裁片 —— 比 full 模式省得多
+            big = n == 0 and mode != "full" and not end_frame
+            tile = _fit(img, SHEET_W if big else SHEET_W // 2 - PAD, 720 if big else 360)
             tiles.append(_label(tile, tag + (" full" if n else " start"), color))
             continue
         H, W = img.shape[:2]
@@ -339,7 +343,7 @@ def tiles_for(frames: list, info: dict, mode: str = "regions", pad: int = 16) ->
             tiles.append(_label(crop, f"{tag} @{x1 + org[0]},{y1 + org[1]} {x2 - x1}x{y2 - y1}", color))
     # regions 模式只有裁片时，连续几张裁片看不出「挪了多远、往哪走」：
     # 最后补一张末帧整帧缩略图，变化区域用框标出来，当全局参照
-    if mode != "full" and len(keys) > 1 and tiles_need_end(keys):
+    if end_frame:
         k = keys[-1]
         t, img, org = frames[k["index"]]
         ref = img.copy()
@@ -350,8 +354,10 @@ def tiles_for(frames: list, info: dict, mode: str = "regions", pad: int = 16) ->
                 cv2.rectangle(ref, (x1, y1), (x1 + r["w"], y1 + r["h"]), c, max(2, img.shape[1] // 640))
                 cv2.putText(ref, f"K{n}", (x1 + 2, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX,
                             max(0.5, img.shape[1] / 1600), c, max(1, img.shape[1] // 960), cv2.LINE_AA)
-        tiles.append(_label(_fit(ref, SHEET_W, 720), f"K{len(keys) - 1} t={t / 1000:.1f}s end (boxes = K regions)",
-                            (255, 255, 255)))
+        end_tile = _label(_fit(ref, SHEET_W // 2 - PAD, 360),
+                          f"K{len(keys) - 1} t={t / 1000:.1f}s end (boxes = K regions)", (255, 255, 255))
+        # 紧挨首帧放，首末两帧在同一行对照
+        tiles.insert(1, end_tile)
     return tiles
 
 

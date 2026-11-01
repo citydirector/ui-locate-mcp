@@ -88,7 +88,7 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 很多操作的结果没法从一张截图预判（地图会不会动、怪往哪走、技能是否在冷却）。`ui_locate_watch` 连录几秒（`duration_ms`、`fps`），用网格差分挑关键帧，只回**一张**图：第一帧全景，之后每个关键帧只贴变化区域的裁片，标着时间和屏幕坐标。画面不动只回一帧；几乎每帧都在变的格子（水面、粒子、时钟）当作环境噪声不计（结果里的 `ambient`）。`ui_locate_act(..., watch_ms=2000)` 在输入发出前开录，动作和 settle 都结束（且录满 `watch_ms`）才停，动作过程本身也录进去，「看 → 做 → 看」一次调用完成。`regions` 模式的拼图最后补一张末帧全景，各关键帧的变化区域用框标出，方向和距离一眼可见。
 
-`ui_locate_marks` 默认增量：同一块屏或同一个窗口，先和上一次比差分，没变就整份复用；变化不到 30% 时只对变化区域（以及跨在边界上的元素）重跑检测和 OCR。返回里 `incremental.mode` 是 `reuse` / `partial` / `full`；编号每次都重新分配。
+`ui_locate_marks` 默认增量：同一块屏或同一个窗口，先和上一次比差分，没变就整份复用；变化不到 30% 时只对变化区域（以及跨在边界上的元素）重跑检测和 OCR。返回里 `incremental.mode` 是 `reuse` / `partial` / `full`；编号每次都重新分配。partial 之前先预估开销（`incremental.estimated_cost`：`area_frac`、`text_frac`、`partial_ms` 对比 `full_ms`，并用上一次 partial 的实测耗时校准）。OCR 开销跟着文字走、不跟面积走，所以文字密集页上变化压在文字上时直接走 `full`（`reason: partial_not_cheaper`）。`incremental=false` 返回 `{mode: full, forced: true}`。
 
 ## 配置与数据目录
 
