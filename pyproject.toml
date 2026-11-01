@@ -21,6 +21,9 @@ dependencies = [
     "pillow",
     "rapidocr>=3.0",
     "httpx",
+    # 抓屏后端：DXGI Desktop Duplication / Windows Graphics Capture（见 capture.py）。
+    # 缺了也能跑，auto 会退回 GDI BitBlt。
+    "dxcam>=0.3,<0.4; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

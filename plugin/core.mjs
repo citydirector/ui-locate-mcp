@@ -23,6 +23,12 @@ import { execFile } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
+/**
+ * 版本同步（`--no-deps`）之后另外补装的依赖：不碰 ORT、旧环境里可能没有的包。
+ * 失败不算同步失败 —— Python 侧缺了它们会自己降级（dxcam 缺了退回 GDI 抓屏）。
+ */
+export const SYNC_EXTRA_DEPS = ["dxcam>=0.3,<0.4"]
+
 /** Python 包名，用来问 venv 里装的是哪个版本。 */
 export const PYTHON_PACKAGE = "ui-locate-mcp"
 
@@ -234,12 +240,33 @@ export async function syncPythonToBundle({
   try {
     await installIntoVenv(python, target, { exec, noDeps: true })
     const after = await installedPythonVersion(python, { exec, exists })
-    if (after === wanted) return { state: "updated", version: after }
+    if (after === wanted) {
+      const extras = await installSyncExtras(python, { exec, platform })
+      return { state: "updated", version: after, ...(extras ? { extras } : {}) }
+    }
     if (after === undefined) return { state: "failed", error: "装完之后仍然读不到版本", wanted }
     return { state: "mismatch", have: after, wanted }
   } catch (error) {
     return { state: "failed", error: String(error?.message ?? error).split("\n")[0].slice(0, 200), wanted }
   }
+}
+
+/**
+ * 版本同步后补装 `SYNC_EXTRA_DEPS`（只在 Windows）。尽力而为：失败只记一笔，
+ * 不把整次同步判成失败。
+ */
+async function installSyncExtras(python, { exec, platform }) {
+  if (platform !== "win32" || SYNC_EXTRA_DEPS.length === 0) return undefined
+  const done = []
+  for (const spec of SYNC_EXTRA_DEPS) {
+    try {
+      await installIntoVenv(python, spec, { exec })
+      done.push({ spec, ok: true })
+    } catch (error) {
+      done.push({ spec, ok: false, error: String(error?.message ?? error).split("\n")[0].slice(0, 200) })
+    }
+  }
+  return done
 }
 
 /**

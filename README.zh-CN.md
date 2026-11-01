@@ -70,6 +70,19 @@ Host 行 ID 是 `ui-locate-update`，MCP 行 ID 是 `mcp-ui-locate`。
 
 Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PROVIDER` 和 `UI_LOCATE_PORT`，详见 [config.py](src/ui_locate/config.py)。MCP 默认连接本机 7788 端口。
 
+### 抓屏方式
+
+`UI_LOCATE_CAPTURE`（或状态目录 `runtime.json` 里的 `"capture"`）决定怎么截图：
+
+| 值 | 方式 | 什么时候用 |
+| --- | --- | --- |
+| `auto`（默认） | DXGI → WGC → GDI，失败或全黑就换下一个，并按屏记住上次成功的方式 | 绝大多数情况 |
+| `dxgi` | Desktop Duplication | 最快；能抓独占全屏的 D3D 游戏 |
+| `wgc` | Windows Graphics Capture（需要 `dxcam[winrt]`） | 混合显卡笔记本上 DXGI 报 `UNSUPPORTED` 时 |
+| `gdi` | BitBlt | 兼容性最好；全屏游戏常抓成全黑 |
+
+`health` 的 `screen.capture` 会显示每块屏上次用的方式。
+
 ## 更新
 
 **插件本身由 DSH 插件页更新，本包不再自带更新器。** 依赖是 registry 形式

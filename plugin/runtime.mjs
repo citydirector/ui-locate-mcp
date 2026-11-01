@@ -67,7 +67,9 @@ export const COMMON_DEPS = [
   "pillow",
   "rapidocr>=3.0",
   "httpx",
+  "dxcam>=0.3,<0.4; sys_platform == 'win32'",
 ]
+
 
 /** CUDA 后端额外要的 nvidia 运行库（与 `pyproject.toml` 的 [cuda] 对齐）。 */
 export const CUDA_RUNTIME_DEPS = [

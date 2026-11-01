@@ -363,9 +363,13 @@ check("syncPythonToBundle：版本不同就重装并复查", async () => {
     exec,
     exists: () => true,
   })
-  assert.deepEqual(answer, { state: "updated", version: want })
+  // 版本同步之后会补装 SYNC_EXTRA_DEPS（dxcam），旧环境里没有它。
+  assert.deepEqual(answer, { state: "updated", version: want, extras: [{ spec: "dxcam>=0.3,<0.4", ok: true }] })
   const install = exec.calls.find((call) => call.command === "uv")
   assert.ok(install, "应当用 uv 装")
+  const extra = exec.calls.filter((call) => call.command === "uv")[1]
+  assert.ok(extra && extra.args.includes("dxcam>=0.3,<0.4"), "应当补装 dxcam")
+  assert.ok(!extra.args.includes("--no-deps"), "补装的包要带上它自己的依赖")
   // ROOT 是目录 URL 转来的，末尾带斜杠；target 是去掉斜杠之后拼的。
   assert.equal(install.args.at(-1), ROOT.replace(/[\\/]+$/, ""), "只装代码目录，不带任何 extras")
 })
@@ -388,6 +392,36 @@ check("syncPythonToBundle：同步版本时不碰运行时依赖，免得把用�
   // 重装依赖就可能把用户 bootstrap 时选的 backend 悄悄换掉，所以必须 --no-deps。
   assert.ok(install.args.includes("--no-deps"), install.args.join(" "))
   assert.ok(!install.args.join(" ").includes("["), "不该带任何 extras")
+})
+
+check("syncPythonToBundle：补装依赖失败不拖累同步结果", async () => {
+  const want = packageVersion()
+  let installed = false
+  const exec = mockExec((command, args) => {
+    if (command === "uv") {
+      if (args.some((a) => a.startsWith("dxcam"))) throw new Error("network down")
+      installed = true
+      return { stdout: "ok" }
+    }
+    return { stdout: `${installed ? want : "0.0.1"}\n` }
+  })
+  const answer = await syncPythonToBundle({ root: ROOT, home: "D:/h", platform: "win32", exec, exists: () => true })
+  assert.equal(answer.state, "updated")
+  assert.equal(answer.extras[0].ok, false)
+})
+
+check("syncPythonToBundle：非 Windows 不补装 dxcam", async () => {
+  const want = packageVersion()
+  let installed = false
+  const exec = mockExec((command) => {
+    if (command === "uv") {
+      installed = true
+      return { stdout: "ok" }
+    }
+    return { stdout: `${installed ? want : "0.0.1"}\n` }
+  })
+  const answer = await syncPythonToBundle({ root: ROOT, home: "/h", platform: "linux", exec, exists: () => true })
+  assert.deepEqual(answer, { state: "updated", version: want })
 })
 
 check("syncPythonToBundle：装完版本还是不对要如实说", async () => {
