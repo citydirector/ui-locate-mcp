@@ -19,6 +19,7 @@
   UI_LOCATE_PORT        服务端口，默认 7788
   UI_LOCATE_BASE        客户端连接的服务地址，默认 http://<host>:<port>
   UI_LOCATE_PROVIDER     cuda / dml / cpu / auto，默认 auto（cuda → dml → cpu）
+  UI_LOCATE_CAPTURE      auto / dxgi / wgc / gdi，默认 auto（见 capture.py）
 
 可调参数（都有默认值，一般不用改）：
   UI_LOCATE_MIN_EDGE     跳过空白块的边缘密度下限，默认 0.0008

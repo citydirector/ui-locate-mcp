@@ -894,6 +894,10 @@ def main() -> None:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[ui-locate] 停止", flush=True)
+    finally:
+        from ui_locate import capture
+
+        capture.release()
 
 
 if __name__ == "__main__":

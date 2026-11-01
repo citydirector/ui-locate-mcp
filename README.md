@@ -70,6 +70,19 @@ The default home follows `UI_LOCATE_HOME` → `DSH_HOME/ui-locate` → `LOCALAPP
 
 The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCATE_PROVIDER` and `UI_LOCATE_PORT`; see [config.py](src/ui_locate/config.py). MCP connects to local port 7788 by default.
 
+### Screen capture
+
+`UI_LOCATE_CAPTURE` (or `"capture"` in the state directory's `runtime.json`) picks how screenshots are taken:
+
+| Value | Method | Use it when |
+| --- | --- | --- |
+| `auto` (default) | DXGI → WGC → GDI, skipping failures and all-black frames, remembering what worked per monitor | Almost always |
+| `dxgi` | Desktop Duplication | Fastest; captures exclusive-fullscreen D3D games |
+| `wgc` | Windows Graphics Capture (needs `dxcam[winrt]`) | Hybrid-GPU laptops where DXGI reports `UNSUPPORTED` |
+| `gdi` | BitBlt | Maximum compatibility; often black for fullscreen games |
+
+`health` reports the backend each monitor last used under `screen.capture`.
+
 ## Updating
 
 **The plugin itself is updated by the DSH plugin page; this package no longer ships

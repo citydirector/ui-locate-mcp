@@ -35,7 +35,6 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Iterable
 
-import cv2
 import numpy as np
 
 _dpi_set = False
@@ -206,34 +205,23 @@ def resolve_monitor(spec: object) -> Monitor | None:
 
 
 def grab_region(rect: tuple[int, int, int, int]) -> np.ndarray:
-    """抓虚拟桌面的一块区域，返回 BGR。
+    """抓虚拟桌面的一块区域，返回 BGR（GDI BitBlt 路线）。
 
-    rect 是屏幕绝对坐标 (x, y, w, h)，x/y 可以为负。
-
-    实现上先抓完整虚拟桌面再裁：实测 `ImageGrab.grab(bbox=<负坐标>)` 会返回
-    全黑图，而 `all_screens=True` 的整张图里负坐标区域是有内容的。多抓一次
-    全屏 + 一次 numpy 切片，代价约 10~15ms，换来「永远不会莫名其妙全黑」。
+    rect 是屏幕绝对坐标 (x, y, w, h)，x/y 可以为负。保留它是给只想要一块
+    任意矩形、不关心后端的调用方；按屏抓图请用 `grab`，它会按设置选
+    DXGI / WGC / GDI（见 `ui_locate.capture`）。
     """
     set_dpi_aware()
-    from PIL import ImageGrab
-
-    full = ImageGrab.grab(all_screens=True)
-    vx, vy, vw, vh = virtual_rect()
-
-    # 尺寸自检：抓到的图必须等于虚拟桌面尺寸，否则说明 DPI 感知没生效
-    if (full.width, full.height) != (vw, vh):
-        raise RuntimeError(
-            f"抓屏尺寸 {full.width}x{full.height} 与虚拟桌面 {vw}x{vh} 不一致，"
-            "DPI 感知未生效或显示器热插拔，坐标会错位"
-        )
+    from ui_locate.capture import Region, _grab_gdi
 
     x, y, w, h = rect
-    x0 = max(0, x - vx)
-    y0 = max(0, y - vy)
-    x1 = min(full.width, x0 + w)
-    y1 = min(full.height, y0 + h)
-    crop = full.crop((x0, y0, x1, y1))
-    return cv2.cvtColor(np.asarray(crop), cv2.COLOR_RGB2BGR)
+    return _grab_gdi(Region("", x, y, w, h))
+
+
+def _grab_monitor(m: Monitor) -> np.ndarray:
+    from ui_locate.capture import CAPTURER, Region
+
+    return CAPTURER.grab(Region(m.device, m.x, m.y, m.w, m.h)).bgr
 
 
 def grab(monitor: object = None) -> tuple[np.ndarray, tuple[int, int]]:
@@ -243,12 +231,25 @@ def grab(monitor: object = None) -> tuple[np.ndarray, tuple[int, int]]:
     origin 才是能交给 cua_driver 的坐标。
 
     参数 monitor：见 `resolve_monitor`。默认整个虚拟桌面。
+
+    抓屏后端由 `ui_locate.capture` 决定（默认 auto：DXGI → WGC → GDI）。
+    整个虚拟桌面按屏分别抓、再贴进一张画布：DXGI / WGC 本来就是一块输出
+    一台相机，显示器之间不存在的空白保持全黑，和 GDI 抓出来的样子一致。
     """
+    set_dpi_aware()
     m = resolve_monitor(monitor)
-    if m is None:
-        vx, vy, vw, vh = virtual_rect()
-        return grab_region((vx, vy, vw, vh)), (vx, vy)
-    return grab_region((m.x, m.y, m.w, m.h)), (m.x, m.y)
+    if m is not None:
+        return _grab_monitor(m), (m.x, m.y)
+    vx, vy, vw, vh = virtual_rect()
+    mons = list_monitors()
+    canvas = np.zeros((vh, vw, 3), dtype=np.uint8)
+    for mon in mons:
+        img = _grab_monitor(mon)
+        x0, y0 = mon.x - vx, mon.y - vy
+        h = min(img.shape[0], vh - y0)
+        w = min(img.shape[1], vw - x0)
+        canvas[y0:y0 + h, x0:x0 + w] = img[:h, :w]
+    return canvas, (vx, vy)
 
 
 def iter_monitors() -> Iterable[Monitor]:
@@ -259,8 +260,11 @@ def describe() -> dict:
     """给诊断用的完整几何信息。"""
     mode = set_dpi_aware()
     vx, vy, vw, vh = virtual_rect()
+    from ui_locate.capture import CAPTURER
+
     return {
         "dpi_awareness": mode,
+        "capture": CAPTURER.status(),
         "virtual": {"x": vx, "y": vy, "w": vw, "h": vh},
         "monitors": [m.as_dict() for m in list_monitors()],
     }
