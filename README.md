@@ -39,6 +39,7 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `locate_text` | Find matching UI text and its center coordinates |
 | `find_all` | Return multiple matching candidates |
 | `detect_elements` | Enumerate detected elements |
+| `ui_locate_marks` | Screenshot with numbered marks (and an optional named grid) so the model picks a number instead of guessing pixels |
 | `ui_locate_act` | Locate, perform an action and attempt verification |
 | `ui_locate_steps` | Run ordered steps and identify failures |
 | `ui_locate_frames` / `ui_locate_frame` | List or retrieve recent action frames |
@@ -46,12 +47,25 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `health` | Check service readiness |
 | `ui_locate_setup` | Prepare or rebuild Python dependencies and models |
 
-The first nine entries come from MCP; the last two are Host tools. The host may prefix tool names with a namespace.
+The first ten entries come from MCP; the last two are Host tools. The host may prefix tool names with a namespace.
 
 ~~~python
 locate_text(text="Save", monitor="primary")
 ui_locate_act(text="Save", action="click", monitor="primary")
 ~~~
+
+For targets without stable text (game items, toolbar icons, map units), mark the screen and act by number:
+
+~~~python
+ui_locate_marks(monitor="primary")          # image with numbered boxes
+ui_locate_act(mark=17)                       # click #17's detector-computed center
+ui_locate_marks(box="1200,40,1500,90")       # zoom a strip of tiny buttons (up to 4x)
+ui_locate_marks(grid=8)                      # nothing boxed? pick a grid cell, e.g. D3
+ui_locate_marks(box="D3", grid=4)            # zoom that cell, then pick a mark or sub-cell
+ui_locate_act(cell="B2")                     # click a cell's center
+~~~
+
+Numbers belong to one marked image; pass `mark_set` to refuse a stale one.
 
 Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string or `all`. Locate again after the UI moves.
 

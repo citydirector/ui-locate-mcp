@@ -393,8 +393,84 @@ def find_all(
 
 
 @mcp.tool()
+def ui_locate_marks(
+    monitor: str = "primary",
+    box: str = "",
+    conf: float = 0.2,
+    text: bool = True,
+    max_marks: int = 200,
+    max_side: int = 1600,
+    grid: int = 0,
+):
+    """截一张屏，把每个可点的东西都标上编号 —— **直接返回图片**。看图选号，再用
+    `ui_locate_act(mark=编号)` 去点。不用自己估坐标。
+
+    什么时候用它：目标没有稳定文字（游戏图标、地图上的单位、工具栏小图标），
+    或者你看得出「是哪个」却说不准「在哪个像素」。坐标由检测器算，像素级；
+    你只负责认。
+
+    小按钮看不清、编号挤成一团时，用 `box` 只看一块：那块会先放大再检测、
+    标注图也跟着放大（最多 4 倍），16px 的按钮也能一个个分开编号。
+
+    **要的东西没有框**（游戏物品格、地图单位、自绘控件常见）：给 `grid`，
+    图上会再叠一层带名字的网格（列 A、B…，行 1、2…）。两轮到像素级：
+      1. `ui_locate_marks(grid=8)` → 看出目标在 "D3"
+      2. `ui_locate_marks(box="D3", grid=4)` → 那一格放大重标；有编号就用编号，
+         没有就再选一格
+      3. `ui_locate_act(mark=…)` 或 `ui_locate_act(cell="B2")`（点格子中心）
+
+    参数：
+      monitor    哪块屏："primary"（默认）/ "0" / "1" / 设备名 / "all"
+      box        只看这块："x1,y1,x2,y2"（**屏幕绝对坐标**），或上一张图的网格
+                 名如 "D3"。留空 = 整块屏。
+      conf       检测置信度下限，默认 0.2（偏低，宁可多标几个）
+      text       顺带 OCR 认字，默认 True；只关心图标时关掉能快 0.5 秒左右
+      max_marks  最多标多少个，默认 200
+      max_side   标注图长边像素，默认 1600
+      grid       叠加网格，长边切几格（短边按比例），0 = 不画（默认）。8 左右合适
+
+    返回：一段 JSON + 一张标注图。
+      JSON：{mark_set, count, marks:[{id, text?, cx, cy, w, h}], origin, box,
+             scale, timings}
+      图上每个框左上角（放不下时在右上 / 下方 / 框内）有编号标签，颜色与
+      框一致。
+
+    编号只对**这一张图**有效。之后点的时候可以带上 `mark_set`：画面已经被
+    重新标注过时会拒绝执行，而不是点到新画面上的另一个同号元素。
+    要的东西没被框出来：换 `box` 放大那一块再标一次；还是没有，就说明检测器
+    认不出它，改用坐标。
+    """
+    payload: dict[str, Any] = {
+        "monitor": monitor or "primary",
+        "conf": conf,
+        "text": bool(text),
+        "max_marks": int(max_marks),
+        "max_side": int(max_side),
+    }
+    if box:
+        payload["box"] = box
+    if grid:
+        payload["grid"] = int(grid)
+    res = _post_any("/marks", payload)
+    if not res.get("ok"):
+        return json.dumps(res, ensure_ascii=False)
+
+    import base64
+
+    from mcp.server.fastmcp.utilities.types import Image
+
+    data = base64.b64decode(res.pop("image_b64"))
+    fmt = res.pop("image_format", "jpeg")
+    res.pop("status", None)
+    return [json.dumps(res, ensure_ascii=False), Image(data=data, format=fmt)]
+
+
+@mcp.tool()
 def ui_locate_act(
     text: str = "",
+    mark: int = 0,
+    cell: str = "",
+    mark_set: int = 0,
     action: str = "click",
     x: int | None = None,
     y: int | None = None,
@@ -420,7 +496,12 @@ def ui_locate_act(
 
     参数：
       text        要操作的目标文字（推荐）。界面一变坐标就变，文字不变。
-                  也可以不给 text，改用 x + y 直接指定坐标。
+                  也可以不给 text，改用 mark（编号）或 x + y（坐标）。
+      mark        `ui_locate_marks` 标注图上的编号。没有稳定文字的目标用它，
+                  比自己估坐标准得多。
+      cell        标注图上的网格名（如 "B2"），点那一格的中心。格子越小越准：
+                  先用 box=格子名 放大重标，再选更小的格子或编号
+      mark_set    可选，标注时返回的集合号；画面已被重新标注过就拒绝执行
       action      click（默认）/ double_click / right_click / middle_click /
                   hover / drag / scroll / type / press / hotkey / wait
       verify      动作后怎么确认生效：
@@ -433,7 +514,7 @@ def ui_locate_act(
       button      鼠标键 left / right / middle
       delivery    输入通道 send_input（系统队列，要求前台）/ message（投窗口
                   消息，后台可用）/ auto（先前者，光标没动再试后者）
-      to          action=drag 的终点：文字或 "x,y"
+      to          action=drag 的终点：文字、"x,y" 或编号 "#17"
       delta       action=scroll 的幅度，负数向下
       value       action=type 要输入的文字
       key / keys  action=press 的单键，或 action=hotkey 的组合键（"ctrl+s"）
@@ -456,6 +537,12 @@ def ui_locate_act(
                                "settle_ms": settle_ms}
     if text:
         payload["text"] = text
+    if mark:
+        payload["mark"] = int(mark)
+    elif cell:
+        payload["cell"] = cell
+    if (mark or cell) and mark_set:
+        payload["mark_set"] = int(mark_set)
     if x is not None and y is not None:
         payload["x"] = x
         payload["y"] = y
@@ -500,6 +587,9 @@ def ui_locate_steps(steps: str) -> str:
                    写成 "确认购买" 或 {"text": "...", "timeout_ms": 8000}
       on_fail      "abort"（默认，失败即停）| "continue"（失败继续下一步）
       action:"wait" 时是纯等待步骤：不动手，只等 text 出现
+      mark         标注图上的编号（同 ui_locate_act 的 mark）。整串步骤里的编号都
+                   指**调用时**最新那张标注图；中途画面变了，后面的编号可能已不准，
+                   这种流程请拆开调用、每次重新标注。
 
     示例：
       [{"text": "背包", "action": "click", "verify": "text",

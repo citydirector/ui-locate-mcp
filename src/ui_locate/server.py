@@ -18,6 +18,8 @@
   POST /act      {"text": "...", "action": "click", "verify": "screen"}
                                    定位 → 动作 → 验证，一次请求走完
   POST /steps    {"steps": [ ... ]} 一串 act 顺序执行，任一步失败即停
+  POST /marks    {"monitor": "primary", "box": "x1,y1,x2,y2"}
+                                   编号标注图 + 编号列表；之后 /act {"mark": 17}
 
 关于「谁来做动作」：本服务确实会调 SendInput / PostMessage（`actions.py`），
 但**不保证生效**。实测两种截然不同的情况：桌面程序在前台时光标移动通道正常
@@ -52,6 +54,7 @@ cuda_dlls.register()
 from ui_locate import act as act_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
+from ui_locate import marks as marks_mod  # noqa: E402
 from ui_locate import screen  # noqa: E402
 from ui_locate.detect import Detector, default_model  # noqa: E402
 from ui_locate.locate import grab_screen  # noqa: E402
@@ -169,6 +172,170 @@ class Engine:
 
 
 ENGINE: Engine | None = None
+MARKS = marks_mod.MarkStore()
+
+
+def _parse_box(value: object) -> tuple[int, int, int, int] | None:
+    """"x1,y1,x2,y2" / [x1,y1,x2,y2] → 整数元组；空值返回 None。"""
+    if value in (None, "", []):
+        return None
+    parts = value.split(",") if isinstance(value, str) else list(value)  # type: ignore[arg-type]
+    if len(parts) != 4:
+        raise ValueError(f"box 需要 x1,y1,x2,y2 四个数：{value!r}")
+    x1, y1, x2, y2 = (int(round(float(v))) for v in parts)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"box 的右下角必须在左上角右下方：{value!r}")
+    return x1, y1, x2, y2
+
+
+def make_marks(body: dict) -> dict:
+    """抓屏 → 检测（+OCR）→ 编号 → 画标注图。
+
+    给了 ``box`` 时只看这一块，并且**放大后再检测**：专业软件里 16px 的小按钮
+    在整屏检测里经常被漏掉或并成一个框，放大 2~3 倍后检测器就能一个个分开，
+    标注图也跟着放大，编号不会糊在一起。
+    """
+    assert ENGINE is not None
+    t0 = time.perf_counter()
+    monitor = body.get("monitor", "primary")
+    if monitor in (None, ""):
+        monitor = "primary"
+    box = None if marks_mod.is_cell_ref(body.get("box")) else _parse_box(body.get("box"))
+    conf = float(body.get("conf", 0.2))
+    want_text = _as_bool(body.get("text", True), True)
+    text_mode = str(body.get("text_mode") or "mosaic")
+    max_marks = int(body.get("max_marks", 200))
+    max_side = int(body.get("max_side", 1600))
+    grid = int(body.get("grid") or 0)
+    fmt = "png" if str(body.get("format") or "").lower() == "png" else "jpeg"
+    # box 也可以写成上一张图的网格名（"C4"）：这就是「选格 → 放大」的第二轮
+    if marks_mod.is_cell_ref(body.get("box")):
+        try:
+            cell, _ = MARKS.resolve_cell(body["box"], body.get("mark_set"))
+        except KeyError as error:
+            raise ValueError(str(error.args[0])) from None
+        box = tuple(int(round(v)) for v in cell)
+
+    if box is not None:
+        # box 是屏幕绝对坐标，可能跨屏，所以从整个虚拟桌面裁
+        full, (vx, vy) = screen.grab("all")
+        x1, y1 = max(box[0], vx), max(box[1], vy)
+        x2 = min(box[2], vx + full.shape[1])
+        y2 = min(box[3], vy + full.shape[0])
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            raise ValueError(f"box {box} 不在任何显示器上")
+        bgr = np.ascontiguousarray(full[y1 - vy:y2 - vy, x1 - vx:x2 - vx])
+        origin = (x1, y1)
+    else:
+        bgr, origin = screen.grab(monitor)
+    grab_ms = (time.perf_counter() - t0) * 1000
+
+    # 小区域放大后检测；坐标再缩回去
+    up = 1.0
+    if box is not None:
+        long_side = max(bgr.shape[:2])
+        if long_side < 900:
+            up = min(3.0, 1280 / long_side)
+    det_img = cv2.resize(bgr, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC) if up > 1 else bgr
+    res = ENGINE.run(det_img, conf=conf, tiled=True, text=want_text,
+                     text_mode=text_mode, origin=(0, 0))
+    elements = res["elements"]
+    ox, oy = origin
+    for it in elements:
+        for k in ("x1", "x2", "cx"):
+            it[k] = it[k] / up + ox
+        for k in ("y1", "y2", "cy"):
+            it[k] = it[k] / up + oy
+        it["w"] = it["w"] / up
+        it["h"] = it["h"] / up
+
+    t1 = time.perf_counter()
+    marks = marks_mod.build_marks(
+        elements, frame_area=float(bgr.shape[0] * bgr.shape[1]), max_marks=max_marks)
+    cells = marks_mod.grid_cells(origin, (bgr.shape[1], bgr.shape[0]), grid)
+    image, scale = marks_mod.render(
+        bgr, marks, origin, max_side=max_side,
+        upscale_max=4.0 if box is not None else 1.0, fmt=fmt, cells=cells)
+    render_ms = (time.perf_counter() - t1) * 1000
+
+    turn = ENGINE.frames.begin_turn()
+    ENGINE.frames.put(turn, bgr, origin, label="marks")
+    mset = MARKS.put(marks, origin, box=box, monitor=monitor, cells=cells,
+                     meta={"turn": turn, "size": [bgr.shape[1], bgr.shape[0]]})
+
+    import base64
+
+    return {
+        "ok": True,
+        "mark_set": mset.id,
+        "turn": turn,
+        "origin": [ox, oy],
+        "size": [bgr.shape[1], bgr.shape[0]],
+        "box": list(box) if box else None,
+        "scale": round(scale, 4),
+        "count": len(marks),
+        "marks": [m.brief() for m in marks],
+        "grid": ({"cols": len({k[0] for k in cells}), "rows": len({k[1:] for k in cells}),
+                  "cell_w": round(bgr.shape[1] / len({k[0] for k in cells}), 1),
+                  "cell_h": round(bgr.shape[0] / len({k[1:] for k in cells}), 1)}
+                 if cells else None),
+        "capture": _capture_last(),
+        "timings": {
+            "grab_ms": round(grab_ms, 1),
+            "detect_ms": res["detect_ms"],
+            "ocr_ms": res["ocr_ms"],
+            "render_ms": round(render_ms, 1),
+            "total_ms": round((time.perf_counter() - t0) * 1000, 1),
+        },
+        "image_format": fmt,
+        "image_b64": base64.b64encode(image).decode("ascii"),
+    }
+
+
+def _capture_last() -> dict:
+    from ui_locate.capture import CAPTURER
+
+    last = CAPTURER.last
+    return {"backend": last.get("backend"), "ms": last.get("ms")} if last else {}
+
+
+def apply_marks(spec: dict) -> dict:
+    """把 spec 里的编号引用换成坐标引用（act 认得的 ``at`` / ``{cx, cy}``）。
+
+    认三处：``mark: 17``（目标）、``to: "#17"``（拖拽终点）、``from: "#17"``（拖拽起点）。
+    to / from 必须写 ``#``：裸数字可能就是屏幕上的文字（页码、数量）。
+    """
+    if not isinstance(spec, dict):
+        return spec
+    out = dict(spec)
+    set_id = out.pop("mark_set", None)
+    try:
+        if out.get("mark") not in (None, "", 0):
+            m, mset = MARKS.resolve(out.pop("mark"), set_id)
+            out.pop("x", None)
+            out.pop("y", None)
+            if not out.get("text"):
+                out["at"] = m.as_target()
+            out["_mark"] = {"id": m.id, "set": mset.id, "age_s": MARKS.age_s()}
+        elif marks_mod.is_cell_ref(out.get("cell")):
+            cell_name = str(out.pop("cell")).strip().upper()
+            (gx1, gy1, gx2, gy2), mset = MARKS.resolve_cell(cell_name, set_id)
+            out.pop("x", None)
+            out.pop("y", None)
+            if not out.get("text"):
+                out["at"] = {"text": None, "cx": (gx1 + gx2) / 2, "cy": (gy1 + gy2) / 2,
+                             "w": gx2 - gx1, "h": gy2 - gy1, "conf": 1.0}
+            out["_mark"] = {"cell": cell_name, "set": mset.id, "age_s": MARKS.age_s()}
+        else:
+            out.pop("mark", None)
+        out.pop("cell", None)
+        for key in ("to", "from"):
+            if marks_mod.is_mark_ref(out.get(key)):
+                m, _ = MARKS.resolve(out[key], set_id)
+                out[key] = {"cx": m.cx, "cy": m.cy, "text": m.text}
+    except KeyError as error:
+        raise act_mod.ActError(str(error.args[0] if error.args else error)) from None
+    return out
 
 
 def _as_bool(v: object, default: bool) -> bool:
@@ -503,6 +670,18 @@ class Handler(BaseHTTPRequestHandler):
             "perform": self._perform,
             "compare": self._compare,
         }
+        mark_info = None
+        if "steps" in data:
+            if isinstance(data["steps"], list):
+                data = {**data, "steps": [apply_marks(s) for s in data["steps"]]}
+        else:
+            data = apply_marks(data)
+            mark_info = data.pop("_mark", None)
+        if "steps" in data and isinstance(data["steps"], list):
+            for step in data["steps"]:
+                if isinstance(step, dict):
+                    step.pop("_mark", None)
+
         turn = ENGINE.frames.begin_turn()
         self._turn = turn
         self._frame_seq = 0
@@ -511,6 +690,8 @@ class Handler(BaseHTTPRequestHandler):
                 out = act_mod.run_steps(data["steps"], **common)
             else:
                 out = act_mod.act(data, **common)
+                if mark_info is not None:
+                    out["mark"] = mark_info
         finally:
             self._turn = None
             self._frame_seq = 0
@@ -836,6 +1017,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, self._handle_click(data))
             except Exception as e:
                 self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+
+        if u.path == "/marks":
+            try:
+                raw = self._body()
+                body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+            except Exception as e:
+                self._send(400, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                return
+            try:
+                self._send(200, make_marks(body))
+            except ValueError as e:
+                self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return
 
         if u.path in ("/act", "/steps"):
