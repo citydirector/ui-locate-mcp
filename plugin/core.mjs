@@ -27,7 +27,18 @@ import { fileURLToPath } from "node:url"
  * 版本同步（`--no-deps`）之后另外补装的依赖：不碰 ORT、旧环境里可能没有的包。
  * 失败不算同步失败 —— Python 侧缺了它们会自己降级（dxcam 缺了退回 GDI 抓屏）。
  */
-export const SYNC_EXTRA_DEPS = ["dxcam>=0.3,<0.4", { spec: "windows-capture>=2.0,<3", noDeps: true }]
+/**
+ * 只在 Windows 上、用 `--no-deps` 装的包（唯一定义处，runtime.mjs 新装环境时也读这里）。
+ * windows-capture（WGC 抓窗口）的元数据要求 `opencv-python`，和
+ * `opencv-python-headless` 冲突；它运行时只要 numpy 和 cv2，headless 已满足。
+ */
+export const NO_DEPS_WIN_DEPS = ["windows-capture>=2.0,<3"]
+
+/**
+ * 两条安装路径互不重叠：新环境由 runtime.mjs 的 ensureRuntime 装（主依赖 + 上面的
+ * no-deps 包）；已有环境升级本包版本时由这里补装，旧 venv 里可能还没有它们。
+ */
+export const SYNC_EXTRA_DEPS = ["dxcam>=0.3,<0.4", ...NO_DEPS_WIN_DEPS.map((spec) => ({ spec, noDeps: true }))]
 
 /** Python 包名，用来问 venv 里装的是哪个版本。 */
 export const PYTHON_PACKAGE = "ui-locate-mcp"
