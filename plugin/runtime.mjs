@@ -31,6 +31,8 @@
 import { existsSync, readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 
+import { NO_DEPS_WIN_DEPS } from "./core.mjs"
+
 /** 检测模型在 HuggingFace 上的地址与落盘名。 */
 export const MODEL_URL =
   "https://huggingface.co/onnx-community/OmniParser-v2.0_icon_detect/resolve/main/onnx/model.onnx"
@@ -71,12 +73,8 @@ export const COMMON_DEPS = [
 ]
 
 
-/**
- * 只在 Windows 上、用 `--no-deps` 单独装的包。windows-capture（WGC 抓窗口）的
- * 元数据要求 `opencv-python`，和 `opencv-python-headless` 冲突；它运行时只要
- * numpy 和 cv2，headless 已满足。装失败不算失败：Python 侧会退回 PrintWindow。
- */
-export const NO_DEPS_WIN_DEPS = ["windows-capture>=2.0,<3"]
+// 只在 Windows、用 --no-deps 装的包：定义在 core.mjs，两条安装路径共用一份。
+export { NO_DEPS_WIN_DEPS }
 
 /** CUDA 后端额外要的 nvidia 运行库（与 `pyproject.toml` 的 [cuda] 对齐）。 */
 export const CUDA_RUNTIME_DEPS = [
