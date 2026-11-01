@@ -39,6 +39,7 @@ dsh plugin --profile web add ui-locate-mcp
 | `locate_text` | 按文字查找匹配元素及其中心坐标 |
 | `find_all` | 返回同名或相似文字的多个候选 |
 | `detect_elements` | 枚举画面中检测到的元素 |
+| `ui_locate_marks` | 带编号框（可叠加带名字的网格）的截图，让模型选编号而不是估像素 |
 | `ui_locate_act` | 定位后执行点击、输入、滚动等动作，并尝试验证 |
 | `ui_locate_steps` | 串行执行一组步骤，返回失败位置 |
 | `ui_locate_frames` / `ui_locate_frame` | 列出或取回近期动作帧 |
@@ -46,12 +47,25 @@ dsh plugin --profile web add ui-locate-mcp
 | `health` | 检查服务是否就绪 |
 | `ui_locate_setup` | 准备或重建 Python 环境与模型 |
 
-前九项由 MCP 服务提供，最后两项由 Host 插件提供；实际调用名称可能带宿主添加的命名空间。
+前十项由 MCP 服务提供，最后两项由 Host 插件提供；实际调用名称可能带宿主添加的命名空间。
 
 ~~~python
 locate_text(text="保存", monitor="primary")
 ui_locate_act(text="保存", action="click", monitor="primary")
 ~~~
+
+没有稳定文字的目标（游戏物品、工具栏图标、地图单位）先标注，再按编号操作：
+
+~~~python
+ui_locate_marks(monitor="primary")          # 带编号框的截图
+ui_locate_act(mark=17)                       # 点 #17，坐标由检测器算
+ui_locate_marks(box="1200,40,1500,90")       # 放大一条小按钮（最多 4 倍）
+ui_locate_marks(grid=8)                      # 没框出来？选一格，比如 D3
+ui_locate_marks(box="D3", grid=4)            # 放大那一格，再选编号或更小的格
+ui_locate_act(cell="B2")                     # 点某一格的中心
+~~~
+
+编号只属于生成它的那张图；带上 `mark_set` 可拒绝过期的编号。
 
 坐标使用屏幕绝对位置，多显示器可能返回负坐标。`monitor` 可为 `primary`、索引字符串或 `all`。界面移动后应重新定位，不要长期复用旧坐标。
 
