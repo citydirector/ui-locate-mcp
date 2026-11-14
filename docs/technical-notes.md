@@ -560,8 +560,8 @@ locate_text("设置")   →  matched='设置'   (1452, 1775)
 
 ## 托管边界为什么落在 HTTP 进程里
 
-`UI_LOCATE_CUA_MANAGED` 只由 **HTTP 服务进程自己的 env** 决定，MCP 侧的 env
-不参与判定。原因是部署上 MCP 与 HTTP 是两个进程：MCP 由 Host 拉起时可以带上
+托管开关（`MANAGED_ENV`，见 `src/ui_locate/managed.py`）只由 **HTTP 服务进程自己的
+env** 决定，MCP 侧的 env 不参与判定。原因是部署上 MCP 与 HTTP 是两个进程：MCP 由 Host 拉起时可以带上
 变量，而端口上可能还挂着上一次独立运行留下的旧实例 —— 它没有这个变量，
 却照样接受 `/act`。如果守卫只在 MCP 里，工具名被隐藏了，HTTP 旁路仍然通着，
 "托管"就只是界面上的假象。
@@ -602,9 +602,9 @@ locate_text("设置")   →  matched='设置'   (1452, 1775)
 亏 —— `_probe_hit()` 的注释里写着「检测器一旦漏框，那段文字就根本没进
 OCR」，因此 `/act` 会在 mosaic 空手时退回 full 再找一遍。
 
-纯图片路径的消费者是 Host 桥接：它拿 `matches[0]` 就去 CUA 点。也就是说
-它和 `/act` 同级，而不是和「只回坐标给人看」的 `/locate` 同级。所以两处
-都对齐到 `/act`：
+纯图片路径当初的消费者是 Host 桥接（2026-11-14 已撤回，见下方说明）：它拿
+`matches[0]` 就去点。也就是说它和 `/act` 同级，而不是和「只回坐标给人看」的
+`/locate` 同级。所以两处都对齐到 `/act`：
 
 1. 匹配档收紧到 `starts`（exact / 前缀 / 后缀）。`contains` 只适合把候选
    列出来给人挑；一旦有人照着点，「碰巧包含」就是点错。
@@ -615,31 +615,7 @@ full ≈ 0.74s，检测器单遍约 0.1s 级。真实截图更大，但同量级
 「找不到就什么都不做」的判断来说，多付一遍 OCR 换回一个真实存在的按钮，
 是划算的。
 
-## 跨仓契约（与 cua-bridge 实际对齐的结果）
-
-Host 桥接（`plugin/cua-bridge.mjs`，B 维护）与 Python 服务之间只走两条路径：
-`GET /health` 与 `POST /locate-image`。已确认的细节，写在这里是因为它们分布在
-两个仓库里，任一侧单独看都不完整：
-
-- **端口**：bundle 里的托管服务用 **7789**（`cordis.patch.yml` 的
-  `UI_LOCATE_PORT: '7789'`）。7788 上常驻的 legacy 实例既不复用也不杀 ——
-  它没有 `contractVersion`，握手会得到 `CONTRACT_MISMATCH`。Host 的候选顺序是
-  `UI_LOCATE_BASE_URL` → `UI_LOCATE_PORT` → 7789 → 7788，逐个问 `/health`，
-  只接受 `contractVersion===1 && managed===true && capabilities.image===true`
-  的那个，并在**本次调用内钉住端口**（health 与 locate 必打同一端口）。
-- **请求**：严格五键 `{image_b64,width,height,text,mode}`；`limit/conf/tiled`
-  由 Host 不发、走服务默认（5 / 0.3 / true）。`mode:"detect"` 时发 `text: ""`，
-  空串合法。
-- **响应**：Host 校验 `ok/contractVersion/coordinateSpace/image/matches` 与每条
-  match 的字段和几何（box 在 image 内、center 在 box 内、confidence ∈ [0,1]）；
-  **没有**排序断言，它始终取 `matches[0]`。所以排序口径只由本仓库定义：
-  exact → 前缀/后缀 → 长度差 → confidence。
-- **空 matches**：Host 视为成功、`dispatched:false, verification:"no-match"`，
-  不再截第二张图、不重试。这正是放弃 contains 档后误命中场景的归宿。
-- **时限**：单次 locate 30s、整个工具调用 60s；mosaic 空手时的整图重读在预算内。
-- **托管拒绝**：Host **不依赖** 403 的具体取值（它从不碰桌面路由）；`/health`
-  的 `managed` 才是它判定的依据。因此 403 + `CUA_MANAGED` 只服务于
-  「绕过桥接直接打 HTTP 的调用方」。
+> CUA 后台投递桥接已撤回（2026-11-14）：background 投递会让 native 宿主退出，止损后改由 ui-locate 自有实现，见 src/ui_locate/actions.py。
 
 ## 比较为什么必须落在像素上（`/compare-images`）
 
@@ -692,6 +668,8 @@ collapsed_to_a_corner`、`test_box_entirely_left_or_above_is_dropped`、
 ## 托管拒绝该指向哪里
 
 托管模式下 hint 曾列出本服务被拒的十二个工具名。那是反的：代理读完 hint 会换一个
-同样被拒的名字再撞一次。现在 hint 指向 Host 侧真正能干活的入口
-（`ui_locate_cua_locate` / `ui_locate_cua_act` 及 CUA 语义接口），并顺带说明纯图片
-的两条路（`/locate-image`、`/compare-images`）。`_HOST_TOOLS` 是唯一来源。
+同样被拒的名字再撞一次。现在 hint 指向 Host 侧真正能干活的桌面入口，并顺带说明
+纯图片的两条路（`/locate-image`、`/compare-images`）。`_HOST_TOOLS` 是唯一来源。
+
+Host 侧的 CUA 桥接工具已撤回（2026-11-14），`_HOST_TOOLS` 的文案需要随之更新，
+否则 hint 会指回一个已经不存在的入口。

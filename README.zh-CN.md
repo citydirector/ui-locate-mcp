@@ -183,13 +183,13 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 ### 托管模式
 
-`UI_LOCATE_CUA_MANAGED=1` 告诉 Python 服务：这台机器的桌面归 Host 管。此时所有自主桌面能力 —— 抓屏、列显示器与窗口、marks、watch、diff、steps、frames、切前台、输入 —— 一律 HTTP `403` + `{"ok": false, "code": "CUA_MANAGED", ...}`，并回显被拒的路由、指向 Host 的做法。拦截发生在 HTTP 进程内部、路由之前，所以直接 POST `/act` 和走 MCP 工具被拒得一模一样；MCP 侧另有一次检查，让过期客户端不必多跑一个来回就知道原因；`/health` 也不再枚举屏幕、不再探测进程完整性。
+托管开关（`src/ui_locate/managed.py` 的 `MANAGED_ENV`）告诉 Python 服务：这台机器的桌面归 Host 管。此时所有自主桌面能力 —— 抓屏、列显示器与窗口、marks、watch、diff、steps、frames、切前台、输入 —— 一律 HTTP `403` + `{"ok": false, "code": "CUA_MANAGED", ...}`，并回显被拒的路由、指向 Host 的做法。拦截发生在 HTTP 进程内部、路由之前，所以直接 POST `/act` 和走 MCP 工具被拒得一模一样；MCP 侧另有一次检查，让过期客户端不必多跑一个来回就知道原因；`/health` 也不再枚举屏幕、不再探测进程完整性。
 
 只留三样：`GET /health`、`POST /locate-image`、`POST /compare-images`。`health` 报出 `contractVersion`、`managed` 和 `capabilities`（`{"image": true, "compare": true, "desktop": false}`），Host 可以先确认对端确实执行这条边界、而且能验证结果，再发任何东西。Host 应把 `capabilities.desktop === false` 也纳入握手，而不只看 `managed: true`：它为 `true`、或整个 `desktop` 键缺失，都说明应答的不是真正执行这条边界的那个进程（例如同一端口上残留的旧独立实例），此时正确做法是拒绝这个实例，而不是降级使用。health 里没有 `contractVersion` 同样是旧进程：重启它，不要拿来用。
 
-变量是每个请求现读的，所以做决定的是**真正在服务这次请求的进程**，不是当初启动它的人。不设这个变量，独立模式保留全部能力。
+开关是每个请求现读的，所以做决定的是**真正在服务这次请求的进程**，不是当初启动它的人。不设这个开关，独立模式保留全部能力。
 
-同时保留托管与独立实例的 Host 会给托管实例单独一个端口（DSH bundle 用 7789），并在发任何请求前先问 `/health`：`7788` 上可能还挂着守卫管不到的旧独立进程。
+同时保留托管与独立实例的 Host 会给托管实例单独一个端口，并在发任何请求前先问 `/health`：`7788` 上可能还挂着守卫管不到的旧独立进程。
 
 ## 更新
 
@@ -209,7 +209,7 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 - MCP 启动失败：先检查运行环境是否准备完成、虚拟环境 Python 是否存在，再重连 MCP。
 - 动作结果中的 `ok` 表示执行流程完成；只有对应的验证结果才能说明界面是否变化。`verified: false` 或 `null` 时不要当作操作成功。
 - `delivery="background"` 是消息投递，不是「Windows 上通用后台输入」：只覆盖点击类，且有些框架会忽略投递的消息。看 `dispatched`，别假设点中了。
-- 设了 `UI_LOCATE_CUA_MANAGED=1` 时，大多数工具返回 `CUA_MANAGED` 是设计如此，只剩 `/health` 和 `/locate-image`；桌面操作请走 Host 自己的能力。
+- 打开托管开关时，大多数工具返回 `CUA_MANAGED` 是设计如此，只剩 `/health`、`/locate-image`、`/compare-images`。Host 侧的 CUA 桥接已于 2026-11-14 撤回 —— background 投递会让 native 宿主退出（`NATIVE_EXITED` / `NATIVE_CLEANUP`），现在改由本包自有实现（`src/ui_locate/actions.py`）承担。
 - 桌面权限、前台焦点、DPI 和应用框架会影响输入与截图。定位命中也不保证目标接受合成输入。
 - 不同 ONNX Runtime 后端共用同名 Python 包；换后端应重建，避免叠装。
 - OCR 有漏检和误识别；重要动作后检查画面或目标文字。

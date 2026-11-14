@@ -25,7 +25,6 @@
     "plugin/runtime.mjs",
     "plugin/api.mjs",
     "plugin/trust.mjs",
-    "plugin/cua-bridge.mjs",
     "locale/*.json",
     "icon.svg",
     "pyproject.toml",

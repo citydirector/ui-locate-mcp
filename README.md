@@ -183,13 +183,13 @@ Fullscreen games often read the mouse and keyboard through Raw Input / DirectInp
 
 ### Managed mode
 
-`UI_LOCATE_CUA_MANAGED=1` tells the Python service that a Host owns this desktop. Every autonomous desktop capability — capture, monitor and window listing, marks, watch, diff, steps, frames, focus, input — is then refused with HTTP `403` and `{"ok": false, "code": "CUA_MANAGED", ...}` naming the route and how to reach the Host instead. The refusal runs inside the HTTP process before routing, so posting straight to `/act` is refused exactly like the MCP tool; MCP repeats the check so a stale client learns the reason without a round trip, and `/health` stops enumerating screens and probing process integrity.
+The managed switch (`MANAGED_ENV` in `src/ui_locate/managed.py`) tells the Python service that a Host owns this desktop. Every autonomous desktop capability — capture, monitor and window listing, marks, watch, diff, steps, frames, focus, input — is then refused with HTTP `403` and `{"ok": false, "code": "CUA_MANAGED", ...}` naming the route and how to reach the Host instead. The refusal runs inside the HTTP process before routing, so posting straight to `/act` is refused exactly like the MCP tool; MCP repeats the check so a stale client learns the reason without a round trip, and `/health` stops enumerating screens and probing process integrity.
 
 Three things stay available: `GET /health`, `POST /locate-image` and `POST /compare-images`. `health` reports `contractVersion`, `managed` and `capabilities` (`{"image": true, "compare": true, "desktop": false}`), so a Host can confirm it reached an instance that enforces the boundary — and can verify results — before sending anything. A Host should treat `capabilities.desktop === false` as part of the handshake, not just `managed: true`: a `true` or a missing `desktop` key means the service that answered is not the one enforcing the boundary (for instance an older standalone process on the same port), and the safe answer is to refuse the instance rather than fall back. A health response without `contractVersion` is likewise an older process: restart it rather than use it.
 
-The variable is read on every request, so the process that serves the request decides — not whoever spawned it. Unset it and the standalone service keeps all of its capabilities.
+The switch is read on every request, so the process that serves the request decides — not whoever spawned it. Unset it and the standalone service keeps all of its capabilities.
 
-A Host that keeps both a managed and a standalone instance gives the managed one its own port (the DSH bundle uses 7789) and asks `/health` before sending anything: `7788` may still be an older standalone process that enforcement never reached.
+A Host that keeps both a managed and a standalone instance gives the managed one its own port and asks `/health` before sending anything: `7788` may still be an older standalone process that enforcement never reached.
 
 ## Updating
 
@@ -214,7 +214,7 @@ button disappear. See the [update audit](docs/update-audit.md).
 - If MCP will not start, check environment preparation and the virtual-environment Python before reconnecting.
 - `ok` means the action pipeline completed; inspect verification separately. `verified: false` or `null` is not confirmation that the intended action succeeded.
 - `delivery="background"` is a message route, not universal background input: it covers the click family only, and some frameworks ignore posted messages. Check `dispatched` rather than assuming the click landed.
-- With `UI_LOCATE_CUA_MANAGED=1` set, most tools return `CUA_MANAGED` on purpose; only `/health` and `/locate-image` remain. Use the Host's own computer-use path instead.
+- With the managed switch on, most tools return `CUA_MANAGED` on purpose; only `/health`, `/locate-image` and `/compare-images` remain. The Host-side CUA bridge was withdrawn on 2026-11-14 — background delivery made the native host exit (`NATIVE_EXITED` / `NATIVE_CLEANUP`), so it now lives in this package (`src/ui_locate/actions.py`), not in a Host bridge.
 - Desktop permissions, focus, DPI and application frameworks affect input and capture. Locating a target does not guarantee it accepts synthetic input.
 - ONNX Runtime backend wheels share the same Python package name; rebuild rather than installing competing backends together.
 - OCR can miss or misread text. Inspect the screen or target text after important actions.
