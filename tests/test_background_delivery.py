@@ -50,33 +50,45 @@ class DeliveryModeTests(unittest.TestCase):
 
 
 class BackgroundClickTests(unittest.TestCase):
-    def test_background_uses_only_window_messages(self):
-        with mock.patch.object(actions, "_click_message",
-                               return_value={"sent": True, "accepted": 6, "total": 6}) as msg, \
+    """background = 绑定 hwnd 的后台投递；前台/指针/抓屏一律不许被碰。
+
+    具体怎么投（UIA / PostMessage、几何下探、白名单）在 ``test_background.py``
+    里逐条验。这里只管 ``actions.click`` 这一层的分派与失败语义。
+    """
+
+    def test_background_delegates_by_hwnd_and_never_touches_foreground(self):
+        fake = {"ok": True, "channel": "uia-invoke", "dispatched": True,
+                "hwnd": 0x100, "sent": True}
+        with mock.patch("ui_locate.background.click", return_value=fake) as bg_click, \
                 mock.patch.object(actions, "_send", boom), \
                 mock.patch.object(actions, "_cursor_or_none", boom), \
                 mock.patch.object(actions, "_goto", boom), \
-                mock.patch.object(actions, "_normalize", boom):
-            report = actions.click(10, 20, delivery="background")
-        self.assertEqual(msg.call_count, 1)
+                mock.patch.object(actions, "_normalize", boom), \
+                mock.patch.object(actions, "_click_message", boom):
+            report = actions.click(10, 20, delivery="background", hwnd=0x100)
+        bg_click.assert_called_once()
+        kwargs = bg_click.call_args.kwargs
+        self.assertEqual(kwargs["hwnd"], 0x100)
         self.assertEqual(report["route"], "background")
         self.assertEqual(report["delivery"], "background")
+        self.assertEqual(report["channel"], "uia-invoke")
+        self.assertTrue(report["dispatched"])
         self.assertNotIn("send_input", report)
+        self.assertNotIn("message", report)
 
     def test_background_with_relative_pointer_still_never_pushes(self):
-        with mock.patch.object(actions, "_click_message",
-                               return_value={"sent": True, "accepted": 6, "total": 6}), \
+        fake = {"ok": True, "channel": "message", "dispatched": True, "sent": True}
+        with mock.patch("ui_locate.background.click", return_value=fake), \
                 mock.patch.object(actions, "_goto", boom), \
                 mock.patch.object(actions, "_send", boom), \
                 mock.patch.object(actions, "_cursor_or_none", boom):
-            report = actions.click(10, 20, delivery="bg", pointer="relative")
+            report = actions.click(10, 20, delivery="bg", pointer="relative", hwnd=0x100)
         self.assertEqual(report["route"], "background")
         self.assertNotIn("relative", report)
 
-    def test_background_without_a_window_fails_explicitly(self):
-        with mock.patch.object(actions, "_click_message",
-                               return_value={"sent": False, "reason": "该坐标上没有窗口"}), \
-                mock.patch.object(actions, "_send", boom):
+    def test_background_without_hwnd_fails_explicitly(self):
+        with mock.patch.object(actions, "_send", boom), \
+                mock.patch.object(actions, "_click_message", boom):
             with self.assertRaises(actions.BackgroundUnavailable) as ctx:
                 actions.click(10, 20, delivery="background")
         err = ctx.exception
@@ -86,14 +98,20 @@ class BackgroundClickTests(unittest.TestCase):
         self.assertFalse(body["dispatched"])
         self.assertIsNone(body["verified"])
         self.assertEqual(body["delivery"], "background")
-        self.assertIn("窗口", body["reason"])
+        # 明确要求 hwnd，而不是拿坐标去猜一个窗口
+        self.assertEqual(body["reason"], "hwnd_required")
+        self.assertIn("hwnd", body["error"])
         self.assertIn("foreground", body["hint"])
 
-    def test_background_partial_accept_still_fails(self):
-        with mock.patch.object(actions, "_click_message",
-                               return_value={"sent": False, "accepted": 3, "total": 6}):
-            with self.assertRaises(actions.BackgroundUnavailable):
-                actions.click(1, 2, delivery="background")
+    def test_background_refusal_from_module_propagates(self):
+        with mock.patch("ui_locate.background.click",
+                        side_effect=actions.BackgroundUnavailable("PostMessage 被拒绝",
+                                                                  reason="post_failed")), \
+                mock.patch.object(actions, "_send", boom):
+            with self.assertRaises(actions.BackgroundUnavailable) as ctx:
+                actions.click(1, 2, delivery="background", hwnd=0x100)
+        self.assertEqual(ctx.exception.reason, "post_failed")
+        self.assertFalse(ctx.exception.body()["dispatched"])
 
     def test_message_channel_keeps_raw_sent_false(self):
         with mock.patch.object(actions, "_click_message",

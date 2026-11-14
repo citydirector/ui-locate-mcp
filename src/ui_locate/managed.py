@@ -54,13 +54,15 @@ DESKTOP_POST_ROUTES = frozenset({
     "/steps",      # 多步注入输入
 })
 
-# 托管模式下仍然可用的路由：给定图片的分析，以及状态查询本身。
+# 托管模式下仍然可用的路由：给定图片的分析、状态查询，以及"暂停/恢复"这个
+# 安全开关本身 —— 暂停是"别动我的桌面"，拒掉它等于不让人刹车。
 ALLOWED_GET = frozenset({"/health"})
-ALLOWED_POST = frozenset({"/locate-image", "/compare-images"})
+ALLOWED_POST = frozenset({"/locate-image", "/compare-images", "/pause", "/resume"})
 
-# 托管模式下真正该被调用的东西在 Host 侧，**不是**本服务那些被拒的工具名。
-# 把被拒的名字写进 hint 只会让代理换个名字再撞一次同样的墙。
-_HOST_TOOLS = "ui_locate_cua_locate / ui_locate_cua_act（以及 Host 的 CUA 语义接口）"
+# 托管模式下桌面操作要去**另一个实例**做：独立（standalone）实例的
+# `ui_locate_act` + delivery="background"。把被拒的工具名写进 hint 只会让
+# 代理换个名字再撞一次同样的墙，所以这里只写真实能用上的入口。
+_HOST_TOOLS = "独立（standalone）实例的 ui_locate_act 并传 delivery=\"background\""
 
 
 def enabled() -> bool:
@@ -89,9 +91,9 @@ def refusal(where: str, *, method: str = "", contract: int = CONTRACT_VERSION) -
         "error": (
             "托管模式：本服务不提供自主桌面能力（抓屏 / 列窗口 / 切前台 / 注入输入）。"
         ),
-        "hint": f"请改用 Host 侧的工具（{_HOST_TOOLS}）—— 抓屏、找目标、点击都由"
-                "Host 负责，本服务不参与；只分析给定图片请用 /locate-image 或 "
-                "ui_locate_image；比较两张给定图片请用 /compare-images。",
+        "hint": "托管实例不提供桌面能力；桌面操作请用" + _HOST_TOOLS + "；"
+                "只分析给定图片请用 /locate-image 或 ui_locate_image；"
+                "比较两张给定图片请用 /compare-images。",
     }
 
 

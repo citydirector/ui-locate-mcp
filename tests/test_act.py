@@ -168,6 +168,21 @@ class BuildActionTests(unittest.TestCase):
         with self.assertRaises(A.ActError) as ctx:
             A.build_action({"action": "explode"}, self.target)
         self.assertIn("click", str(ctx.exception))
+    def test_activate_travels_with_the_action(self):
+        _n, params = A.build_action(
+            {"delivery": "background", "hwnd": 42, "activate": "never"}, self.target)
+        self.assertEqual(params["activate"], "never")
+        self.assertEqual(params["hwnd"], 42)
+        self.assertEqual(params["delivery"], "background")
+
+    def test_activate_is_omitted_when_not_given(self):
+        _n, params = A.build_action({"delivery": "background", "hwnd": 42}, self.target)
+        self.assertNotIn("activate", params)
+
+    def test_activate_is_ignored_by_wait(self):
+        name, params = A.build_action({"action": "wait", "activate": "always"}, self.target)
+        self.assertEqual(name, "none")
+        self.assertEqual(params, {})
 
 
 class DragEndpointTests(unittest.TestCase):

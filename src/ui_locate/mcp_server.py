@@ -641,6 +641,8 @@ def ui_locate_act(
     watch_ms: int = 0,
     watch_mode: str = "regions",
     watch_max_keyframes: int = 6,
+    hwnd: int = 0,
+    activate: str = "auto",
 ):
     """定位 → 动作 → 验证，**一次调用走完**。
 
@@ -680,8 +682,24 @@ def ui_locate_act(
                   给正数 = 固定等这么多毫秒
       count       连点次数（action=click 时）
       button      鼠标键 left / right / middle
-      delivery    输入通道 send_input（系统队列，要求前台）/ message（投窗口
-                  消息，后台可用）/ auto（先前者，光标没动再试后者）
+      delivery    输入通道：
+                    "auto"（默认）—— 先 SendInput；**只有明确观察到光标没动**才
+                    再投一次窗口消息（会移动真实指针）
+                    "foreground" —— 只走 SendInput，必要时切前台
+                    "background" —— 只做事后台投递：不切前台、不动真实指针、
+                    不发 SendInput。**必须给 hwnd**（只给坐标会明确报错）；
+                    先试 UIA（InvokePattern），失败落目标窗口的 PostMessage；
+                    Chromium / WinUI3 / UWP / 游戏这类自绘框架直接
+                    BACKGROUND_UNAVAILABLE，**绝不回落前台**
+                    "message" —— 底层名字：只投窗口消息（旧写法，按屏幕坐标找窗口）
+      hwnd        目标窗口句柄。delivery="background" 时**必填**：由
+                  ui_locate_windows 取得。坐标只说"点哪儿"，不说明"点进谁的窗口"
+      activate    后台通道投递前要不要先让目标"看起来是活的"：
+                    "auto"（默认）—— 目标本来不是前台才发一条 WM_ACTIVATE
+                    "never" —— 一条都不发
+                    "always" —— 每次投递前都发
+                  它**不调用 SetForegroundWindow**；但极少数应用收到 WM_ACTIVATE
+                  后会自己去抢前台，看到就改回 "never"。只对 delivery="background" 有意义
       to          action=drag 的终点：文字、"x,y" 或编号 "#17"
       delta       action=scroll 的幅度，负数向下
       value       action=type 要输入的文字（不是 text！）
@@ -718,7 +736,9 @@ def ui_locate_act(
 
     判读要点：`ok: true, verified: false` 表示「点了但屏幕上没看出变化」——
     目标可能没吃到这次点击，也可能界面本来就不会变（比如点空白处）。
-    这种情况换 delivery="message" 或改用 hotkey 更可靠。
+    这种情况换 delivery="background" + hwnd 再试一次（不抢前台），或者
+    换一个更稳定的目标。`verify.size_changed=true` 表示两次截图尺寸不同
+    （窗口改了大小/换了显示器）：那不算动作生效，也不算没生效。
     """
     _refused = _managed_refusal("ui_locate_act")
     if _refused:
@@ -729,6 +749,12 @@ def ui_locate_act(
         payload["settle_ms"] = settle_value
     if window:
         payload["window"] = window
+    hwnd_value = _as_int(hwnd, "hwnd")
+    if hwnd_value:
+        payload["hwnd"] = hwnd_value
+    activate_value = str(activate or "").strip().lower()
+    if activate_value and activate_value != "auto":
+        payload["activate"] = activate_value
     if focus and focus != "auto":
         payload["focus"] = False if focus in ("off", "false", "no", "none") else focus
     timeout_value = _as_int(verify_timeout_ms, "verify_timeout_ms")
@@ -1044,6 +1070,28 @@ def health() -> str:
             ensure_ascii=False,
         )
     return json.dumps(h, ensure_ascii=False)
+
+
+@mcp.tool()
+def ui_locate_pause(reason: str = "") -> str:
+    """立刻暂停本服务的一切输入动作（点击 / 输入 / 拖动 / 切前台）。
+
+    这是给人用的刹车：说了"别动我的桌面"之后，任何通道都不该再动手 ——
+    包括前台 SendInput。暂停期间输入类请求返回 `code:"PAUSED"`、
+    `paused:true`，不会悄悄执行，也不会静默失败。
+
+    状态在服务进程内，重启服务即复位；设置环境变量 `UI_LOCATE_PAUSE_FILE`
+    可以把它落盘到指定文件（默认不落盘）。
+
+    返回 JSON：{ok, paused, reason, since}
+    """
+    return json.dumps(_post_any("/pause", {"reason": reason or ""}), ensure_ascii=False)
+
+
+@mcp.tool()
+def ui_locate_resume() -> str:
+    """解除 `ui_locate_pause` 的暂停。返回 {ok, paused:false, was_paused}。"""
+    return json.dumps(_post_any("/resume", {}), ensure_ascii=False)
 
 
 @mcp.tool()

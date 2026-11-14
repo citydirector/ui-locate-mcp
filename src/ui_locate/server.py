@@ -58,6 +58,7 @@ from ui_locate import config, cuda_dlls
 cuda_dlls.register()
 
 from ui_locate import act as act_mod  # noqa: E402
+from ui_locate import background  # noqa: E402
 from ui_locate import compare_api, image_api, managed  # noqa: E402
 from ui_locate import capture as capture_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
@@ -1053,6 +1054,11 @@ class Handler(BaseHTTPRequestHandler):
                 delivery=str(params.get("delivery") or "auto"),
                 delay_ms=int(params.get("delay_ms") or 40),
                 pointer=params.get("pointer"),
+                # 后台投递必须绑定窗口：hwnd 优先，其次 window 写法。
+                hwnd=int(params.get("hwnd") or 0),
+                window=params.get("window"),
+                budget_ms=int(params.get("budget_ms") or 0),
+                activate=str(params.get("activate") or ""),
             )
         if action_name in ("hover", "move"):
             return actions.move(int(params["x"]), int(params["y"]),
@@ -1410,6 +1416,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/health":
             body = {"ok": True, **self._engine_health()}
             body.update(managed.health_fields())
+            # 「暂停」是进程级开关，两种模式下都要报：调用方得知道现在还能不能
+            # 让它动手，而不是发一次动作再吃一个 409。
+            body["paused"] = background.state()["paused"]
             if not managed.enabled():
                 # 托管模式下连"有几块屏、屏幕多大"都不能说：那本身就是一次
                 # 桌面发现。能力表里的 desktop:false 已经足够表达状态。
@@ -1570,6 +1579,20 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_compare()
             return
 
+        # 暂停开关：一个进程内状态，不需要模型，也不碰桌面。
+        if u.path in ("/pause", "/resume"):
+            try:
+                data = json.loads(self._body() or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+            except Exception:  # noqa: BLE001 - 空 body 也允许
+                data = {}
+            if u.path == "/pause":
+                self._send(200, {"ok": True, **background.pause(data.get("reason"))})
+            else:
+                self._send(200, {"ok": True, **background.resume()})
+            return
+
         assert ENGINE is not None
 
         if u.path == "/locate-image":
@@ -1692,6 +1715,13 @@ class Handler(BaseHTTPRequestHandler):
                     with capture_mod.choose(body.get("capture")):
                         self._send(200, diff_since(body))
                 else:
+                    if background.paused():
+                        # 暂停是给"别动我的桌面"用的，切前台当然也算动手。
+                        self._send(409, {"ok": False, "code": "PAUSED",
+                                         "paused": True,
+                                         "error": "ui-locate 已暂停：不会切换前台",
+                                         "hint": "先 POST /resume 再试"})
+                        return
                     spec = window_mod.as_spec(body.get("window"))
                     if not spec:
                         raise ValueError("要给 window（标题或句柄）")
@@ -1714,6 +1744,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请求体必须是 JSON 对象")
             except Exception as e:
                 self._send(400, {"error": f"{type(e).__name__}: {e}"})
+                return
+            if background.paused():
+                # 在动手之前就拒：让调用方拿到的是一句明确的话，而不是
+                # 动作执行到一半才抛出来的异常。
+                state = background.state()
+                self._send(409, {"ok": False, "code": "PAUSED", "paused": True,
+                                 "error": "ui-locate 已暂停：所有输入动作都被拒绝",
+                                 "reason": state.get("reason"),
+                                 "since": state.get("since"),
+                                 "hint": "先调用 ui_locate_resume（或 POST /resume）"})
                 return
             try:
                 with capture_mod.choose(data.get("capture")):

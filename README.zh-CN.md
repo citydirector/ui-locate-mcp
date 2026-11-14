@@ -122,10 +122,16 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 ### 只对一个窗口操作
 
+后台投递必须绑定窗口：传 `hwnd=`（来自 `ui_locate_windows`）或 `window=`。只给屏幕坐标会被明确拒绝（`reason: "hwnd_required"`）—— 服务不会去猜你指的是哪个窗口。
+
+`background` 内部的通道顺序是固定的：元素有 `InvokePattern` 就走 UI Automation（`channel: "uia-invoke"`）；只有**确定的**空手（`no_pattern`、`no_element`、UIA 根本不可用）才落到目标窗口消息（`channel: "message"`）。UIA 超时或报错会被报成 `code: "BACKGROUND_UNKNOWN"` + `dispatched: null` —— 动作可能已经发生，所以一条都不重发。消息通道只对白名单开放（`#32770`、WinForms 根窗口，以及 `Button`、`Edit`、`ComboBox`、`SysListView32`、`msctls_*` 这类经典控件）；Chromium、WinUI3、UWP、游戏与自绘界面一律 `BACKGROUND_UNAVAILABLE`，绝不回落前台。鼠标序列之前可能补发一条 `WM_ACTIVATE`，让控件认为自己处于激活状态 —— `activate="auto"`（默认，目标本来不是前台才发）/ `never` / `always`；它不调 `SetForegroundWindow`，但极少数应用收到后会自己去抢前台，遇到就把 `activate` 设为 `"never"`。有模态弹窗时，消息发给弹窗（`GetLastActivePopup`）、坐标也按弹窗换算，不会再点到被禁用的父窗口上。
+
+`ui_locate_pause(reason)` / `ui_locate_resume()`（或 `POST /pause` / `/resume`）会停掉所有输入路径 —— 前台与后台都停 —— 直到恢复前一律回 `code: "PAUSED"`；`/health` 会报 `paused`。进程级热键这一轮还没做。
+
 给 `ui_locate_marks`、`ui_locate_act`、`ui_locate_diff` 传 `window=`（标题或其中一段，或句柄）：
 
 - 抓图先走 Windows Graphics Capture：直接从合成器拿窗口画面，游戏被聊天窗口盖住也能抓到，GPU 渲染的内容也在，裁成客户区。每个窗口保持一个常驻会话（空闲 15 秒关闭），watch / wait 连续抓几乎零开销。WGC 失败或全黑时退到 `PrintWindow`，再退到按屏抓再裁。`UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`：`auto`（默认）、`wgc`、`printwindow`、`screen`。WGC 需要 `windows-capture` 包，插件用 `--no-deps` 安装（它的元数据要求 `opencv-python`，和 `opencv-python-headless` 冲突）。Win10 上窗口周围可能出现黄色捕获边框，Win11 会关掉。
-- 输入通道与焦点是两件事（`delivery=`）。`auto`（默认）走前台路径，点击仅在**明确观察到光标没动**时才补一次窗口消息。`foreground` 恒定走前台路径，可能移动真实指针。`background` 只投窗口消息 —— 不切前台、不动真实指针 —— 窗口吃不下时明确返回 `BACKGROUND_UNAVAILABLE`，绝不悄悄升级成 SendInput。后台目前只覆盖点击类（单击/双击/右键/中键）；键盘、滚动、拖动、移动需要 `foreground`。它是消息投递，不是保证：有些框架会忽略投递的点击，所以看 `dispatched`。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
+- 输入通道与焦点是两件事（`delivery=`）。`auto`（默认）走前台路径，点击仅在**明确观察到光标没动**时才补一次窗口消息。`foreground` 恒定走前台路径，可能移动真实指针。`background` 只投窗口消息 —— 不切前台、不动真实指针 —— 窗口吃不下时明确返回 `BACKGROUND_UNAVAILABLE`（UIA 结果不可知时是 `BACKGROUND_UNKNOWN`），绝不悄悄升级成 SendInput。后台目前只覆盖点击类（单击/双击/右键/中键）；键盘、滚动、拖动、移动需要 `foreground`。它是消息投递，不是保证：有些框架会忽略投递的点击，所以看 `dispatched`。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
 - 用 `window=` 标注的编号会记住这个窗口，之后 `ui_locate_act(mark=…)` 自动切前台、按窗口验证。
 
 ### 等待与验证
@@ -208,7 +214,8 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 - MCP 启动失败：先检查运行环境是否准备完成、虚拟环境 Python 是否存在，再重连 MCP。
 - 动作结果中的 `ok` 表示执行流程完成；只有对应的验证结果才能说明界面是否变化。`verified: false` 或 `null` 时不要当作操作成功。
-- `delivery="background"` 是消息投递，不是「Windows 上通用后台输入」：只覆盖点击类，且有些框架会忽略投递的消息。看 `dispatched`，别假设点中了。
+- `delivery="background"` 需要 `hwnd=`/`window=`，且只覆盖点击类。它是「UIA + 窗口消息」路线，不是「Windows 上通用后台输入」：有些框架会忽略投递的消息，UIA 超时会被报成 `BACKGROUND_UNKNOWN` + `dispatched: null` —— 不要盲目重试。
+- `ui_locate_pause` 一次停住所有输入路径；暂停期间 `/health` 照常回答，只是 `paused: true`。
 - 打开托管开关时，大多数工具返回 `CUA_MANAGED` 是设计如此，只剩 `/health`、`/locate-image`、`/compare-images`。Host 侧的 CUA 桥接已于 2026-11-14 撤回 —— background 投递会让 native 宿主退出（`NATIVE_EXITED` / `NATIVE_CLEANUP`），现在改由本包自有实现（`src/ui_locate/actions.py`）承担。
 - 桌面权限、前台焦点、DPI 和应用框架会影响输入与截图。定位命中也不保证目标接受合成输入。
 - 不同 ONNX Runtime 后端共用同名 Python 包；换后端应重建，避免叠装。

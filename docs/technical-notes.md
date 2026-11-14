@@ -668,8 +668,32 @@ collapsed_to_a_corner`、`test_box_entirely_left_or_above_is_dropped`、
 ## 托管拒绝该指向哪里
 
 托管模式下 hint 曾列出本服务被拒的十二个工具名。那是反的：代理读完 hint 会换一个
-同样被拒的名字再撞一次。现在 hint 指向 Host 侧真正能干活的桌面入口，并顺带说明
-纯图片的两条路（`/locate-image`、`/compare-images`）。`_HOST_TOOLS` 是唯一来源。
+同样被拒的名字再撞一次。现在 hint 只说三件事——桌面操作去**独立（standalone）
+实例**用 `ui_locate_act` 并传 `delivery="background"`；只分析给定图片用
+`/locate-image` / `ui_locate_image`；比较两张给定图片用 `/compare-images`。
+`_HOST_TOOLS` 是「桌面操作去哪」这半句的唯一来源，被拒的工具名一律不进 hint。
 
-Host 侧的 CUA 桥接工具已撤回（2026-11-14），`_HOST_TOOLS` 的文案需要随之更新，
-否则 hint 会指回一个已经不存在的入口。
+这里不再有「Host 侧 CUA 桥接」这一层（2026-11-14 已整层撤回）：托管变量
+`UI_LOCATE_CUA_MANAGED` 仍然保留，语义是「这个实例只做无桌面能力的事」，只是
+不再由任何 bundle 自动设置。
+
+## MAA 输入方式对照：哪些采用、哪些不采用
+
+参考 `MaaFramework/source/MaaWin32ControlUnit/Input/` 里的几套输入实现（`SendMessageInput`、`SeizeInput`、`InterceptionInput`、`AnchoredTouchInput`）。对照结论：
+
+**采用**
+
+- **发送前 `PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0)`，再等 10ms。** 有些控件不认「未激活窗口」里的鼠标消息，补这一条等于告诉它"你现在是活的"。参数 `activate: "never" | "auto" | "always"`，默认 `auto`：只有目标本来不是前台才发（已经在前台就不必多此一举）。它不调用 `SetForegroundWindow`，但极少数应用收到 `WM_ACTIVATE` 会自己去抢前台 —— 这一点写进 README，遇到就设 `never`。
+- **`GetAncestor(hwnd, GA_ROOTOWNER)` + `GetLastActivePopup` 改投活跃弹窗。** 有模态弹窗时，发给父窗口的消息会被丢弃（父窗口是禁用的）。多花两个 Win32 调用定位当前弹窗、把坐标按弹窗客户区重新换算，比"点了没反应"好排查。
+- **键盘 lParam 的 bit 语义。** `WM_KEYDOWN` 的 lParam 低 16 位是重复次数、16–23 位是扫描码，`WM_KEYUP` 还要再加 bit30（前一状态按下）与 bit31（转换中）。很多控件据此判断"这是真按键"，缺了扫描码会当成合成输入。
+
+**评估过但不采用**
+
+- `Seize`（`SendInput` + 真前台）：正是本次要摆脱的路径 —— 会抢焦点、会移动真实指针，在用户正在打字的机器上不可接受。
+- `with_cursor_pos`（`SetCursorPos` 后再点）：同样动真实指针；后台投递的意义就是不动它。
+- `with_window_pos`（挪窗口 + `WH_MOUSE_LL` 钩子）：为了投递去改变用户窗口位置，副作用比收益大。
+- `block_input`（`BlockInput`）：会连用户的键鼠一起冻住，崩溃时留下锁死的桌面。
+- `Interception`（内核驱动）：需要装驱动，超出"一个 Python 服务"的边界。
+- `AnchoredTouch`（合成指针 + 提升 topmost + 透明窗口）：技术可行，但会改变窗口 z 序、且在部分合成器上闪烁；留作未来可选项，当前不做。
+
+**没有采用 UIA 的 `ElementFromPoint`。** 本机实测它一律回 `E_ACCESSDENIED`（`0x80070005`），`ElementFromHandle` 正常。所以坐标命中交给 Win32 几何下探（`ChildWindowFromPointEx` 逐层，每层从屏幕坐标副本重算），拿到叶子 hwnd 之后再用 `ElementFromHandle` 取 UIA 元素试 `InvokePattern`。

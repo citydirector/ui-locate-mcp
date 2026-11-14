@@ -273,6 +273,9 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
         params["keys_mode"] = str(spec["keys_mode"])
     # 前台：输入层发 SendInput 前把目标窗口切到前台（见 server._focus）
     if action != "none":
+        if spec.get("hwnd") not in (None, "", 0):
+            # 后台投递必须绑定窗口：坐标只说"点哪儿"，不说明"点进谁的窗口"。
+            params["hwnd"] = int(spec["hwnd"])
         win = spec.get("window")
         if not win and _is_window_spec(spec.get("monitor")):
             win = spec.get("monitor")
@@ -280,6 +283,9 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
             params["window"] = win
         if spec.get("focus") not in (None, "", "auto"):
             params["focus"] = spec["focus"]
+        if spec.get("activate") not in (None, ""):
+            # 只在后台通道生效；非法值由 background 明确拒绝（bad_activate）。
+            params["activate"] = str(spec["activate"])
     return action, params
 
 
@@ -407,6 +413,15 @@ def _materialize_points(spec: dict, *, probe: Callable[..., dict | None],
 # 验证
 # ---------------------------------------------------------------------------
 
+def _frame_shape(frame: Any) -> Any:
+    """截图帧 → 形状。帧一般是 ``(img, origin)``，也可能只是 img。"""
+    try:
+        img, _origin = frame
+    except (TypeError, ValueError):
+        return getattr(frame, "shape", None)
+    return getattr(img, "shape", None)
+
+
 def verify_screen(
     before: Any,
     after: Any,
@@ -424,13 +439,25 @@ def verify_screen(
     """
     diff = compare(before, after, x, y, radius)
     if diff is None:
+        before_shape, after_shape = _frame_shape(before), _frame_shape(after)
+        if before_shape is not None and after_shape is not None and before_shape != after_shape:
+            # 尺寸变了就**不**比像素：两张图的坐标根本不是同一套。这既不能算
+            # "变了"、也不能算"没变"，只能报"不可比"，并把尺寸单独说清楚 ——
+            # 调用方据此知道是窗口改大小/换了显示器，而不是动作没生效。
+            return {"kind": "screen", "changed": None, "changed_enough": None,
+                    "size_changed": True,
+                    "before_size": list(before_shape[:2]),
+                    "after_size": list(after_shape[:2]),
+                    "note": "两次截图尺寸不同：不比较像素，也不代表动作生效"}
         return {"kind": "screen", "changed": None, "changed_enough": None,
+                "size_changed": False,
                 "note": "无法比对（截图缺失或尺寸不一致）"}
     return {
         "kind": "screen",
         "changed": round(float(diff), 2),
         "changed_enough": float(diff) > _DEFAULT_CHANGE_THRESHOLD,
         "threshold": _DEFAULT_CHANGE_THRESHOLD,
+        "size_changed": False,
         "radius": radius if x is not None else None,
         "scope": "point" if x is not None else "screen",
     }

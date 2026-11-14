@@ -174,7 +174,14 @@ class ManagedModuleTests(unittest.TestCase):
         self.assertEqual(body["contractVersion"], managed.CONTRACT_VERSION)
         self.assertEqual(body["path"], "/locate")
         self.assertEqual(body["method"], "POST")
-        self.assertIn("Host", body["hint"])
+        # hint 要指向真正能用的入口，且不能把被拒的工具名再念一遍
+        hint = body["hint"]
+        self.assertIn("standalone", hint)
+        self.assertIn('delivery="background"', hint)
+        self.assertIn("/compare-images", hint)
+        for refused in ("locate_text", "detect_elements", "ui_locate_marks",
+                        "ui_locate_windows", "ui_locate_watch"):
+            self.assertNotIn(refused, hint)
 
     def test_blocked_covers_every_desktop_route(self):
         with mock.patch.dict(os.environ, ENV):

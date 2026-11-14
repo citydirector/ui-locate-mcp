@@ -57,6 +57,7 @@ import time
 __all__ = [
     "InputError",
     "BackgroundUnavailable",
+    "Paused",
     "BACKGROUND_DELIVERIES",
     "FOREGROUND_DELIVERIES",
     "available",
@@ -72,6 +73,13 @@ __all__ = [
     "window_at",
     "describe",
 ]
+
+
+def _paused_guard() -> None:
+    """暂停中拒绝一切输入。延迟导入：background 依赖本模块。"""
+    from . import background as background_module
+
+    background_module.require_running()
 
 
 class InputError(RuntimeError):
@@ -92,18 +100,26 @@ class BackgroundUnavailable(InputError):
     code = "BACKGROUND_UNAVAILABLE"
 
     def __init__(self, message: str, *, x: int | None = None, y: int | None = None,
-                 reason: str | None = None) -> None:
+                 reason: str | None = None, dispatched: bool | None = False,
+                 code: str | None = None) -> None:
         super().__init__(message)
         self.x = x
         self.y = y
         self.reason = reason
+        if code:
+            # ``BACKGROUND_UNKNOWN``：动作可能已经发生（UIA 超时）。客户端
+            # 绝不能把它当成"没发出去"去重放。
+            self.code = code
+        # False：确定没发出去；None：**不知道**（例如 UIA 超时，动作可能已经被
+        # 目标执行了）。后者绝不能被上层当成"没发生"去重放。
+        self.dispatched = dispatched
 
     def body(self) -> dict:
         out = {
             "ok": False,
             "code": self.code,
             "error": str(self),
-            "dispatched": False,
+            "dispatched": self.dispatched,
             "verified": None,
             "delivery": "background",
         }
@@ -112,9 +128,42 @@ class BackgroundUnavailable(InputError):
         if self.reason:
             out["reason"] = self.reason
         out["hint"] = (
-            "后台通道只投窗口消息，目标坐标上必须有窗口。"
-            "换坐标、或显式改用 delivery=\"foreground\"（会移动真实指针并切换前台）。"
+            "后台投递要把事件送进某个窗口：请传 hwnd（或 window 写法），"
+            "例如先 ui_locate_windows 取窗口；只给屏幕坐标不会去猜窗口。"
+            "要动真实指针/前台就显式用 delivery=\"foreground\"。"
         )
+        return out
+
+
+class Paused(InputError):
+    """ui-locate 被显式暂停：所有输入动作一律拒绝。
+
+    ``paused`` 与"后台不可用"是两件事：暂停是**人**按下的开关，任何通道
+    （含前台 SendInput）都不该绕过它。所以这个错误不提示"改用 foreground"。
+    """
+
+    code = "PAUSED"
+
+    def __init__(self, message: str, *, reason: str | None = None,
+                 since: float | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.since = since
+
+    def body(self) -> dict:
+        out = {
+            "ok": False,
+            "code": self.code,
+            "paused": True,
+            "error": str(self),
+            "dispatched": False,
+            "verified": None,
+        }
+        if self.reason:
+            out["reason"] = self.reason
+        if self.since is not None:
+            out["since"] = self.since
+        out["hint"] = "先调用 ui_locate_resume（或 POST /resume）再执行动作。"
         return out
 
 
@@ -297,6 +346,7 @@ def _send(*items: _INPUT) -> int:
     两次独立单击（双击判定窗口通常 500ms 内，但中间插入的事件会打断）。
     """
     _require()
+    _paused_guard()
     if not items:
         return 0
     array = (_INPUT * len(items))(*items)
@@ -602,15 +652,18 @@ _BUTTON_FLAGS = {
 
 
 def click(x: int, y: int, *, button: str = "left", count: int = 1,
-          delivery: str = "auto", delay_ms: int = 40, pointer: str | None = None) -> dict:
+          delivery: str = "auto", delay_ms: int = 40, pointer: str | None = None,
+          hwnd: int = 0, window: object = None,
+          budget_ms: int = 0, activate: str = "") -> dict:
     """在屏幕绝对坐标点一下。
 
     delivery:
       "send_input" / "foreground"
                     只走系统队列（最像真人，要求前台；会移动真实指针并切前台）
       "message"     只投窗口消息（不动光标、不切前台，但很多框架不认）
-      "background"  明确的后台通道：只投窗口消息；目标上没有窗口就**报错**，
-                    不降级成 SendInput
+      "background"  明确的后台通道：**必须绑定 hwnd**（或 window 写法），
+                    目标里的元素优先走 UIA Invoke，否则投窗口消息；
+                    拿不到可投递的窗口就**报错**，不降级成 SendInput
       "auto"        先试 send_input；**只有明确观察到光标没动**才再投一次消息
 
     ``background`` 与 ``message`` 的差别只在失败时的行为：``message`` 是底层
@@ -630,15 +683,25 @@ def click(x: int, y: int, *, button: str = "left", count: int = 1,
     report: dict = {"x": x, "y": y, "button": btn, "count": count, "delivery": mode}
 
     if mode == "background":
-        # 后台通道：不动光标、不切前台、不发 SendInput。
-        msg = _click_message(x, y, mkflag, down_msg, up_msg, count, delay_ms)
-        report["message"] = msg
-        if not msg.get("sent"):
-            raise BackgroundUnavailable(
-                f"后台点击失败：{msg.get('reason') or '窗口没有接受消息'}",
-                x=x, y=y, reason=msg.get("reason"),
-            )
-        report["route"] = "background"
+        # 后台通道：绑定 hwnd，UIA 优先、窗口消息兜底，不动光标、不切前台、
+        # 不发 SendInput。只给坐标时明确报错 —— 猜窗口就是"按屏幕坐标碰运气"：
+        # 遮挡物、输入法候选框都会让事件落到别的窗口上。
+        from . import background as background_module
+
+        options = {"budget_ms": int(budget_ms)} if budget_ms else {}
+        result = background_module.click(
+            x, y, hwnd=int(hwnd or 0), window=window,
+            button=btn, count=count, delay_ms=delay_ms, **options)
+        report.update({
+            "route": "background",
+            "channel": result.get("channel"),
+            "hwnd": result.get("hwnd"),
+            "leaf": result.get("leaf"),
+            "depth": result.get("depth"),
+            "dispatched": True,
+            "sent": True,
+            "background": result,
+        })
         return report
 
     # 后台通道绝不能进这一段：这里会推真实指针。
@@ -681,6 +744,7 @@ def click(x: int, y: int, *, button: str = "left", count: int = 1,
 def _click_message(x: int, y: int, mkflag: int, down: int, up: int,
                    count: int, delay_ms: int) -> dict:
     """把带 lParam 坐标的鼠标消息直接投给那个坐标上的窗口。"""
+    _paused_guard()
     target = window_at(x, y)
     hwnd = target["hwnd"]
     if not hwnd:
