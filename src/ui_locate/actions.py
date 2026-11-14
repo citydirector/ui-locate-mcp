@@ -33,9 +33,18 @@
   vk         同时填虚拟键码和扫描码（默认）。普通程序认 VK，多数游戏认扫描码。
   scancode   加 KEYEVENTF_SCANCODE，系统只看扫描码。DirectInput 游戏最稳。
 
-`delivery="auto"` 的规则：先 SendInput；若返回值显示一条都没送出去，再退回
-PostMessage。**不把「没抛异常」当作成功** —— 这两个 API 都可能返回成功而
-什么都没发生，真正的判据在 `ui_locate.act` 的验证阶段。
+`delivery` 的规则：
+
+  "send_input" / "foreground"
+               只走系统队列。会移动真实指针、要求目标窗口在前台。
+  "message"    只投窗口消息。不动光标、不切前台，由调用方自己看 ``sent``。
+  "background" 明确的后台通道：只投窗口消息；目标上没有窗口就抛
+               ``BackgroundUnavailable``（**不降级**到 SendInput）。
+  "auto"       先 SendInput；若返回值显示一条都没送出去，再退回 PostMessage。
+
+**不把「没抛异常」当作成功** —— 这两个 API 都可能返回成功而什么都没发生，
+真正的判据在 `ui_locate.act` 的验证阶段（``verified``）。``dispatched`` 只说明
+"东西送出去了"，不代表目标程序受理了。
 """
 
 from __future__ import annotations
@@ -47,6 +56,9 @@ import time
 
 __all__ = [
     "InputError",
+    "BackgroundUnavailable",
+    "BACKGROUND_DELIVERIES",
+    "FOREGROUND_DELIVERIES",
     "available",
     "cursor",
     "move",
@@ -64,6 +76,73 @@ __all__ = [
 
 class InputError(RuntimeError):
     """输入通道不可用，或参数组合没有意义。"""
+
+
+class BackgroundUnavailable(InputError):
+    """后台通道**明确**不可用：目标坐标上没有可投递的窗口。
+
+    单独一个类，是因为调用方要做的处理不同：
+
+      * 这是"这条路走不通"，不是"参数写错了" —— 不该重试同一个请求；
+      * **绝不能**悄悄降级成 SendInput：那会移动真实指针、抢走前台焦点，
+        用户正在打字的时候尤其危险；
+      * 回包里必须带上 ``code``，让 HTTP / MCP 两边给出同一个稳定标识。
+    """
+
+    code = "BACKGROUND_UNAVAILABLE"
+
+    def __init__(self, message: str, *, x: int | None = None, y: int | None = None,
+                 reason: str | None = None) -> None:
+        super().__init__(message)
+        self.x = x
+        self.y = y
+        self.reason = reason
+
+    def body(self) -> dict:
+        out = {
+            "ok": False,
+            "code": self.code,
+            "error": str(self),
+            "dispatched": False,
+            "verified": None,
+            "delivery": "background",
+        }
+        if self.x is not None and self.y is not None:
+            out["target"] = {"x": self.x, "y": self.y}
+        if self.reason:
+            out["reason"] = self.reason
+        out["hint"] = (
+            "后台通道只投窗口消息，目标坐标上必须有窗口。"
+            "换坐标、或显式改用 delivery=\"foreground\"（会移动真实指针并切换前台）。"
+        )
+        return out
+
+
+# 通道别名。两个集合是**互斥**的：一个请求要么走后台、要么走前台，不存在
+# "先试后台、不行再前台"—— 那等于偷偷抢焦点。
+BACKGROUND_DELIVERIES = frozenset({"message", "post", "postmessage", "msg", "background", "bg"})
+FOREGROUND_DELIVERIES = frozenset({"send_input", "sendinput", "send", "input", "foreground", "fg"})
+
+
+def delivery_mode(delivery: object) -> str:
+    """把各种写法归一成 ``send_input`` / ``message`` / ``auto`` / ``background``。
+
+    ``foreground`` 与 ``send_input`` 是同一件事（都用当前焦点、都动真实指针），
+    只在返回值里保留调用方写的是哪个，便于日志区分意图。
+    """
+    mode = str(delivery or "auto").strip().lower()
+    if mode in FOREGROUND_DELIVERIES:
+        return "send_input"
+    if mode in ("post", "postmessage", "msg", "message"):
+        return "message"
+    if mode in ("background", "bg"):
+        return "background"
+    if mode in ("", "auto"):
+        return "auto"
+    raise InputError(
+        f"不认识的 delivery {delivery!r}；可用 "
+        "send_input / foreground / message / background / auto"
+    )
 
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -527,9 +606,17 @@ def click(x: int, y: int, *, button: str = "left", count: int = 1,
     """在屏幕绝对坐标点一下。
 
     delivery:
-      "send_input"  只走系统队列（最像真人，要求前台）
-      "message"     只投窗口消息（不动光标、不需焦点，但很多框架不认）
-      "auto"        先试 send_input；光标没动过就再投一次消息（默认）
+      "send_input" / "foreground"
+                    只走系统队列（最像真人，要求前台；会移动真实指针并切前台）
+      "message"     只投窗口消息（不动光标、不切前台，但很多框架不认）
+      "background"  明确的后台通道：只投窗口消息；目标上没有窗口就**报错**，
+                    不降级成 SendInput
+      "auto"        先试 send_input；**只有明确观察到光标没动**才再投一次消息
+
+    ``background`` 与 ``message`` 的差别只在失败时的行为：``message`` 是底层
+    原语，失败就回 ``sent: False`` 让调用方自己判断；``background`` 是给
+    上层（``/act``、MCP）用的声明式选项，失败必须是一个**明确的错误**，
+    不能被"再试一次前台"掩盖过去。
     """
     _require()
     btn = str(button or "left").strip().lower()
@@ -537,18 +624,25 @@ def click(x: int, y: int, *, button: str = "left", count: int = 1,
         raise InputError(f"不认识的鼠标键 {button!r}；可用 left / right / middle")
     count = max(1, int(count))
 
-    mode = str(delivery or "auto").strip().lower()
-    if mode in ("sendinput", "send", "input"):
-        mode = "send_input"
-    if mode in ("post", "postmessage", "msg"):
-        mode = "message"
-    if mode not in ("send_input", "message", "auto"):
-        raise InputError(f"不认识的 delivery {delivery!r}；可用 send_input / message / auto")
+    mode = delivery_mode(delivery)
 
     down, up, mkflag, down_msg, up_msg = _BUTTON_FLAGS[btn]
-    report: dict = {"x": x, "y": y, "button": btn, "count": count}
+    report: dict = {"x": x, "y": y, "button": btn, "count": count, "delivery": mode}
 
-    if pointer_mode(pointer) == "relative" and mode != "message":
+    if mode == "background":
+        # 后台通道：不动光标、不切前台、不发 SendInput。
+        msg = _click_message(x, y, mkflag, down_msg, up_msg, count, delay_ms)
+        report["message"] = msg
+        if not msg.get("sent"):
+            raise BackgroundUnavailable(
+                f"后台点击失败：{msg.get('reason') or '窗口没有接受消息'}",
+                x=x, y=y, reason=msg.get("reason"),
+            )
+        report["route"] = "background"
+        return report
+
+    # 后台通道绝不能进这一段：这里会推真实指针。
+    if pointer_mode(pointer) == "relative" and mode in ("send_input", "auto"):
         # 全屏游戏：先「推」到位，再原地按下抬起。不退回窗口消息 ——
         # 这类游戏本来就不认合成消息，退回去只会多一次无效点击。
         rel = _goto(x, y, "relative")

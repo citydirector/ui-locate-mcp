@@ -39,6 +39,7 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `locate_text` | Find matching UI text and its center coordinates |
 | `find_all` | Return multiple matching candidates |
 | `detect_elements` | Enumerate detected elements |
+| `ui_locate_image` | Analyse an image the caller already has: locate text or detect elements, coordinates in image pixels |
 | `ui_locate_marks` | Screenshot with numbered marks (and an optional named grid) so the model picks a number instead of guessing pixels |
 | `ui_locate_act` | Locate, perform an action and attempt verification |
 | `ui_locate_steps` | Run ordered steps and identify failures |
@@ -50,7 +51,7 @@ Stop the instance before CLI changes and restart afterwards. Prefer the Plugins 
 | `health` | Check service readiness |
 | `ui_locate_setup` | Prepare or rebuild Python dependencies and models |
 
-The first twelve entries come from MCP; the last two are Host tools. The host may prefix tool names with a namespace.
+Everything in the table is an MCP tool except `ui_locate_setup`, which the Host provides. The host may prefix tool names with a namespace.
 
 ~~~python
 locate_text(text="Save", monitor="primary")
@@ -72,17 +73,66 @@ Besides detector boxes, marks include repeated same-size cells found by geometry
 
 Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string, `all`, `window:<title>` or `hwnd:<handle>`. Locate again after the UI moves.
 
+### Analysing an image you already have
+
+When the caller already holds the pixels — a screenshot from somewhere else, an image the user attached, a frame another tool produced — `ui_locate_image` answers without touching this desktop. The same contract is served over HTTP as `POST /locate-image`.
+
+Request: `image_b64`, `width`, `height`, `text`, `mode` (`"locate"` or `"detect"`), plus the optional `limit`, `conf` and `tiled`. Any other key is rejected (`unsupported_field`) rather than ignored: a caller who writes `path` or `window` believes it works, and silent tolerance would teach the wrong lesson.
+
+The response shape is fixed at contract version 1:
+
+~~~json
+{"ok": true, "contractVersion": 1, "coordinateSpace": "image-pixels",
+ "image": {"width": 1280, "height": 720},
+ "matches": [{"text": "Save", "confidence": 0.91,
+              "box": {"x": 20, "y": 30, "width": 84, "height": 26},
+              "center": {"x": 62, "y": 43}}]}
+~~~
+
+- `width` / `height` must equal the decoded image size. A mismatch is `dimension_mismatch`, not a silently rescaled answer: every coordinate the caller derives afterwards depends on that number.
+- Coordinates are pixels from the top-left of the whole image — no monitor origin added, no normalisation — and every box is clipped inside the image.
+- `mode: "locate"` requires non-empty `text`; `mode: "detect"` may omit it or send an empty string.
+- Locate uses the same match tier as actions, not the looser one used for "just show me": exact, or the query at the start/end of the recognised text. Text where the query only appears mid-string is refused, because whoever receives a match tends to click it — a result that merely "happens to contain" the words is how the wrong window gets clicked. When the cropped OCR of detected boxes finds nothing, the whole image is re-read once before answering; a successful hit costs one pass.
+- `matches` is best-first (exact before prefix/suffix, then closeness of text length, then confidence), so `matches[0]` is the intended target. Confidence is therefore not monotonically decreasing.
+- No match is a success with `matches: []` and nothing is executed.
+- Limits: 32 MiB request body, 24 MiB image, 40 megapixels, 16384 px per side, `limit` up to 500.
+- Codes: `bad_json`, `bad_request`, `unsupported_field`, `bad_base64`, `bad_image`, `unsupported_format` (PNG and JPEG only), `too_large` (413), `dimension_mismatch`, `missing_text`, `bad_mode`, `busy` (503, engine timeout), `engine_error` (500). Failures are never cached and never return a partial match list.
+
+The route accepts no `path`, `monitor`, `window`, `capture` or `focus`, reads no file and grabs no screen; it keeps working with the desktop side switched off.
+
+### Comparing two images
+
+Whether a step actually changed anything is a question about pixels, not about file bytes: the same picture re-encoded with another compressor, or carrying one extra `tEXt` chunk, has different bytes and identical pixels. `POST /compare-images` decodes both images and compares them pixel by pixel — no detector, no OCR, no screen, no model, so it still answers when the engine failed to load.
+
+Request: `{"before": {"image_b64", "width", "height"}, "after": {...}}` — a strict whitelist, with the same size/format/volume limits as `/locate-image`. Each side's declared size must match the size in the image header (`dimension_mismatch` otherwise), and the header is checked **before** decoding, so declaring `1×1` cannot smuggle a huge image past the pixel budget.
+
+~~~json
+{"ok": true, "contractVersion": 1, "comparable": true, "changed": false,
+ "changedPixels": 0, "totalPixels": 921600, "changedRatio": 0.0,
+ "maxChannelDelta": 0, "changedBox": null,
+ "image": {"width": 1280, "height": 720},
+ "before": {"width": 1280, "height": 720},
+ "after":  {"width": 1280, "height": 720}}
+~~~
+
+- `changedPixels` counts pixels where any channel differs, with **no tolerance**: one level of difference is a difference. Deciding how much change is meaningful belongs to the caller, using `changedRatio`, `maxChannelDelta` and `changedBox`.
+- Different sizes are not comparable: HTTP 200 with `comparable: false` and `changed: null` (plus `reason: "dimension_mismatch"`). Not `false` — `false` would claim "I compared them and nothing moved". A resized pair is neither, and must never be recorded as a successful verification.
+- `comparable: false` is still a well-formed request (both images are valid, only their sizes differ). The 400s are for malformed input: `unsupported_field`, `bad_base64`, `unsupported_format`, `dimension_mismatch` (declared ≠ decoded), `too_large`.
+- `/health` advertises `capabilities.compare`, so a client can refuse to act *before* discovering halfway through that the service cannot verify the result. In managed mode this route stays available: it touches no desktop and injects no input.
+
 ### Working with one window
 
 Pass `window=` (title or part of it, or a handle) to `ui_locate_marks`, `ui_locate_act` or `ui_locate_diff`:
 
 - Capture tries Windows Graphics Capture first: it reads the window from the compositor, so a game covered by the chat window is still captured, GPU-rendered content included, cropped to the client area. One session per window stays open while frames are being requested (closed after 15 s idle), so repeated grabs during watch/wait are nearly free. If WGC fails or returns black it falls back to `PrintWindow`, then to cropping a monitor capture. `UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`: `auto` (default), `wgc`, `printwindow`, `screen`. WGC needs the `windows-capture` package; the plugin installs it with `--no-deps` (its metadata asks for `opencv-python`, which clashes with `opencv-python-headless`). On Windows 10 a yellow capture border may show around the window; Windows 11 turns it off.
-- Before sending input, the target window is brought to the foreground (SendInput only reaches the foreground window). Without `window=`, mouse actions focus the window under the point; `focus="off"` disables it. `performed.focus` reports whether it worked.
+- Input channel and focus are separate decisions (`delivery=`). `auto` (default) sends input to the foreground window and, for clicks, falls back to window messages only when the cursor demonstrably did not move. `foreground` always takes the foreground path and may move the real pointer. `background` posts window messages only — it never focuses and never moves the pointer — and refuses with `BACKGROUND_UNAVAILABLE` when the target window cannot take them, instead of quietly escalating to SendInput. Background exists for the click family (single/double/right/middle); keyboard, scroll, drag and move need `foreground`. It is a message route, not a guarantee: some frameworks ignore posted clicks, so inspect `dispatched`. Without `window=`, mouse actions focus the window under the point; `focus="off"` disables it. `performed.focus` reports whether it worked.
 - Marks taken with `window=` keep it, so `ui_locate_act(mark=…)` later focuses and verifies that window.
 
 ### Waiting and verifying
 
 With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` without text waits for a still screen. Before acting, about 80 ms of idle frames measure how much the scene moves by itself (water, particles, video); on such scenes (`verify.noise.animated`) the threshold rises with the noise and cells that were already moving are ignored, so clicking empty animated background no longer reports `verified: true`.
+
+Results keep two questions apart: `dispatched` says whether the input reached the target (a posted message was accepted, or SendInput delivered events), `verified` says whether the screen then confirmed the expected change. `verified: false` is never retried automatically — synthetic input has side effects, and replaying a click because the pixels did not move is how the same button gets pressed twice.
 
 ### Watch, then act
 
@@ -131,6 +181,16 @@ Fullscreen games often read the mouse and keyboard through Raw Input / DirectInp
 
 `action="hold"` keeps keys down for `duration_ms` (walking, charging). Keyboard actions need no target; their screen check compares the whole frame.
 
+### Managed mode
+
+`UI_LOCATE_CUA_MANAGED=1` tells the Python service that a Host owns this desktop. Every autonomous desktop capability — capture, monitor and window listing, marks, watch, diff, steps, frames, focus, input — is then refused with HTTP `403` and `{"ok": false, "code": "CUA_MANAGED", ...}` naming the route and how to reach the Host instead. The refusal runs inside the HTTP process before routing, so posting straight to `/act` is refused exactly like the MCP tool; MCP repeats the check so a stale client learns the reason without a round trip, and `/health` stops enumerating screens and probing process integrity.
+
+Three things stay available: `GET /health`, `POST /locate-image` and `POST /compare-images`. `health` reports `contractVersion`, `managed` and `capabilities` (`{"image": true, "compare": true, "desktop": false}`), so a Host can confirm it reached an instance that enforces the boundary — and can verify results — before sending anything. A Host should treat `capabilities.desktop === false` as part of the handshake, not just `managed: true`: a `true` or a missing `desktop` key means the service that answered is not the one enforcing the boundary (for instance an older standalone process on the same port), and the safe answer is to refuse the instance rather than fall back. A health response without `contractVersion` is likewise an older process: restart it rather than use it.
+
+The variable is read on every request, so the process that serves the request decides — not whoever spawned it. Unset it and the standalone service keeps all of its capabilities.
+
+A Host that keeps both a managed and a standalone instance gives the managed one its own port (the DSH bundle uses 7789) and asks `/health` before sending anything: `7788` may still be an older standalone process that enforcement never reached.
+
 ## Updating
 
 **The plugin itself is updated by the DSH plugin page; this package no longer ships
@@ -153,6 +213,8 @@ button disappear. See the [update audit](docs/update-audit.md).
 
 - If MCP will not start, check environment preparation and the virtual-environment Python before reconnecting.
 - `ok` means the action pipeline completed; inspect verification separately. `verified: false` or `null` is not confirmation that the intended action succeeded.
+- `delivery="background"` is a message route, not universal background input: it covers the click family only, and some frameworks ignore posted messages. Check `dispatched` rather than assuming the click landed.
+- With `UI_LOCATE_CUA_MANAGED=1` set, most tools return `CUA_MANAGED` on purpose; only `/health` and `/locate-image` remain. Use the Host's own computer-use path instead.
 - Desktop permissions, focus, DPI and application frameworks affect input and capture. Locating a target does not guarantee it accepts synthetic input.
 - ONNX Runtime backend wheels share the same Python package name; rebuild rather than installing competing backends together.
 - OCR can miss or misread text. Inspect the screen or target text after important actions.

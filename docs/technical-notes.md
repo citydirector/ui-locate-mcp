@@ -532,3 +532,165 @@ locate_text("设置")   →  matched='设置'   (1452, 1775)
 ```
 
 同一套修法在 `mosaic` 和 `full` 两种 OCR 模式下都生效。
+
+## 纯图片契约为什么是「固定」的（`/locate-image` v1）
+
+`/locate-image` 与其它路由最大的不同在于：它**不回答「这台机器现在长什么样」**，
+只回答「你给我的这张图里有什么」。因此它不能借用桌面路由那套灵活字段 ——
+一旦接受 `origin`、`scale`、`monitor` 这类偏移参数，调用方就会在同一份
+坐标系里混进两种含义，而错位在截图以外的任何地方都看不出来。
+
+三条硬约束，都是为了「别让调用方算出错误坐标」：
+
+1. **`origin` 恒为 `(0, 0)`**。`Engine.run()` 本身支持把元素偏移到屏幕绝对坐标
+   （`/detect` 走的就是那条路）。纯图片路径显式传 `(0, 0)`，让坐标天然就是
+   图片像素；默认参数不该被复用成"顺手也偏移一下"。
+2. **宽高必须等于解码尺寸**，不等就报 `dimension_mismatch` 而不是按比例的换算。
+   调用方给的宽高通常是它自己的渲染尺寸（缩放后的 `<img>`、DPR 不同的 canvas），
+   一旦我们替它缩放，返回的框就是「差不多对」—— 比报错更难查。
+3. **框夹进图片内**，但**不因裁剪而丢弃**。检测器偶尔给出越界的框（贴边元素），
+   丢弃会让"明明看得见却没匹配"；夹到边界至少保留位置，且 `center` 由裁剪后的
+   框重新计算，不会指向图外。
+
+失败分层也是契约的一部分：`busy`（503，引擎超时）与 `engine_error`（500）
+必须能和输入错误（400/413/415）分开 —— 前者重试可能有用，后者重试永远没用。
+所有输入校验都在调用引擎**之前**完成，测试里用「失败路径下引擎调用次数为 0」
+钉住这一点：校验失败却已经跑了一遍 OCR，是既慢又危险的顺序。
+
+## 托管边界为什么落在 HTTP 进程里
+
+`UI_LOCATE_CUA_MANAGED` 只由 **HTTP 服务进程自己的 env** 决定，MCP 侧的 env
+不参与判定。原因是部署上 MCP 与 HTTP 是两个进程：MCP 由 Host 拉起时可以带上
+变量，而端口上可能还挂着上一次独立运行留下的旧实例 —— 它没有这个变量，
+却照样接受 `/act`。如果守卫只在 MCP 里，工具名被隐藏了，HTTP 旁路仍然通着，
+"托管"就只是界面上的假象。
+
+所以拦截放在 `do_GET` / `do_POST` 路由分派之前，且**每个请求现读 env**：
+测试里在同一个实例上先设变量让 `/windows` 返回 403，再清掉变量让它返回 200，
+证明决定权在服务这次请求的进程，而不是启动时的快照。
+
+`/health` 也一并收窄：托管下不再调 `screen.describe()`、不再探进程完整性。
+健康检查顺手枚举屏幕，等于给了一条没被点名的旁路 —— 守卫写在路由表上，
+能力却从 health 漏出去，这种漏洞比不做守卫更糟。
+
+## 为什么 `auto` 能降级、`background` 不能
+
+`auto` 的历史行为是"先 SendInput，只有**明确观察到光标没动**才补一次窗口消息"。
+这里的降级是可观测的：光标位置读回来了，确实没动，说明前台路径没生效。
+`background` 不一样 —— 调用方说的是"别碰我的前台"。此时再退回 SendInput，
+结果不是"动作失败"，而是光标在别人打字时跳走；而且返回值里看不出发生过，
+无法补偿。所以 `background` 只走 `PostMessage`，窗口吃不下就抛
+`BackgroundUnavailable`，附 `dispatched: false` 和指向 `foreground` 的提示。
+
+顺带把 `dispatched` 与 `verified` 拆开：前者是"输入有没有送出去"（消息被接受
+的条数、SendInput 的事件数），后者是"画面有没有确认"。这两件事过去挤在
+`ok` 里，导致 `verified: false` 看起来像"没做"，于是有人去重试 —— 而输入
+是有副作用的，重放一次点击就是点两下。`act()` 里因此只在 `verified` 之外
+单独记录 `dispatched`，并且**任何情况下都不因 `verified: false` 重放动作**。
+
+## mosaic 的漏网，以及为什么纯图片路径要回退一次
+
+`/locate-image` 最初只跑一遍 `text_mode="mosaic"`。真实模型冒烟把这个假设
+打穿了：合成的按钮图（白底、深色矩形、白字）被检测器准确框住
+（`x=39,y=72,w=186,h=70`），但 mosaic 的裁片 OCR 读出来是空串；
+同一张图改用 `full` 整页 OCR，一次就命中 `Save`、`text_score=1.0`。
+
+原因不在匹配而在**取字**：mosaic 只把检测框内的裁片拼成一张长图去 OCR，
+裁片太小、或者框的边缘把字切掉一点，识别就整段丢掉；而这段文字根本没有
+以别的形式进入结果，所以 `find()` 再宽松也找不到。live 路径早就吃过这个
+亏 —— `_probe_hit()` 的注释里写着「检测器一旦漏框，那段文字就根本没进
+OCR」，因此 `/act` 会在 mosaic 空手时退回 full 再找一遍。
+
+纯图片路径的消费者是 Host 桥接：它拿 `matches[0]` 就去 CUA 点。也就是说
+它和 `/act` 同级，而不是和「只回坐标给人看」的 `/locate` 同级。所以两处
+都对齐到 `/act`：
+
+1. 匹配档收紧到 `starts`（exact / 前缀 / 后缀）。`contains` 只适合把候选
+   列出来给人挑；一旦有人照着点，「碰巧包含」就是点错。
+2. mosaic 空手时整图 OCR 再扫一遍。代价只在"没找到"时支付：命中仍是一遍。
+
+实测代价（本机 DML + CPU OCR，640×240 合成图）：mosaic 单遍 OCR ≈ 0.69s，
+full ≈ 0.74s，检测器单遍约 0.1s 级。真实截图更大，但同量级；对一次
+「找不到就什么都不做」的判断来说，多付一遍 OCR 换回一个真实存在的按钮，
+是划算的。
+
+## 跨仓契约（与 cua-bridge 实际对齐的结果）
+
+Host 桥接（`plugin/cua-bridge.mjs`，B 维护）与 Python 服务之间只走两条路径：
+`GET /health` 与 `POST /locate-image`。已确认的细节，写在这里是因为它们分布在
+两个仓库里，任一侧单独看都不完整：
+
+- **端口**：bundle 里的托管服务用 **7789**（`cordis.patch.yml` 的
+  `UI_LOCATE_PORT: '7789'`）。7788 上常驻的 legacy 实例既不复用也不杀 ——
+  它没有 `contractVersion`，握手会得到 `CONTRACT_MISMATCH`。Host 的候选顺序是
+  `UI_LOCATE_BASE_URL` → `UI_LOCATE_PORT` → 7789 → 7788，逐个问 `/health`，
+  只接受 `contractVersion===1 && managed===true && capabilities.image===true`
+  的那个，并在**本次调用内钉住端口**（health 与 locate 必打同一端口）。
+- **请求**：严格五键 `{image_b64,width,height,text,mode}`；`limit/conf/tiled`
+  由 Host 不发、走服务默认（5 / 0.3 / true）。`mode:"detect"` 时发 `text: ""`，
+  空串合法。
+- **响应**：Host 校验 `ok/contractVersion/coordinateSpace/image/matches` 与每条
+  match 的字段和几何（box 在 image 内、center 在 box 内、confidence ∈ [0,1]）；
+  **没有**排序断言，它始终取 `matches[0]`。所以排序口径只由本仓库定义：
+  exact → 前缀/后缀 → 长度差 → confidence。
+- **空 matches**：Host 视为成功、`dispatched:false, verification:"no-match"`，
+  不再截第二张图、不重试。这正是放弃 contains 档后误命中场景的归宿。
+- **时限**：单次 locate 30s、整个工具调用 60s；mosaic 空手时的整图重读在预算内。
+- **托管拒绝**：Host **不依赖** 403 的具体取值（它从不碰桌面路由）；`/health`
+  的 `managed` 才是它判定的依据。因此 403 + `CUA_MANAGED` 只服务于
+  「绕过桥接直接打 HTTP 的调用方」。
+
+## 比较为什么必须落在像素上（`/compare-images`）
+
+Host 最初的做法是比较前后两张截图的 PNG 编码字节。这条路有个安静的失效模式：
+PNG 是有损于"字节"的容器 —— 压缩级别不同、多一个 `tEXt` 块（工具名、时间戳）、
+换一个编码器，像素一模一样而字节完全不同。`tests/test_compare_api.py` 里两个用例
+直接钉住它：`test_same_pixels_different_encoding_is_unchanged`（压缩级别 0 vs 9，
+先断言字节不等）与 `test_same_pixels_different_metadata_is_unchanged`（在 IHDR 后
+插一个 CRC 合法的 `tEXt` 块，同样先断言字节不等）。两者都必须回 `changed: false`。
+
+比较本身没有算法：`cv2.absdiff` → 任一通道非零 → `np.count_nonzero`。**刻意不给
+容差**。加一个 `tolerance` 会把"变了多少像素"折叠成一个布尔，调用方随即开始争论
+该设多少；现在它拿到 `changedPixels` / `changedRatio` / `maxChannelDelta` /
+`changedBox`，判断权与证据分离，同一对图永远给出同样的数字。
+
+## 尺寸不同为什么是 `comparable: false` 而不是 400
+
+400 在本服务里统一表示"请求写错了，改一改再发"（`bad_base64`、`unsupported_field`
+那一档）。两张尺寸不同的图各自都合法，只是**不可比**，把它塞进 400 会让客户端的
+错误处理把它当参数/传输故障。更关键的是语义：`changed: false` 的含义是"我比过了，
+没动"；尺寸变了既不是"动了"也不是"没动"，所以是 `null` + `comparable: false` +
+`reason: "dimension_mismatch"`。检验成功的判断必须留在 Host 侧（它把尺寸变化记成
+自己的 dimension-changed），本服务不替它下结论，更不会把不可比记成成功。
+
+## 解码之前先读文件头（`_probe_size`）
+
+`cv2.imdecode` 按图片**自己声明**的尺寸分配内存。请求写 `width=1,height=1` 却塞一张
+50000×50000 的图时，先解码再比对等于先把内存花掉，40MP 上限形同虚设。所以
+`image_api._decode_image` 现在：magic 检查 → 读头（PNG 的 IHDR / JPEG 的第一个
+SOF 段，只看几十字节）→ 头尺寸过 `MAX_SIDE` / `MAX_PIXELS` → 与声明尺寸比对 →
+**才** `imdecode` → 解码后再按真实尺寸过一遍限额（头也可能撒谎）。
+
+测试用 `mock.patch.object(cv2, "imdecode", side_effect=AssertionError)` 证明这些
+拒绝路径**一次都没解码**：`test_png_header_over_the_side_limit_is_413_before_decode`、
+`test_png_header_over_the_pixel_budget_is_413_before_decode`、
+`test_declared_small_but_large_png_is_refused_before_decode`、
+`test_jpeg_header_is_checked_before_decode`；`/compare-images` 复用同一函数，
+`test_declared_small_but_large_image_is_refused_before_decode` 覆盖它。
+
+## 整框落在图外为什么要丢弃（`_clip_box`）
+
+早先的实现把裁剪后的宽高强行抬到 ≥1。于是一个 `x1=y1=300`、图片只有 200×100 的
+检测结果，会被夹成 `(199, 99, 1, 1)` —— 图片右下角那一个像素，一个**可以点**的
+坐标。收到它的人不会知道这是"框完全在图外"，只会以为匹配错了。现在：非有限坐标
+（NaN / ±Inf）直接丢；与图片没有交集直接丢；只有确实有交集、但取整后不足 1px 的
+框才抬到 1px（此时它一定落在图内）。反例见 `test_fully_outside_box_is_dropped_not_
+collapsed_to_a_corner`、`test_box_entirely_left_or_above_is_dropped`、
+`test_non_finite_geometry_is_dropped`。
+
+## 托管拒绝该指向哪里
+
+托管模式下 hint 曾列出本服务被拒的十二个工具名。那是反的：代理读完 hint 会换一个
+同样被拒的名字再撞一次。现在 hint 指向 Host 侧真正能干活的入口
+（`ui_locate_cua_locate` / `ui_locate_cua_act` 及 CUA 语义接口），并顺带说明纯图片
+的两条路（`/locate-image`、`/compare-images`）。`_HOST_TOOLS` 是唯一来源。

@@ -10,10 +10,13 @@
   读 77MB 模型的 IO。
 
 端点（全部 JSON）：
-  GET  /health                     存活与预热状态
+  GET  /health                     存活与预热状态（含 contractVersion / managed）
   POST /detect   {"path": "..."}   检测指定图片
   POST /detect                    body 直接是 PNG/JPEG 字节
   GET  /find?text=保存             按文字找元素（服务内部先检测+OCR）
+  POST /locate-image              只分析请求里给的这张图片（无抓屏、无 origin）
+  POST /compare-images            逐像素比较两张给定图片（不跑引擎、不抓屏）
+                                  见 image_api.py；托管模式下这是唯一可用的分析入口
   POST /locate   {"text": "保存"}  只返回坐标，不点击
   POST /act      {"text": "...", "action": "click", "verify": "screen"}
                                    定位 → 动作 → 验证，一次请求走完
@@ -55,6 +58,7 @@ from ui_locate import config, cuda_dlls
 cuda_dlls.register()
 
 from ui_locate import act as act_mod  # noqa: E402
+from ui_locate import compare_api, image_api, managed  # noqa: E402
 from ui_locate import capture as capture_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
@@ -995,13 +999,15 @@ class Handler(BaseHTTPRequestHandler):
 
         目标窗口怎么定：params 里有窗口写法（来自 window= / monitor="window:…"）就用它；
         否则用点击点下面那个顶层窗口；纯键盘动作又没给窗口 → 不动前台。
-        focus=false 关掉；delivery=message 不需要前台，也跳过。
+        focus=false 关掉；后台通道（message / background）不需要前台，也跳过。
         """
         want = params.pop("focus", "auto")
         win = params.pop("window", None)
         if want in (False, "false", "off", "no", "0", "none"):
             return None
-        if str(params.get("delivery") or "") == "message":
+        # 后台通道的前提就是"不动前台"：这里要是照切，PostMessage 虽然还能
+        # 送到，但用户的焦点已经被抢走了 —— 那就不是后台了。
+        if str(params.get("delivery") or "").strip().lower() in actions.BACKGROUND_DELIVERIES:
             return None
         if not actions.available():
             return None
@@ -1273,25 +1279,149 @@ class Handler(BaseHTTPRequestHandler):
 
         return grab_screen()
 
+    def _managed_block(self, path: str, method: str) -> bool:
+        """托管模式下拒绝自主桌面路由。返回 True 表示已经回过包。
+
+        守卫放在**路由分派之前**，而不是逐个分支里：`do_*` 的每条分支都会
+        抓屏 / 列窗口 / 注入输入，逐条加判断迟早会漏一条，而漏掉的那条就是
+        绕过。`managed.blocked()` 只认已知桌面路由，未知路径仍走 404 ——
+        否则拼错的 URL 会被报成"权限问题"，排查时容易走错方向。
+        """
+        refuse = managed.blocked(path, method)
+        if refuse is None:
+            return False
+        self._send(403, refuse)
+        return True
+
+    def _refuse_oversize_body(self) -> bool:
+        """`/locate-image` 的体积闸门：超限就不读 body。
+
+        读进来再判断等于"先把 24MB 收下再说"，对一个不受信任的接口没有意义。
+        代价是连接不能复用（body 还在 socket 里，见 `_drain` 的注释），所以
+        直接关连接 —— 413 之后本来就该断开，让客户端重新开一条干净的连接。
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= image_api.MAX_BODY_BYTES:
+            return False
+        self.close_connection = True
+        # 标记 body 已读，避免 _send → _drain 再去读那 24MB。
+        self._body_done = True
+        self._body_cache = b""
+        self._send(413, {
+            "ok": False,
+            "code": "too_large",
+            "error": f"请求体超过 {image_api.MAX_BODY_BYTES} 字节（声明 {n}）",
+            "contractVersion": managed.CONTRACT_VERSION,
+        })
+        return True
+
+    def _serve_image(self) -> None:
+        """POST /locate-image：给定图片 + 文字 → 图片像素坐标。
+
+        这条路径**不碰桌面**：不抓屏、不列窗口、不切前台、不读本地路径。
+        它拿到什么图就分析什么图，坐标只相对这张图解释。
+
+        匹配口径见 `image_api.locate_image`：与动作同级（exact / 前缀 / 后缀），
+        并在 mosaic 裁片 OCR 空手时整图再读一遍 —— 这条路径的消费者会照着
+        matches[0] 去点，宁可多付一遍 OCR，也不能把存在的目标报成"没有"。
+        """
+        if self._refuse_oversize_body():
+            return
+        raw = self._body()
+        try:
+            payload = image_api.parse_body(raw)
+            result = image_api.locate_image(payload, ENGINE)
+        except image_api.ImageError as exc:
+            # 400/413/415/503 各自代表调用方该做不同的事，不能糊成一个 500
+            self._send(exc.status, exc.body())
+            return
+        except Exception as exc:  # noqa: BLE001 - 兜底也要给稳定错误码
+            self._send(500, {
+                "ok": False,
+                "code": "engine_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "contractVersion": managed.CONTRACT_VERSION,
+            })
+            return
+        self._send(200, result)
+
+    def _engine_health(self) -> dict:
+        """引擎状态，允许引擎没起来。
+
+        托管实例可能只被用来做纯图片分析与比较 —— 那两条路径不需要模型。
+        模型加载失败时 `/health` 仍必须回答，否则 Host 会把"比较能力在、模型
+        不在"误判成"整个服务不可用"。
+        """
+        engine = ENGINE
+        if engine is None:
+            return {
+                "ready": False,
+                "provider": None,
+                "active": False,
+                "ocr": False,
+                "warmup_ms": 0.0,
+            }
+        det = getattr(engine, "det", None)
+        return {
+            "ready": bool(getattr(engine, "ready", False)),
+            "provider": getattr(engine, "provider", None),
+            "active": bool(getattr(det, "active", False)),
+            "ocr": bool(getattr(engine, "use_ocr", False)),
+            "warmup_ms": round(float(getattr(engine, "warmup_ms", 0.0) or 0.0), 1),
+        }
+
+    def _serve_compare(self) -> None:
+        """POST /compare-images：两张给定图片 → 真实像素有没有变。
+
+        这条路径连引擎都不碰：不抓屏、不列窗口、不切前台、不读本地路径、
+        不注入输入，也不 load 模型。托管模式下它与 `/locate-image` 一样可用，
+        并在模型加载失败时仍然工作 —— 它是"动作有没有生效"的独立证据源。
+        """
+        if self._refuse_oversize_body():
+            return
+        raw = self._body()
+        try:
+            payload = compare_api.parse_body(raw)
+            result = compare_api.compare_images(payload)
+        except image_api.ImageError as exc:
+            # 两侧各自的格式/尺寸/体积错误走同一套码，field 里带 before./after.
+            self._send(exc.status, exc.body())
+            return
+        except Exception as exc:  # noqa: BLE001 - 兜底也要给稳定错误码
+            self._send(500, {
+                "ok": False,
+                "code": "compare_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "contractVersion": managed.CONTRACT_VERSION,
+            })
+            return
+        self._send(200, result)
+
     def do_GET(self) -> None:
-        assert ENGINE is not None
         u = urlparse(self.path)
         q = parse_qs(u.query)
 
-        if u.path == "/health":
-            self._send(200, {
-                "ok": True,
-                "ready": ENGINE.ready,
-                "provider": ENGINE.provider,
-                "active": ENGINE.det.active,
-                "ocr": ENGINE.use_ocr,
-                "warmup_ms": round(ENGINE.warmup_ms, 1),
-                "screen": screen.describe(),
-                # 本服务的完整性级别：medium 时操作不了以管理员运行的窗口（UIPI）
-                "integrity": window_mod.self_integrity(),
-            })
+        if self._managed_block(u.path, "GET"):
             return
 
+        if u.path == "/health":
+            body = {"ok": True, **self._engine_health()}
+            body.update(managed.health_fields())
+            if not managed.enabled():
+                # 托管模式下连"有几块屏、屏幕多大"都不能说：那本身就是一次
+                # 桌面发现。能力表里的 desktop:false 已经足够表达状态。
+                body["screen"] = screen.describe()
+                # 完整性级别只影响"能不能操作管理员窗口"，托管模式下不注入
+                # 输入，这项也就没有意义了。
+                body["integrity"] = window_mod.self_integrity()
+            self._send(200, body)
+            return
+
+        # 只有真正要看屏幕的分支才需要引擎：`/health` 在模型没起来时也要答。
+        assert ENGINE is not None
         if u.path == "/monitors":
             self._send(200, screen.describe())
             return
@@ -1428,9 +1558,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
     def do_POST(self) -> None:
-        assert ENGINE is not None
         u = urlparse(self.path)
         q = parse_qs(u.query)
+
+        if self._managed_block(u.path, "POST"):
+            return
+
+        # 纯图片比较先于引擎断言：它不需要模型，模型没加载也能回答
+        # "这两张图一不一样"。
+        if u.path == "/compare-images":
+            self._serve_compare()
+            return
+
+        assert ENGINE is not None
+
+        if u.path == "/locate-image":
+            self._serve_image()
+            return
 
         if u.path == "/detect":
             try:

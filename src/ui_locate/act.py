@@ -30,6 +30,17 @@ cua_driver 点击 → 模型再截图确认。每一步都是一次完整的模�
   - ``verify: {"text": "..."}`` —— 动作后在限定时间内有没有出现这段文字（更强的判据）
 
 两者都给时先比对再等文字，两个都过才叫 ``verified: true``。
+
+``dispatched`` 与 ``verified`` 是两件事，故意分开报：
+
+  - ``dispatched`` —— 输入事件有没有送到目标进程（PostMessage 的返回值、或
+    SendInput 实际送出的条数）。它证明"送出去了"，**不证明**程序受理了。
+  - ``verified`` —— 屏幕/文字有没有按预期变化。``None`` 表示"这次没有判据"，
+    不是"失败"，更不是"成功"。
+
+``verified: false`` 的动作**不会自动重放**。输入是有副作用的：那一次点击可能
+已经落下、只是反馈慢了一帧；重放就会点两次（"买 20 个"变成 40 个）。是否重试
+由调用方决定 —— 它知道这一步幂不幂等，本模块不知道。
 """
 
 from __future__ import annotations
@@ -196,6 +207,54 @@ def _keys(value: Any) -> str:
 
 _MOUSE_ACTIONS = {"click", "double_click", "right_click", "middle_click", "hover", "move"}
 _KEYBOARD_ACTIONS = {"type", "write", "press", "key", "hold", "hold_key", "hotkey", "shortcut"}
+
+# 有后台实现的动作：只有点击类。它们能靠 PostMessage 把带坐标的 WM_* 直接
+# 投给目标窗口，不需要焦点、不动真实指针。
+_CLICK_ACTIONS = {"click", "double_click", "right_click", "middle_click"}
+
+_BG_ALIASES = ("background", "bg")
+_FG_ALIASES = ("foreground", "fg", "send_input", "sendinput", "send", "input")
+_MSG_ALIASES = ("message", "post", "postmessage", "msg")
+
+
+def delivery_plan(action: str, spec: dict) -> tuple[str | None, str | None, str | None]:
+    """决定这次动作走哪条通道。返回 ``(delivery, 拒绝原因, 拒绝码)``。
+
+    ``background`` 是一个**声明式**选项：调用方说"别动我的前台"，那本模块就
+    只能答应或者明确拒绝 —— 绝不能"后台不行就悄悄换成前台"。悄悄降级的表现
+    是：用户正在打字，光标突然跳走、焦点被抢。比动作失败糟糕得多。
+
+    后台目前只对点击类动作有实现。键盘要投 WM_KEYDOWN，得先解决"发给哪个
+    窗口、焦点语义怎么算"，而 PostMessage 键盘在 Chromium / WPF 上普遍不认 ——
+    与其猜一个不可靠的实现，不如明确说"不支持"。
+
+    拒绝码分三种，因为调用方要做的事不一样：``BACKGROUND_UNAVAILABLE`` 是
+    "这个动作没有后台实现"（可改用 foreground 或放弃），``CHANNEL_UNSUPPORTED``
+    是"这个动作只能走前台"（同上），``BAD_DELIVERY`` 是拼错了（改单词即可）。
+    """
+    raw = str(spec.get("delivery") or "").strip().lower()
+    if not raw or raw == "auto":
+        return None, None, None  # 交给输入层的默认行为
+    if raw in _FG_ALIASES:
+        # 显式前台：点击类改走 send_input（会移动真实指针、必要时切前台），
+        # 键盘/其它动作本来就只走 SendInput，不需要额外参数。
+        return ("send_input" if action in _CLICK_ACTIONS else None), None, None
+    if raw in _BG_ALIASES:
+        if action in _CLICK_ACTIONS:
+            return "background", None, None
+        return None, (
+            f"{action} 没有后台实现：目前只有点击类动作能只投窗口消息。"
+            "要执行这个动作请用 delivery=\"foreground\"（会移动真实指针并切换前台）。"
+        ), "BACKGROUND_UNAVAILABLE"
+    if raw in _MSG_ALIASES:
+        if action in _CLICK_ACTIONS:
+            return "message", None, None
+        return None, (
+            f"{action} 不支持 message 通道：目前只有点击类动作能只投窗口消息。"
+        ), "CHANNEL_UNSUPPORTED"
+    return (None,
+            f"不认识的 delivery {raw!r}；可用 foreground / background / message / auto",
+            "BAD_DELIVERY")
 
 
 def build_action(spec: dict, target: dict) -> tuple[str, dict]:
@@ -485,6 +544,7 @@ def act(
             "target": None,
             "target_source": None,
             "performed": None,
+            "dispatched": None,
             "verified": None,
             "timings": timings,
         }
@@ -522,6 +582,8 @@ def act(
             "stage": "find",
             "error": f"屏幕上没找到 {info.get('text')!r}",
             "target": None,
+            "dispatched": None,
+            "verified": None,
             "timings": timings,
         }
 
@@ -542,8 +604,31 @@ def act(
 
     if action == "none":
         timings["total_ms"] = _ms(t_all, clock)
-        result.update({"performed": None, "verified": None, "timings": timings})
+        result.update({"performed": None, "dispatched": None, "verified": None,
+                       "timings": timings})
         return result
+
+    # 通道在这里定，然后才轮到"抓 before 图"。后台不支持的组合要在
+    # **动手之前**拒绝：先抓一张图再报错，等于为了报错多付一次抓屏代价，
+    # 还会让调用方误以为"已经开始执行了"。
+    plan, refusal, plan_code = delivery_plan(action, spec)
+    if refusal:
+        timings["total_ms"] = _ms(t_all, clock)
+        result.update({
+            "ok": False,
+            "stage": "act",
+            "code": plan_code or "BACKGROUND_UNAVAILABLE",
+            "error": refusal,
+            "performed": None,
+            "dispatched": False,
+            "verified": None,
+            "delivery": str(spec.get("delivery") or "").strip().lower(),
+            "timings": timings,
+        })
+        return result
+    if plan:
+        params["delivery"] = plan
+    result["delivery"] = plan or params.get("delivery") or "auto"
 
     if action == "drag":
         spec = _materialize_points(spec, probe=probe, timings=timings, clock=clock)
@@ -580,8 +665,25 @@ def act(
             "stage": "act",
             "error": f"{type(exc).__name__}: {exc}",
             "performed": None,
+            # 走到这里说明输入层根本没把事件送出去（或明确拒绝送），
+            # 所以 dispatched 是 False 而不是 None：这不是"没验证"。
+            "dispatched": False,
+            "verified": None,
             "timings": timings,
         })
+        # 输入层可以给自己的失败一个稳定 code（如 BACKGROUND_UNAVAILABLE）。
+        # 用 attr 而不是 import 它：act 是纯编排层，不依赖 ctypes / Win32。
+        code = getattr(exc, "code", None)
+        if code:
+            result["code"] = code
+            body = getattr(exc, "body", None)
+            if callable(body):
+                try:
+                    hint = body().get("hint")
+                except Exception:  # noqa: BLE001
+                    hint = None
+                if hint:
+                    result["hint"] = hint
         # 这条路径也必须带上 capture_error。抓屏失败与动作失败同时发生时，
         # 只说「动作失败」等于把另一半真相扔掉：调用方会去查目标窗口，
         # 而真正的问题可能是本进程根本没有抓屏/注入权限 —— 两件事该查的
@@ -592,6 +694,9 @@ def act(
         return result
     timings["act_ms"] = _ms(t0, clock)
     result["performed"] = performed
+    # 「送出去了」与「程序受理了」分开报：前者的证据在输入层的返回值里，
+    # 后者只能靠 verified 的像素/文字判据。
+    result["dispatched"] = _dispatched(performed)
 
     mode = settle_mode(spec, verify, can_diff=differ is not None and before is not None)
     after = None
@@ -800,6 +905,37 @@ def _relative_to_noise(check: dict, noise: dict) -> None:
     threshold = max(_DEFAULT_CHANGE_THRESHOLD, noise["mean"] * 2 + 1.5)
     check["threshold"] = round(threshold, 2)
     check["changed_enough"] = float(check["changed"]) > threshold
+
+
+def _dispatched(performed: Any) -> bool | None:
+    """从输入层返回值里读出「事件送出去了没有」。
+
+    三种形态，按可靠性排：
+
+      1. ``message`` 字典 —— PostMessage 的 ``accepted == total``（后台通道）
+      2. ``send_input`` 字典 —— SendInput 实际送出的条数 > 0
+      3. 顶层的 ``sent``（键盘/滚轮等）
+
+    读不出来就回 ``None``：不知道 ≠ 失败。把它写成 False 会让调用方以为
+    "完全没送出去"而去重试，而实际上可能已经送出去了。
+    """
+    if not isinstance(performed, dict):
+        return None
+    msg = performed.get("message")
+    if isinstance(msg, dict) and "sent" in msg:
+        return bool(msg["sent"])
+    si = performed.get("send_input")
+    if isinstance(si, dict) and si.get("sent") is not None:
+        try:
+            return int(si["sent"]) > 0
+        except (TypeError, ValueError):
+            return None
+    if performed.get("sent") is not None:
+        try:
+            return int(performed["sent"]) > 0
+        except (TypeError, ValueError):
+            return bool(performed["sent"])
+    return None
 
 
 def _checks_pass(checks: list[dict]) -> bool:

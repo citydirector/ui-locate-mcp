@@ -37,6 +37,27 @@
         env:
           # 同一个目录，传给 Python 侧（模型 / 日志落这里）
           UI_LOCATE_HOME: !!js '`${process.env.UI_LOCATE_HOME ?? (process.env.DSH_HOME ? `${process.env.DSH_HOME}/ui-locate` : (process.env.LOCALAPPDATA ?? process.env.HOME) + "/ui-locate")}`'
+          # 托管模式：这个 MCP 进程（以及由它继承环境拉起的常驻 HTTP 服务）只保留
+          # 「给定图片做纯图片分析」的能力，自主抓屏 / 桌面发现 / 执行输入一律拒绝，
+          # 并指向 Host 的 ui_locate_cua_locate / ui_locate_cua_act。
+          #
+          # 为什么要在这里给：Python 侧读不到 DSH_ 前缀的变量，而且只给 MCP 设
+          # 不等于全机生效 —— 已经在跑的旧服务不会因此变成托管模式。Host 侧会读
+          # /health 的 managed 字段确认；不一致就报「重启到托管模式」，不会静默
+          # 复用旧实例。
+          UI_LOCATE_CUA_MANAGED: '1'
+          # 托管实例用**独立端口**，不去抢 7788。
+          #
+          # 为什么必须分开：老版本 ui-locate 的服务常常已经在 7788 上常驻（早于
+          # 托管模式，`/health` 里没有 contractVersion，也不受 managed 约束），
+          # 它不能被静默复用、也不该被我们杀掉。新服务换到 7789，两个进程各活
+          # 各的；Host 侧先问 7789 再问 7788，并且只认握手全过的那个。
+          #
+          # 这个变量会被两处继承：MCP 进程自己（`config.port()` 决定探哪个端口）
+          # 与它拉起的常驻服务（`_spawn_server` 走 `Popen` 不带 env，整份环境继承，
+          # 所以 server.py 的 `--port` 默认值也是 7789）。两处必须同值，否则
+          # ensure_ready 会一直探 7788 而把服务起在别处。
+          UI_LOCATE_PORT: '7789'
         # 首次调用要等常驻服务预热（CUDA 约 35 秒 / DirectML 约 2 秒）+ 一次整页 OCR
         toolCallTimeoutMs: 180000
     # Host 半身：准备 Python 运行环境，并让 venv 里的包跟着 npm 包版本走。

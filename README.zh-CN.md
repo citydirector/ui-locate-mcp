@@ -39,6 +39,7 @@ dsh plugin --profile web add ui-locate-mcp
 | `locate_text` | 按文字查找匹配元素及其中心坐标 |
 | `find_all` | 返回同名或相似文字的多个候选 |
 | `detect_elements` | 枚举画面中检测到的元素 |
+| `ui_locate_image` | 分析调用方已有的图片：找文字或枚举元素，坐标按图片像素算 |
 | `ui_locate_marks` | 带编号框（可叠加带名字的网格）的截图，让模型选编号而不是估像素 |
 | `ui_locate_act` | 定位后执行点击、输入、滚动等动作，并尝试验证 |
 | `ui_locate_steps` | 串行执行一组步骤，返回失败位置 |
@@ -50,7 +51,7 @@ dsh plugin --profile web add ui-locate-mcp
 | `health` | 检查服务是否就绪 |
 | `ui_locate_setup` | 准备或重建 Python 环境与模型 |
 
-前十二项由 MCP 服务提供，最后两项由 Host 插件提供；实际调用名称可能带宿主添加的命名空间。
+除 `ui_locate_setup` 由 Host 插件提供外，表内其余都是 MCP 工具；实际调用名称可能带宿主添加的命名空间。
 
 ~~~python
 locate_text(text="保存", monitor="primary")
@@ -72,17 +73,66 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 坐标使用屏幕绝对位置，多显示器可能返回负坐标。`monitor` 可为 `primary`、索引字符串、`all`、`window:<标题>` 或 `hwnd:<句柄>`。界面移动后应重新定位，不要长期复用旧坐标。
 
+### 分析手上已有的图片
+
+当调用方自己就拿着像素 —— 别处截的图、用户贴进来的图片、别的工具产出的帧 —— `ui_locate_image` 直接回答，不碰这台机器的桌面。同一套契约也走 HTTP：`POST /locate-image`。
+
+请求：`image_b64`、`width`、`height`、`text`、`mode`（`"locate"` 或 `"detect"`），可选 `limit`、`conf`、`tiled`。其它字段一律拒绝（`unsupported_field`）而不是忽略：写 `path` 或 `window` 的人会以为它生效了，默默容忍只会教出错误的用法。
+
+响应形状固定为契约版本 1：
+
+~~~json
+{"ok": true, "contractVersion": 1, "coordinateSpace": "image-pixels",
+ "image": {"width": 1280, "height": 720},
+ "matches": [{"text": "保存", "confidence": 0.91,
+              "box": {"x": 20, "y": 30, "width": 84, "height": 26},
+              "center": {"x": 62, "y": 43}}]}
+~~~
+
+- `width` / `height` 必须等于解码出来的图片尺寸。不一致报 `dimension_mismatch`，不会悄悄缩放：调用方后面算的每个坐标都依赖这个数。
+- 坐标是整张图片左上角起算的像素 —— 不叠加显示器原点、不做归一化 —— 每个框都夹在图片范围内。
+- `mode: "locate"` 要求 `text` 非空；`mode: "detect"` 可以不给，也可以给空串。
+- locate 用的是**和动作同级**的匹配档，不是「只查不动」那套宽松档：完全相同，或查询词出现在识别文本的开头/结尾（OCR 常把图标拼在按钮前，「8 插件」查「插件」会命中）。查询词只出现在中间的文本一律不算 —— 拿到匹配的人通常会直接去点，而「碰巧包含这两个字」正是点错窗口的由来。检测框裁片的 OCR 没读出字时，会整图再读一遍才回答「没找到」；命中只跑一遍。
+- `matches` 最优在前（完全相同优先于前缀/后缀，再比文本长度接近程度，最后才比置信度），所以 `matches[0]` 就是要操作的目标；也正因如此，confidence 不保证单调递减。
+- 没有匹配是**成功**，返回 `matches: []`，不会执行任何动作。
+- 限额：请求体 32 MiB、图片 24 MiB、4000 万像素、单边 16384 px、`limit` 最多 500。
+- 错误码：`bad_json`、`bad_request`、`unsupported_field`、`bad_base64`、`bad_image`、`unsupported_format`（只收 PNG / JPEG）、`too_large`（413）、`dimension_mismatch`、`missing_text`、`bad_mode`、`busy`（503，引擎超时）、`engine_error`（500）。失败不缓存，也绝不返回半份匹配结果。
+
+这条路由不接受 `path`、`monitor`、`window`、`capture`、`focus`，不读文件、不抓屏；桌面侧被关掉时它照样工作。
+
+### 比较两张图片
+
+某一步到底有没有改变画面，问的是**像素**，不是文件字节：同一张图换一个压缩器重编码，或者多一个 `tEXt` 块，字节完全不同而像素一模一样。`POST /compare-images` 解码两张图后逐像素比较 —— 不跑检测、不跑 OCR、不抓屏、不加载模型，所以模型没起来时它也照样回答。
+
+请求：`{"before": {"image_b64", "width", "height"}, "after": {...}}`，严格白名单，限额与 `/locate-image` 完全一致。每侧声明的尺寸必须等于图片头里的尺寸（否则 `dimension_mismatch`），而且**先看文件头再解码** —— 声明 `1×1` 塞一张巨图绕不过像素上限。
+
+~~~json
+{"ok": true, "contractVersion": 1, "comparable": true, "changed": false,
+ "changedPixels": 0, "totalPixels": 921600, "changedRatio": 0.0,
+ "maxChannelDelta": 0, "changedBox": null,
+ "image": {"width": 1280, "height": 720},
+ "before": {"width": 1280, "height": 720},
+ "after":  {"width": 1280, "height": 720}}
+~~~
+
+- `changedPixels` 统计**任一通道**不同的像素，**没有容差**：差一级也算变了。多大的变化才算"有意义"交给调用方，配合 `changedRatio`、`maxChannelDelta`、`changedBox` 自己判断。
+- 尺寸不同就是**不可比**：HTTP 200 + `comparable: false` + `changed: null`（附 `reason: "dimension_mismatch"`）。不是 `false` —— `false` 的含义是"我比过了，没动"。缩放过的两张图两者都不是，绝不能记成"验证成功"。
+- `comparable: false` 仍然是一个格式正确的请求（两张图各自合法，只是尺寸不同）。400 留给写错的输入：`unsupported_field`、`bad_base64`、`unsupported_format`、`dimension_mismatch`（声明≠解码）、`too_large`。
+- `/health` 会报出 `capabilities.compare`，客户端可以在**动手之前**就拒绝，而不是点到一半才发现服务没法验证结果。托管模式下这条路由照常可用：它不碰桌面、不注入输入。
+
 ### 只对一个窗口操作
 
 给 `ui_locate_marks`、`ui_locate_act`、`ui_locate_diff` 传 `window=`（标题或其中一段，或句柄）：
 
 - 抓图先走 Windows Graphics Capture：直接从合成器拿窗口画面，游戏被聊天窗口盖住也能抓到，GPU 渲染的内容也在，裁成客户区。每个窗口保持一个常驻会话（空闲 15 秒关闭），watch / wait 连续抓几乎零开销。WGC 失败或全黑时退到 `PrintWindow`，再退到按屏抓再裁。`UI_LOCATE_WINDOW_CAPTURE` / `"window_capture"`：`auto`（默认）、`wgc`、`printwindow`、`screen`。WGC 需要 `windows-capture` 包，插件用 `--no-deps` 安装（它的元数据要求 `opencv-python`，和 `opencv-python-headless` 冲突）。Win10 上窗口周围可能出现黄色捕获边框，Win11 会关掉。
-- 发输入前先把目标窗口切到前台（SendInput 只送给前台窗口）。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
+- 输入通道与焦点是两件事（`delivery=`）。`auto`（默认）走前台路径，点击仅在**明确观察到光标没动**时才补一次窗口消息。`foreground` 恒定走前台路径，可能移动真实指针。`background` 只投窗口消息 —— 不切前台、不动真实指针 —— 窗口吃不下时明确返回 `BACKGROUND_UNAVAILABLE`，绝不悄悄升级成 SendInput。后台目前只覆盖点击类（单击/双击/右键/中键）；键盘、滚动、拖动、移动需要 `foreground`。它是消息投递，不是保证：有些框架会忽略投递的点击，所以看 `dispatched`。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
 - 用 `window=` 标注的编号会记住这个窗口，之后 `ui_locate_act(mark=…)` 自动切前台、按窗口验证。
 
 ### 等待与验证
 
 `verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 不给文字 = 等画面静止。动作前会先静置约 80ms 量一下画面自己在动多少（水面、粒子、视频）；这类画面（`verify.noise.animated`）上阈值随噪声抬高，本来就在动的格子不计，点空白动态背景不会再报 `verified: true`。
+
+结果把两个问题分开：`dispatched` 说明输入有没有送达目标（投递的消息被接受、或 SendInput 真的发了事件），`verified` 说明画面随后有没有确认预期的变化。`verified: false` **不会**自动重放 —— 模拟输入有副作用，因为像素没变就再点一次，正是同一个按钮被点两下的由来。
 
 ### 先看几秒再动手
 
@@ -131,6 +181,16 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 `action="hold"` 按住键 `duration_ms` 毫秒（走路、蓄力）。纯键盘动作不需要目标，屏幕验证改为整屏比对。
 
+### 托管模式
+
+`UI_LOCATE_CUA_MANAGED=1` 告诉 Python 服务：这台机器的桌面归 Host 管。此时所有自主桌面能力 —— 抓屏、列显示器与窗口、marks、watch、diff、steps、frames、切前台、输入 —— 一律 HTTP `403` + `{"ok": false, "code": "CUA_MANAGED", ...}`，并回显被拒的路由、指向 Host 的做法。拦截发生在 HTTP 进程内部、路由之前，所以直接 POST `/act` 和走 MCP 工具被拒得一模一样；MCP 侧另有一次检查，让过期客户端不必多跑一个来回就知道原因；`/health` 也不再枚举屏幕、不再探测进程完整性。
+
+只留三样：`GET /health`、`POST /locate-image`、`POST /compare-images`。`health` 报出 `contractVersion`、`managed` 和 `capabilities`（`{"image": true, "compare": true, "desktop": false}`），Host 可以先确认对端确实执行这条边界、而且能验证结果，再发任何东西。Host 应把 `capabilities.desktop === false` 也纳入握手，而不只看 `managed: true`：它为 `true`、或整个 `desktop` 键缺失，都说明应答的不是真正执行这条边界的那个进程（例如同一端口上残留的旧独立实例），此时正确做法是拒绝这个实例，而不是降级使用。health 里没有 `contractVersion` 同样是旧进程：重启它，不要拿来用。
+
+变量是每个请求现读的，所以做决定的是**真正在服务这次请求的进程**，不是当初启动它的人。不设这个变量，独立模式保留全部能力。
+
+同时保留托管与独立实例的 Host 会给托管实例单独一个端口（DSH bundle 用 7789），并在发任何请求前先问 `/health`：`7788` 上可能还挂着守卫管不到的旧独立进程。
+
 ## 更新
 
 **插件本身由 DSH 插件页更新，本包不再自带更新器。** 依赖是 registry 形式
@@ -148,6 +208,8 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 - MCP 启动失败：先检查运行环境是否准备完成、虚拟环境 Python 是否存在，再重连 MCP。
 - 动作结果中的 `ok` 表示执行流程完成；只有对应的验证结果才能说明界面是否变化。`verified: false` 或 `null` 时不要当作操作成功。
+- `delivery="background"` 是消息投递，不是「Windows 上通用后台输入」：只覆盖点击类，且有些框架会忽略投递的消息。看 `dispatched`，别假设点中了。
+- 设了 `UI_LOCATE_CUA_MANAGED=1` 时，大多数工具返回 `CUA_MANAGED` 是设计如此，只剩 `/health` 和 `/locate-image`；桌面操作请走 Host 自己的能力。
 - 桌面权限、前台焦点、DPI 和应用框架会影响输入与截图。定位命中也不保证目标接受合成输入。
 - 不同 ONNX Runtime 后端共用同名 Python 包；换后端应重建，避免叠装。
 - OCR 有漏检和误识别；重要动作后检查画面或目标文字。

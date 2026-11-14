@@ -32,7 +32,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from ui_locate import config
+from ui_locate import config, managed
 
 ROOT = config.state_dir()
 
@@ -157,11 +157,40 @@ def _log_tail(name: str, limit: int = 800) -> str:
     return text[-limit:].strip()
 
 
+def _check_contract(h: dict[str, Any]) -> dict[str, Any]:
+    """托管模式下的握手校验。返回 h（便于链式使用）。
+
+    为什么必须显式比较而不是"试试看"：MCP 进程与 HTTP 服务是**两个进程**，
+    各自读自己的环境变量。常见错配是"Host 设了变量，但连上的是上一次留下
+    的 legacy 服务"。这时桌面工具会被服务端 403 挡住——模型看到的却是一条
+    含混的失败，而真实原因是两个进程的托管状态不一致。
+
+    这类错误必须一次说清楚，因为它的修法只有一个：重启服务，让它继承新
+    环境。版本不一致同理：旧服务对 /locate-image 只会回 404。
+    """
+    if not managed.enabled():
+        return h
+    if h.get("managed") is not True:
+        raise RuntimeError(
+            "托管状态不一致：本 MCP 进程是托管的（UI_LOCATE_CUA_MANAGED=1），"
+            f"但 {DEFAULT_BASE} 上的服务不是（health.managed={h.get('managed')!r}）。"
+            "那多半是一个旧的 legacy 实例还占着端口——它对桌面能力的限制不生效，"
+            "所以不能用。请结束该进程后重启服务（新进程会继承托管变量）。"
+        )
+    version = h.get("contractVersion")
+    if version != managed.CONTRACT_VERSION:
+        raise RuntimeError(
+            f"契约版本不一致：MCP 需要 contractVersion={managed.CONTRACT_VERSION}，"
+            f"服务返回 {version!r}。旧服务不理解 /locate-image v1，请重启服务。"
+        )
+    return h
+
+
 def ensure_ready(wait_s: float = 120.0) -> dict[str, Any]:
     """确保服务可用。必要时拉起并等待预热完成。"""
     h = _probe()
     if h and h.get("ready"):
-        return h
+        return _check_contract(h)
 
     child = _spawn_server()
 
@@ -170,7 +199,7 @@ def ensure_ready(wait_s: float = 120.0) -> dict[str, Any]:
         time.sleep(1.0)
         h = _probe()
         if h and h.get("ready"):
-            return h
+            return _check_contract(h)
 
         # 进程已经退出就别再等到超时了——多等 120 秒只会让人以为在预热。
         # 典型死因：端口被占、模型路径不对、venv 里缺包。
@@ -218,6 +247,18 @@ def _post_any(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 # ── 工具 ────────────────────────────────────────────────────────────────────
 
 
+def _managed_refusal(tool: str) -> str | None:
+    """托管模式下桌面工具的直接回包；独立模式返回 None。
+
+    这是**提前告知**，不是防线：真正作数的是 HTTP 服务进程自己的环境变量
+    （见 managed.py 的说明）。多做这一层，是为了让模型拿到结构化的 code 与
+    hint，而不是一条 ``/locate 返回 403`` 的字符串——后者看起来像服务坏了。
+    """
+    if not managed.enabled():
+        return None
+    return json.dumps(managed.refusal(tool, method="MCP"), ensure_ascii=False)
+
+
 @mcp.tool()
 def locate_text(
     text: str,
@@ -248,6 +289,9 @@ def locate_text(
     排序规则：完全相等 > 以查询词开头/结尾 > 包含；同档内「文字长度越接近
     查询词」越优先，然后才看置信度。控件名天然短，长度比 conf 可靠。
     """
+    _refused = _managed_refusal("locate_text")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {
         "text": text,
         "conf": conf,
@@ -284,6 +328,9 @@ def detect_elements(
               detect_ms, ocr_ms, tiles}
       cx / cy 是屏幕绝对坐标，origin 是这张图左上角的屏幕坐标。
     """
+    _refused = _managed_refusal("detect_elements")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {
         "conf": conf,
         "text_mode": text_mode,
@@ -312,6 +359,9 @@ def list_monitors() -> str:
               primary,x,y,w,h}]}
       index 可直接作为其它工具的 monitor 参数（"0"、"1"）。
     """
+    _refused = _managed_refusal("list_monitors")
+    if _refused:
+        return _refused
     # 必须显式 ensure_ready：`health` 之外，这里是唯一走 GET 的工具，以前
     # 直接 `_http().get(...)`，于是成了唯一不会自动拉起服务的工具。表现很
     # 像「服务坏了」——第一次调用它的人（包括我自己）看到的是
@@ -348,6 +398,9 @@ def find_all(
 
     返回 JSON：{query, matches:[{text, cx, cy, w, h, conf}], origin}
     """
+    _refused = _managed_refusal("find_all")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {
         "conf": conf,
         "text_mode": text_mode,
@@ -453,6 +506,9 @@ def ui_locate_marks(
     要的东西没被框出来：换 `box` 放大那一块再标一次；还是没有，就说明检测器
     认不出它，改用坐标。
     """
+    _refused = _managed_refusal("ui_locate_marks")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {
         "monitor": _window_spec(window) or monitor or "primary",
         "conf": conf,
@@ -591,6 +647,9 @@ def ui_locate_act(
     目标可能没吃到这次点击，也可能界面本来就不会变（比如点空白处）。
     这种情况换 delivery="message" 或改用 hotkey 更可靠。
     """
+    _refused = _managed_refusal("ui_locate_act")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {"action": action, "verify": verify}
     if settle_ms and int(settle_ms) > 0:
         payload["settle_ms"] = int(settle_ms)
@@ -680,6 +739,9 @@ def ui_locate_windows(title: str = "") -> str:
     参数：title  只列标题里含这段文字的窗口（不分大小写），留空 = 全部
     返回 JSON：{count, windows:[{hwnd, title, class, pid, x, y, w, h, foreground, minimized}]}
     """
+    _refused = _managed_refusal("ui_locate_windows")
+    if _refused:
+        return _refused
     ensure_ready()
     params = {"title": title} if title else {}
     r = _http().get("/windows", params=params)
@@ -704,6 +766,9 @@ def ui_locate_diff(monitor: str = "primary", window: str = "", cell: int = 32,
                regions:[{x, y, w, h, cx, cy, cells, strength}], grab_ms, diff_ms}
       regions 是屏幕绝对坐标，按大小排序；strength 是格内平均像素差（0~255，>15 是明显变化）
     """
+    _refused = _managed_refusal("ui_locate_diff")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {"monitor": _window_spec(window) or monitor or "primary",
                                "cell": int(cell)}
     if reset:
@@ -754,6 +819,9 @@ def ui_locate_watch(monitor: str = "primary", window: str = "", duration_ms: int
       拼图里每块标着 K<序号> t=<秒>，裁片还标着屏幕坐标 @x,y 和尺寸。
       static=true 表示这段时间画面没变（只有第一帧）。
     """
+    _refused = _managed_refusal("ui_locate_watch")
+    if _refused:
+        return _refused
     payload: dict[str, Any] = {"monitor": _window_spec(window) or monitor or "primary",
                                "duration_ms": int(duration_ms), "fps": float(fps),
                                "mode": mode, "max_keyframes": int(max_keyframes)}
@@ -790,6 +858,9 @@ def ui_locate_steps(steps: str) -> str:
     返回 JSON：{ok, stage, steps:[每步的结果], completed, failed_index?, timings}
       失败时 failed_index 是**从 0 开始**的序号，对照你传进来的数组即可。
     """
+    _refused = _managed_refusal("ui_locate_steps")
+    if _refused:
+        return _refused
     try:
         parsed = json.loads(steps) if isinstance(steps, str) else steps
     except json.JSONDecodeError as exc:
@@ -802,14 +873,87 @@ def ui_locate_steps(steps: str) -> str:
 
 
 @mcp.tool()
+def ui_locate_image(
+    image_b64: str,
+    width: int,
+    height: int,
+    text: str = "",
+    mode: str = "locate",
+    limit: int = 0,
+    conf: float = 0.3,
+    tiled: bool = False,
+) -> str:
+    """只分析**你给的那张图**：返回图片像素坐标，不碰屏幕。
+
+    和 `locate_text` / `ui_locate_act` 的分工：
+      · `locate_text` 问的是"现在屏幕上有什么"——它有隐式抓屏、隐式显示器选择；
+      · 本工具问的是"这张图里这个字在哪"——图片是你给的，坐标系就是这张图。
+
+    因此：不抓屏、不列窗口、不切前台、不读本地路径、不注入输入。同一张图 +
+    同一段文字，在任何机器上给出同样的坐标。托管模式下这是**唯一**可用的
+    分析入口（桌面能力归 Host）。
+
+    参数：
+      image_b64  完整图片的纯 base64（PNG / JPEG；不要带 data: 前缀）
+      width     图片像素宽（必须等于图片本身，用来解释坐标）
+      height    图片像素高
+      text      mode=locate 时必填，要查找的文字
+      mode      "locate"（默认，按文字找）| "detect"（列出元素，不需要 text）
+      limit     最多回几个匹配；0 = 用服务默认（locate 5 / detect 20），上限 500
+      conf      检测置信度下限，默认 0.3
+      tiled     分块检测（小图标更全，慢），默认 False
+
+    返回 JSON：
+      {ok: true, contractVersion: 1, coordinateSpace: "image-pixels",
+       image: {width, height},
+       matches: [{text, confidence,
+                  box: {x, y, width, height},
+                  center: {x, y}}]}
+
+    坐标基于**整张图片的左上角**，不加任何屏幕 origin、不归一化；所有框都在
+    图片范围内。`matches: []` 是成功（没找到），不是错误。
+
+    locate 的匹配档和动作同级：完全相同，或查询词出现在识别文本的开头/结尾；
+    只出现在中间的文本不算（拿到匹配的人通常会直接去点）。检测框裁片的 OCR
+    没读出字时，会整图再读一遍才回答"没找到"；命中只读一遍。
+
+    出错时回 {ok: false, code, error, field?, hint?}，code 分成几类：
+      bad_json / bad_request / unsupported_field / bad_base64 / bad_image /
+      unsupported_format / too_large / dimension_mismatch / missing_text /
+      bad_mode      → 改请求，重试没用
+      busy          → 服务正忙，稍后重试
+      engine_error  → 服务侧问题
+    """
+    payload: dict[str, Any] = {
+        "image_b64": image_b64,
+        "width": int(width),
+        "height": int(height),
+        "text": text,
+        "mode": mode,
+        "conf": float(conf),
+        "tiled": bool(tiled),
+    }
+    if limit and int(limit) > 0:
+        payload["limit"] = int(limit)
+    # _post_any：400/413/415 里带着 field / hint，是调用方必须看到的结构化信息，
+    # 用 _post 会把它压成一条 RuntimeError 字符串。
+    return json.dumps(_post_any("/locate-image", payload), ensure_ascii=False)
+
+
+@mcp.tool()
 def health() -> str:
-    """查看定位服务状态：是否就绪、用的哪个推理后端、预热花了多久。"""
+    """查看定位服务状态：是否就绪、用的哪个推理后端、预热花了多久。
+
+    托管模式下同一份回包还会带 contractVersion / managed / capabilities，
+    并且**不列屏幕信息** —— 那本身就是一次桌面发现。
+    """
     h = _probe()
     if not h:
         return json.dumps(
             {
                 "ok": False,
                 "ready": False,
+                **managed.health_fields(),
                 "hint": "服务未运行。调用任意其它工具会自动拉起（CUDA 首次约 35 秒，DirectML 约 2 秒）。",
             },
             ensure_ascii=False,
@@ -836,6 +980,9 @@ def ui_locate_frames(limit: int = 10) -> str:
 
     返回 {ok, turns: [{turn, frames: [{turn, frame, label, size, origin, age_s}], age_s, bytes}], stats}。
     """
+    _refused = _managed_refusal("ui_locate_frames")
+    if _refused:
+        return _refused
     try:
         r = _http().get("/frames", params={"limit": int(limit)})
     except TypeError:
@@ -882,6 +1029,9 @@ def ui_locate_frame(
     返回：一张 PNG 图片 + 一段 JSON 元信息（含 `box`：这块裁剪在屏幕上的
     位置，据此把图里的坐标换算回屏幕坐标）。
     """
+    _refused = _managed_refusal("ui_locate_frame")
+    if _refused:
+        return _refused
     params: dict[str, Any] = {"turn": int(turn), "frame": int(frame)}
     if box:
         params["box"] = box
