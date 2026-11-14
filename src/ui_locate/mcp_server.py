@@ -259,6 +259,78 @@ def _managed_refusal(tool: str) -> str | None:
     return json.dumps(managed.refusal(tool, method="MCP"), ensure_ascii=False)
 
 
+# ── 入参校验 ────────────────────────────────────────────────────────────────
+#
+# MCP 客户端把布尔序列化成字符串是常见行为（经 JSON-RPC 中转时尤其如此）：
+# 传到达里的是 `"false"`，而不是 `False`。**`bool("false")` 是 True**，所以
+# 只要有一处裸 `bool(...)` 或者 `if not value`，开关就会反向——真机上表现为
+# 「text=false 却强制 OCR」「cells=false 却照样补格子」，而且不报错。
+#
+# 三个函数的口径一致：能确定就转换，确定不了就抛 ValueError（带字段名），
+# 绝不猜。`"maybe"`、空串、未知类型都不是「大概算开」。
+
+_BOOL_WORDS = {
+    "true": True,
+    "1": True,
+    "yes": True,
+    "on": True,
+    "false": False,
+    "0": False,
+    "no": False,
+    "off": False,
+}
+
+
+def _as_bool(value: object, field: str) -> bool:
+    """把入参判成布尔；判不了就抛 ValueError（带字段名）。
+
+    接受 `bool`、白名单内的字符串（大小写与首尾空白容错）、以及数字 0/1。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _BOOL_WORDS:
+            return _BOOL_WORDS[token]
+    raise ValueError(
+        f"{field} 需要布尔值（true/false/1/0/yes/no/on/off），收到 {value!r}"
+    )
+
+
+def _as_int(value: object, field: str) -> int:
+    """把入参判成整数；判不了就抛 ValueError（带字段名）。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 需要整数，收到的却是布尔 {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise ValueError(f"{field} 需要整数，收到小数 {value!r}")
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            raise ValueError(f"{field} 需要整数，收到 {value!r}") from None
+    raise ValueError(f"{field} 需要整数，收到 {value!r}")
+
+
+def _as_float(value: object, field: str) -> float:
+    """把入参判成数字（float）；判不了就抛 ValueError（带字段名）。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 需要数字，收到的却是布尔 {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            raise ValueError(f"{field} 需要数字，收到 {value!r}") from None
+    raise ValueError(f"{field} 需要数字，收到 {value!r}")
+
+
 @mcp.tool()
 def locate_text(
     text: str,
@@ -294,9 +366,9 @@ def locate_text(
         return _refused
     payload: dict[str, Any] = {
         "text": text,
-        "conf": conf,
+        "conf": _as_float(conf, "conf"),
         "text_mode": text_mode,
-        "smart": smart,
+        "smart": _as_bool(smart, "smart"),
     }
     if monitor:
         payload["monitor"] = monitor
@@ -332,10 +404,10 @@ def detect_elements(
     if _refused:
         return _refused
     payload: dict[str, Any] = {
-        "conf": conf,
+        "conf": _as_float(conf, "conf"),
         "text_mode": text_mode,
-        "tiled": tiled,
-        "smart": smart,
+        "tiled": _as_bool(tiled, "tiled"),
+        "smart": _as_bool(smart, "smart"),
     }
     if monitor:
         payload["monitor"] = monitor
@@ -402,11 +474,11 @@ def find_all(
     if _refused:
         return _refused
     payload: dict[str, Any] = {
-        "conf": conf,
+        "conf": _as_float(conf, "conf"),
         "text_mode": text_mode,
         "text": True,
         "tiled": True,
-        "smart": smart,
+        "smart": _as_bool(smart, "smart"),
     }
     if img_path:
         payload["path"] = img_path
@@ -511,18 +583,19 @@ def ui_locate_marks(
         return _refused
     payload: dict[str, Any] = {
         "monitor": _window_spec(window) or monitor or "primary",
-        "conf": conf,
-        "text": bool(text),
-        "max_marks": int(max_marks),
-        "max_side": int(max_side),
+        "conf": _as_float(conf, "conf"),
+        "text": _as_bool(text, "text"),
+        "max_marks": _as_int(max_marks, "max_marks"),
+        "max_side": _as_int(max_side, "max_side"),
     }
     if box:
         payload["box"] = box
-    if grid:
-        payload["grid"] = int(grid)
-    if not cells:
+    grid_value = _as_int(grid, "grid")
+    if grid_value:
+        payload["grid"] = grid_value
+    if not _as_bool(cells, "cells"):
         payload["cells"] = False
-    if not incremental:
+    if not _as_bool(incremental, "incremental"):
         payload["incremental"] = False
     res = _post_any("/marks", payload)
     if not res.get("ok"):
@@ -651,37 +724,43 @@ def ui_locate_act(
     if _refused:
         return _refused
     payload: dict[str, Any] = {"action": action, "verify": verify}
-    if settle_ms and int(settle_ms) > 0:
-        payload["settle_ms"] = int(settle_ms)
+    settle_value = _as_int(settle_ms, "settle_ms")
+    if settle_value > 0:
+        payload["settle_ms"] = settle_value
     if window:
         payload["window"] = window
     if focus and focus != "auto":
         payload["focus"] = False if focus in ("off", "false", "no", "none") else focus
+    timeout_value = _as_int(verify_timeout_ms, "verify_timeout_ms")
     if action == "wait" and not text:
-        payload["timeout_ms"] = int(verify_timeout_ms)
+        payload["timeout_ms"] = timeout_value
     if text:
         payload["text"] = text
-    if mark:
-        payload["mark"] = int(mark)
+    mark_value = _as_int(mark, "mark")
+    mark_set_value = _as_int(mark_set, "mark_set")
+    if mark_value:
+        payload["mark"] = mark_value
     elif cell:
         payload["cell"] = cell
-    if (mark or cell) and mark_set:
-        payload["mark_set"] = int(mark_set)
+    if (mark_value or cell) and mark_set_value:
+        payload["mark_set"] = mark_set_value
     if x is not None and y is not None:
-        payload["x"] = x
-        payload["y"] = y
+        payload["x"] = _as_float(x, "x")
+        payload["y"] = _as_float(y, "y")
     if monitor:
         payload["monitor"] = monitor
-    if count and int(count) != 1:
-        payload["count"] = int(count)
+    count_value = _as_int(count, "count")
+    if count_value != 1:
+        payload["count"] = count_value
     if button:
         payload["button"] = button
     if delivery:
         payload["delivery"] = delivery
     if to:
         payload["to"] = to
-    if delta != -3:
-        payload["delta"] = int(delta)
+    delta_value = _as_int(delta, "delta")
+    if delta_value != -3:
+        payload["delta"] = delta_value
     if value:
         payload["value"] = value
     if key:
@@ -692,18 +771,21 @@ def ui_locate_act(
         payload["pointer"] = pointer
     if keys_mode:
         payload["keys_mode"] = keys_mode
-    if duration_ms:
-        payload["duration_ms" if action in ("hold", "hold_key", "drag") else "hold_ms"] = int(duration_ms)
+    duration_value = _as_int(duration_ms, "duration_ms")
+    if duration_value:
+        payload["duration_ms" if action in ("hold", "hold_key", "drag") else "hold_ms"] = duration_value
 
     if verify == "text":
-        payload["verify"] = {"text": verify_text, "timeout_ms": int(verify_timeout_ms)}
+        payload["verify"] = {"text": verify_text, "timeout_ms": timeout_value}
     elif verify in ("none", ""):
         payload["verify"] = None
 
-    if watch_ms:
-        payload["watch_ms"] = int(watch_ms)
+    watch_value = _as_int(watch_ms, "watch_ms")
+    if watch_value:
+        payload["watch_ms"] = watch_value
         payload["watch_mode"] = watch_mode or "regions"
-        payload["watch_max_keyframes"] = int(watch_max_keyframes or 6)
+        keyframes = _as_int(watch_max_keyframes, "watch_max_keyframes") or 6
+        payload["watch_max_keyframes"] = keyframes
     res = _post_any("/act", payload)
     watch = res.get("watch") if isinstance(res, dict) else None
     if isinstance(watch, dict) and watch.get("image_b64"):
@@ -770,8 +852,8 @@ def ui_locate_diff(monitor: str = "primary", window: str = "", cell: int = 32,
     if _refused:
         return _refused
     payload: dict[str, Any] = {"monitor": _window_spec(window) or monitor or "primary",
-                               "cell": int(cell)}
-    if reset:
+                               "cell": _as_int(cell, "cell")}
+    if _as_bool(reset, "reset"):
         payload["reset"] = True
     return json.dumps(_post_any("/diff", payload), ensure_ascii=False)
 
@@ -823,8 +905,10 @@ def ui_locate_watch(monitor: str = "primary", window: str = "", duration_ms: int
     if _refused:
         return _refused
     payload: dict[str, Any] = {"monitor": _window_spec(window) or monitor or "primary",
-                               "duration_ms": int(duration_ms), "fps": float(fps),
-                               "mode": mode, "max_keyframes": int(max_keyframes)}
+                               "duration_ms": _as_int(duration_ms, "duration_ms"),
+                               "fps": _as_float(fps, "fps"),
+                               "mode": mode,
+                               "max_keyframes": _as_int(max_keyframes, "max_keyframes")}
     res = _post_any("/watch", payload)
     if not res.get("ok"):
         return json.dumps(res, ensure_ascii=False)
@@ -926,15 +1010,16 @@ def ui_locate_image(
     """
     payload: dict[str, Any] = {
         "image_b64": image_b64,
-        "width": int(width),
-        "height": int(height),
+        "width": _as_int(width, "width"),
+        "height": _as_int(height, "height"),
         "text": text,
         "mode": mode,
-        "conf": float(conf),
-        "tiled": bool(tiled),
+        "conf": _as_float(conf, "conf"),
+        "tiled": _as_bool(tiled, "tiled"),
     }
-    if limit and int(limit) > 0:
-        payload["limit"] = int(limit)
+    limit_value = _as_int(limit, "limit")
+    if limit_value > 0:
+        payload["limit"] = limit_value
     # _post_any：400/413/415 里带着 field / hint，是调用方必须看到的结构化信息，
     # 用 _post 会把它压成一条 RuntimeError 字符串。
     return json.dumps(_post_any("/locate-image", payload), ensure_ascii=False)
@@ -983,8 +1068,13 @@ def ui_locate_frames(limit: int = 10) -> str:
     _refused = _managed_refusal("ui_locate_frames")
     if _refused:
         return _refused
+    # 参数先解析再发请求：坏值不该真的打到服务上。
     try:
-        r = _http().get("/frames", params={"limit": int(limit)})
+        limit_value = _as_int(limit, "limit")
+    except ValueError as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    try:
+        r = _http().get("/frames", params={"limit": limit_value})
     except TypeError:
         return json.dumps({"ok": False, "error": "limit 必须是整数"}, ensure_ascii=False)
     if r.status_code != 200:
@@ -1032,11 +1122,15 @@ def ui_locate_frame(
     _refused = _managed_refusal("ui_locate_frame")
     if _refused:
         return _refused
-    params: dict[str, Any] = {"turn": int(turn), "frame": int(frame)}
+    params: dict[str, Any] = {
+        "turn": _as_int(turn, "turn"),
+        "frame": _as_int(frame, "frame"),
+    }
     if box:
         params["box"] = box
-    if scale and scale > 0:
-        params["scale"] = float(scale)
+    scale_value = _as_float(scale, "scale")
+    if scale_value > 0:
+        params["scale"] = scale_value
 
     ensure_ready()
     r = _http().get("/frame", params=params)
