@@ -691,9 +691,9 @@ test("runtime：readRuntimeSettings 读回写出去的键", async () => {
   const { readRuntimeSettings, writeRuntimeSettings } = await import("../plugin/runtime.mjs")
   const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
   try {
-    await writeRuntimeSettings(dir, { modelDir: "D:/models/ui-locate", backend: "directml" })
+    await writeRuntimeSettings(dir, { modelDir: "C:/models/ui-locate", backend: "directml" })
     assert.deepEqual(readRuntimeSettings(dir), {
-      modelDir: "D:/models/ui-locate",
+      modelDir: "C:/models/ui-locate",
       backend: "directml",
     })
   } finally {

@@ -21,6 +21,7 @@
 
 import { execFile } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
+import { posix as posixPath, win32 as win32Path } from "node:path"
 import { fileURLToPath } from "node:url"
 
 /**
@@ -109,6 +110,43 @@ export function stateDir(env = process.env) {
   if (env.DSH_HOME) return `${env.DSH_HOME}/ui-locate`
   const base = env.LOCALAPPDATA ?? (env.HOME ? `${env.HOME}/.local/share` : undefined)
   return base === undefined ? `${process.cwd()}/ui-locate` : `${base}/ui-locate`
+}
+
+/**
+ * 把**默认值**规范成该平台的路径写法。
+ *
+ * `stateDir()` 用模板字符串拼 `/`，在 Windows 上得到 `D:/app/data/ui-locate`。
+ * 那不是错（Windows 两向都认），但它会被原样填进设置页的输入框、再原样写进
+ * `runtime.json`，于是同一个目录在界面上有两种写法、`--home` 与配置里的字符串
+ * 对不上、日志里也很难一眼看出到底指哪。所以在生成默认值这一步统一成反斜杠。
+ *
+ * **只用于默认值**。用户显式输入的东西一律不动：他敲 `D:/my/models` 就该原样
+ * 保留，替用户改写路径是另一种越权。
+ *
+ * @param value - 待规范的路径文本。
+ * @param platform - 目标平台，默认当前平台。
+ * @returns 规范化后的路径；空值原样返回（空串表示「用默认」，不是路径）。
+ */
+export function normalizeDefaultPath(value, platform = process.platform) {
+  if (typeof value !== "string" || value === "") return value
+  return platform === "win32" ? win32Path.normalize(value) : posixPath.normalize(value)
+}
+
+/**
+ * 当前该用的默认位置：运行目录与它下面的 `models/`。
+ *
+ * 单列出来是因为它有两个消费者：`plan()` 要填进设置页的 placeholder，Python
+ * 侧要拿它当实际目标目录。两边必须是同一个字符串——分开拼一次就会一边斜杠
+ * 一边反斜杠。
+ *
+ * @param env - 环境变量表（测试注入）。
+ * @param platform - 目标平台，默认当前平台。
+ * @returns `{ home, modelDir }`，都已是该平台的规范写法。
+ */
+export function defaultPaths(env = process.env, platform = process.platform) {
+  const home = normalizeDefaultPath(stateDir(env), platform)
+  const join = platform === "win32" ? win32Path.join : posixPath.join
+  return { home, modelDir: join(home, "models") }
 }
 
 /**

@@ -521,7 +521,7 @@ export async function writeRuntimeSettings(home, { modelDir, backend } = {}) {
  *
  * 写出去却读不回来，是这条通路最容易漏的一半：界面按配置里的默认值渲染，
  * 而 Python 按 `runtime.json` 里的值找模型，两边各说一套。用户上次明明把
- * 模型指到了 `D:\models\ui-locate`（那里已经有 77MB 的现成模型），
+ * 模型指到了 `%USERPROFILE%\myLocalModels\ui-locate`（那里已经有 77MB 的现成模型），
  * 界面却显示默认目录并说「模型缺失」，点一下又重新下一份。
  *
  * 容错口径与 Python 侧一致：文件不在、不是 JSON、不是对象、字段不是非空

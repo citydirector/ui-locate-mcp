@@ -36,12 +36,11 @@
  */
 
 import { existsSync, statSync } from "node:fs"
-import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { execFile } from "node:child_process"
 import z from "@deepseek-ai/schemastery"
 import { defineTool, ToolArgsError } from "./tool.mjs"
-import { stateDir, syncPythonToBundle } from "./core.mjs"
+import { stateDir, defaultPaths, syncPythonToBundle } from "./core.mjs"
 import {
   DEFAULT_BACKEND,
   bundledPythonCandidates,
@@ -132,7 +131,11 @@ export function apply(ctx, config) {
    * `DSH_HOME/ui-locate` → `LOCALAPPDATA/ui-locate` 那条链。
    */
   function plan(override = {}) {
-    const defaults = stateDir()
+    // 默认值走 `defaultPaths()` 而不是现拼 `stateDir()`：后者用 `/` 拼串，
+    // 在 Windows 上会给出 `D:/...`。默认值会被填进设置页、也会写进
+    // runtime.json，所以只在这一处规范成反斜杠；用户显式输入的值不动。
+    const fallback = defaultPaths()
+    const defaults = fallback.home
     // 优先级：本次显式传入 → 插件配置 → 上次写下的 runtime.json → 默认值。
     //
     // 之所以要读回 runtime.json：这个文件的用途是「告诉 Python 侧用哪个目录」，
@@ -147,13 +150,13 @@ export function apply(ctx, config) {
       // 而 `"" ?? x` 得到的是 `""`——`??` 只在 null/undefined 时才让位。
       modelDir: override.modelDir || current?.modelDir || remembered.modelDir || "",
       defaultHome: defaults,
-      defaultModelDir: join(defaults, "models"),
+      defaultModelDir: fallback.modelDir,
     })
     return {
       ...resolved,
       backend: override.backend || current?.backend || remembered.backend || DEFAULT_BACKEND,
       defaultHome: defaults,
-      defaultModelDir: join(defaults, "models"),
+      defaultModelDir: fallback.modelDir,
       venvPython: resolved.python,
     }
   }
