@@ -971,6 +971,38 @@ class Handler(BaseHTTPRequestHandler):
             hits = find(elements, text, min_tier="starts")
             if not hits:
                 return None
+
+            # 动手前先问一句：这个名字在范围内唯一吗？
+            # 同一窗口里「系统摘要」既是树项、又是结果区标题，两者都 exact。
+            # 以前取第一个就点，结果点到标题、`verified:false` 兜底 —— 但调用方
+            # 看到的 `ok:true`，很容易被当成「点对了」。宁可不点，把候选交出去。
+            # 4px 内视为同一处（检测器偶尔对同一元素重复出框）。
+            uniq: list[dict] = []
+            for h in hits:
+                if h.get("match_tier") != "exact":
+                    continue
+                cx, cy = float(h["cx"]), float(h["cy"])
+                if any(abs(cx - u["cx"]) <= 4 and abs(cy - u["cy"]) <= 4 for u in uniq):
+                    continue
+                uniq.append(h)
+            if len(uniq) > 1:
+                return {
+                    "ambiguous": True,
+                    "text": text,
+                    "count": len(uniq),
+                    "candidates": [
+                        {
+                            "text": h.get("text"),
+                            "cx": int(round(float(h["cx"]))),
+                            "cy": int(round(float(h["cy"]))),
+                            "w": int(round(float(h.get("w") or 0))),
+                            "h": int(round(float(h.get("h") or 0))),
+                            "conf": round(float(h.get("conf") or 0.0), 3),
+                        }
+                        for h in uniq[:5]
+                    ],
+                }
+
             top = hits[0]
             return {
                 "matched": top.get("text"),

@@ -124,6 +124,13 @@ def resolve_target(
         timings["find_ms"] = _ms(t0, clock)
         if hit is None:
             return None, {"reason": "not-found", "text": text}
+        if hit.get("ambiguous"):
+            return None, {
+                "reason": "ambiguous",
+                "text": text,
+                "count": hit.get("count"),
+                "candidates": hit.get("candidates"),
+            }
         return {
             "text": hit.get("matched") or text,
             "cx": int(round(float(hit["cx"]))),
@@ -633,6 +640,21 @@ def act(
         target, info = resolve_target(spec, probe=probe, timings=timings, clock=clock)
     if target is None:
         timings["total_ms"] = _ms(t_all, clock)
+        if info.get("reason") == "ambiguous":
+            # 不点。同名多目标时「取第一个」等于替调用方掷骰子，而它点错的
+            # 代价可能不可逆（删除、发送、购买）。把候选原样交回去。
+            return {
+                "ok": False,
+                "stage": "find",
+                "code": "AMBIGUOUS_TARGET",
+                "error": f"同一范围内有 {info.get('count')} 处 {info.get('text')!r}，没有唯一目标",
+                "hint": "改用坐标、ui_locate_marks 的编号，或更长的唯一文本",
+                "target": None,
+                "candidates": info.get("candidates"),
+                "dispatched": None,
+                "verified": None,
+                "timings": timings,
+            }
         return {
             "ok": False,
             "stage": "find",
