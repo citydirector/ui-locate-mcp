@@ -602,9 +602,8 @@ env** 决定，MCP 侧的 env 不参与判定。原因是部署上 MCP 与 HTTP 
 亏 —— `_probe_hit()` 的注释里写着「检测器一旦漏框，那段文字就根本没进
 OCR」，因此 `/act` 会在 mosaic 空手时退回 full 再找一遍。
 
-纯图片路径当初的消费者是 Host 桥接（2026-11-14 已撤回，见下方说明）：它拿
-`matches[0]` 就去点。也就是说它和 `/act` 同级，而不是和「只回坐标给人看」的
-`/locate` 同级。所以两处都对齐到 `/act`：
+纯图片路径的消费者会拿 `matches[0]` 就去点：它和 `/act` 同级，而不是和
+「只回坐标给人看」的 `/locate` 同级。所以两处都对齐到 `/act`：
 
 1. 匹配档收紧到 `starts`（exact / 前缀 / 后缀）。`contains` 只适合把候选
    列出来给人挑；一旦有人照着点，「碰巧包含」就是点错。
@@ -615,11 +614,9 @@ full ≈ 0.74s，检测器单遍约 0.1s 级。真实截图更大，但同量级
 「找不到就什么都不做」的判断来说，多付一遍 OCR 换回一个真实存在的按钮，
 是划算的。
 
-> CUA 后台投递桥接已撤回（2026-11-14）：background 投递会让 native 宿主退出，止损后改由 ui-locate 自有实现，见 src/ui_locate/actions.py。
-
 ## 比较为什么必须落在像素上（`/compare-images`）
 
-Host 最初的做法是比较前后两张截图的 PNG 编码字节。这条路有个安静的失效模式：
+比较前后两张截图的 PNG 编码字节，是最先想到的做法。它有个安静的失效模式：
 PNG 是有损于"字节"的容器 —— 压缩级别不同、多一个 `tEXt` 块（工具名、时间戳）、
 换一个编码器，像素一模一样而字节完全不同。`tests/test_compare_api.py` 里两个用例
 直接钉住它：`test_same_pixels_different_encoding_is_unchanged`（压缩级别 0 vs 9，
@@ -673,9 +670,8 @@ collapsed_to_a_corner`、`test_box_entirely_left_or_above_is_dropped`、
 `/locate-image` / `ui_locate_image`；比较两张给定图片用 `/compare-images`。
 `_HOST_TOOLS` 是「桌面操作去哪」这半句的唯一来源，被拒的工具名一律不进 hint。
 
-这里不再有「Host 侧 CUA 桥接」这一层（2026-11-14 已整层撤回）：托管变量
-`UI_LOCATE_CUA_MANAGED` 仍然保留，语义是「这个实例只做无桌面能力的事」，只是
-不再由任何 bundle 自动设置。
+托管变量 `UI_LOCATE_CUA_MANAGED` 的语义是「这个实例只做无桌面能力的事」；不写它
+就保持全功能，也没有任何 bundle 会自动设置它。
 
 ## MAA 输入方式对照：哪些采用、哪些不采用
 

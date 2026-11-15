@@ -118,9 +118,9 @@ _kernel32 = _WINDLL("kernel32", use_last_error=True) if _WINDLL is not None else
 
 # ── 暂停开关 ────────────────────────────────────────────────────────────────
 #
-# 参考实现用全局热键 Ctrl+Alt+Q。热键要装钩子、要处理"钩子被别的程序吃掉"，
-# 这一轮先不做（TODO），只提供进程内状态 + HTTP / MCP 两个入口。不落盘时
-# 状态随进程消失 —— 对"我现在不想让它动我的桌面"这个诉求来说，够用且可预期。
+# 参考实现用全局热键 Ctrl+Alt+Q。热键要装钩子、还要处理"钩子被别的程序吃掉"，
+# 所以这里只提供 HTTP / MCP 两个入口。不设 UI_LOCATE_PAUSE_FILE 时状态只在
+# 进程内，随进程消失 —— 对"我现在不想让它动我的桌面"这个诉求来说，够用且可预期。
 
 _pause_lock = threading.Lock()
 _paused = False

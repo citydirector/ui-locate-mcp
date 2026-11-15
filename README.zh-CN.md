@@ -216,7 +216,7 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 - 动作结果中的 `ok` 表示执行流程完成；只有对应的验证结果才能说明界面是否变化。`verified: false` 或 `null` 时不要当作操作成功。
 - `delivery="background"` 需要 `hwnd=`/`window=`，且只覆盖点击类。它是「UIA + 窗口消息」路线，不是「Windows 上通用后台输入」：有些框架会忽略投递的消息，UIA 超时会被报成 `BACKGROUND_UNKNOWN` + `dispatched: null` —— 不要盲目重试。
 - `ui_locate_pause` 一次停住所有输入路径；暂停期间 `/health` 照常回答，只是 `paused: true`。
-- 打开托管开关时，大多数工具返回 `CUA_MANAGED` 是设计如此，只剩 `/health`、`/locate-image`、`/compare-images`。Host 侧的 CUA 桥接已于 2026-11-14 撤回 —— background 投递会让 native 宿主退出（`NATIVE_EXITED` / `NATIVE_CLEANUP`），现在改由本包自有实现（`src/ui_locate/actions.py`）承担。
+- 打开托管开关时，大多数工具返回 `CUA_MANAGED` 是设计如此，只剩 `/health`、`/locate-image`、`/compare-images`。桌面动作请交给独立（standalone）实例的 `ui_locate_act`（`delivery="background"`）。
 - 桌面权限、前台焦点、DPI 和应用框架会影响输入与截图。定位命中也不保证目标接受合成输入。
 - 不同 ONNX Runtime 后端共用同名 Python 包；换后端应重建，避免叠装。
 - OCR 有漏检和误识别；重要动作后检查画面或目标文字。

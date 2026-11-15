@@ -223,7 +223,7 @@ button disappear. See the [update audit](docs/update-audit.md).
 - `ok` means the action pipeline completed; inspect verification separately. `verified: false` or `null` is not confirmation that the intended action succeeded.
 - `delivery="background"` needs `hwnd=`/`window=` and covers the click family only. It is a message/UIA route, not universal background input: some frameworks ignore posted messages, and a UIA timeout is reported as `BACKGROUND_UNKNOWN` with `dispatched: null` — do not retry it blindly.
 - `ui_locate_pause` stops every input path at once; `/health` keeps answering with `paused: true` while paused.
-- With the managed switch on, most tools return `CUA_MANAGED` on purpose; only `/health`, `/locate-image` and `/compare-images` remain. The Host-side CUA bridge was withdrawn on 2026-11-14 — background delivery made the native host exit (`NATIVE_EXITED` / `NATIVE_CLEANUP`), so it now lives in this package (`src/ui_locate/actions.py`), not in a Host bridge.
+- With the managed switch on, most tools return `CUA_MANAGED` on purpose; only `/health`, `/locate-image` and `/compare-images` remain. Desktop actions belong to a standalone instance's `ui_locate_act` with `delivery="background"`.
 - Desktop permissions, focus, DPI and application frameworks affect input and capture. Locating a target does not guarantee it accepts synthetic input.
 - ONNX Runtime backend wheels share the same Python package name; rebuild rather than installing competing backends together.
 - OCR can miss or misread text. Inspect the screen or target text after important actions.
