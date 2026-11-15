@@ -688,7 +688,11 @@ def click(x: int, y: int, *, button: str = "left", count: int = 1,
         # 遮挡物、输入法候选框都会让事件落到别的窗口上。
         from . import background as background_module
 
-        options = {"budget_ms": int(budget_ms)} if budget_ms else {}
+        options: dict = {"budget_ms": int(budget_ms)} if budget_ms else {}
+        if activate:
+            # 声明式的开关必须真的传到输入层：调用方说 never，就不能一边
+            # 报 "never" 一边照发 WM_ACTIVATE。空串表示"没表态"，交给默认。
+            options["activate"] = str(activate)
         result = background_module.click(
             x, y, hwnd=int(hwnd or 0), window=window,
             button=btn, count=count, delay_ms=delay_ms, **options)

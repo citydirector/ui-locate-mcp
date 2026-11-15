@@ -86,6 +86,28 @@ class BackgroundClickTests(unittest.TestCase):
         self.assertEqual(report["route"], "background")
         self.assertNotIn("relative", report)
 
+    def test_activate_reaches_the_input_layer(self):
+        """activate 曾经被这一层吞掉：传 never 实际仍按 auto 发 WM_ACTIVATE。
+
+        声明式开关谎报后果很实际 —— 用户以为「后台绝不碰前台」，实际每次都
+        发了一条可能让目标自己抢前台的消息。
+        """
+        fake = {"ok": True, "channel": "message", "dispatched": True, "sent": True}
+        with mock.patch("ui_locate.background.click", return_value=fake) as bg_click, \
+                mock.patch.object(actions, "_send", boom), \
+                mock.patch.object(actions, "_cursor_or_none", boom):
+            actions.click(10, 20, delivery="background", hwnd=0x100, activate="never")
+            self.assertEqual(bg_click.call_args.kwargs.get("activate"), "never")
+
+            bg_click.reset_mock()
+            actions.click(10, 20, delivery="background", hwnd=0x100, activate="always")
+            self.assertEqual(bg_click.call_args.kwargs.get("activate"), "always")
+
+            bg_click.reset_mock()
+            actions.click(10, 20, delivery="background", hwnd=0x100)
+            # 没表态就不塞，让 background 用它的默认（auto）
+            self.assertNotIn("activate", bg_click.call_args.kwargs)
+
     def test_background_without_hwnd_fails_explicitly(self):
         with mock.patch.object(actions, "_send", boom), \
                 mock.patch.object(actions, "_click_message", boom):
