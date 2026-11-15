@@ -105,17 +105,14 @@ def is_window_spec(spec: object) -> bool:
 
 
 def as_spec(window: object) -> str:
-    """MCP 里的 ``window`` 参数 → ``monitor`` 写法。数字当句柄，其它当标题。"""
-    if window in (None, "", 0):
-        return ""
-    if isinstance(window, int):
-        return f"hwnd:{window}"
-    s = str(window).strip()
-    if is_window_spec(s):
-        return s
-    if s.isdecimal() or s.lower().startswith("0x"):
-        return f"hwnd:{s}"
-    return f"window:{s}"
+    """MCP 里的 ``window`` 参数 → ``monitor`` 写法。数字当句柄，其它当标题。
+
+    规则与「定位范围」共用一份实现（``act.scope_monitor``）：两处各写一套，
+    迟早会出现「定位按标题、投递按句柄」这种对不上的情况。
+    """
+    from ui_locate.act import scope_monitor
+
+    return scope_monitor({"window": window}) or ""
 
 
 def pick(windows: list[WinInfo], query: dict) -> WinInfo | None:

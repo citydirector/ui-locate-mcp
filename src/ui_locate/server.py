@@ -921,6 +921,22 @@ class Handler(BaseHTTPRequestHandler):
     # 是因为它们的失败语义完全不同：probe 找不到只是没命中，perform 抛异常
     # 说明输入通道不可用，compare 拿不到图说明抓屏出了问题。
 
+    def _bind_window(self, spec: dict) -> None:
+        """把 ``window`` 写法解成 ``hwnd``：投递层只认句柄，调用方手里常只有标题。
+
+        只在后台投递时强制解析。前台动作带 ``window`` 只是「告诉我要动哪个
+        窗口」，解析失败不该让整条指令失败；而后台投递没有句柄就无处投递，
+        此时宁可直接报「窗口不存在」，也不要落到后面变成误导性的「需要 hwnd」。
+        """
+        if str(spec.get("delivery") or "").strip().lower() not in ("background", "message"):
+            return
+        if spec.get("hwnd") not in (None, "", 0):
+            return
+        window = spec.get("window")
+        if window in (None, "", 0):
+            return
+        spec["hwnd"] = window_mod.resolve(window).hwnd
+
     def _probe_hit(self, text: str, spec: dict) -> dict | None:
         """按文字找元素，返回 act 层认的那几个字段（找不到就 None）。
 
@@ -942,7 +958,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         def scan(text_mode: str) -> dict | None:
             elements, _stats = detect_monitors(
-                spec.get("monitor"),
+                act_mod.scope_monitor(spec),
                 float(spec.get("conf", 0.25)),
                 0.5,
                 _as_bool(spec.get("tiled"), True),
@@ -1173,6 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
             if multi:
                 out = act_mod.run_steps(data["steps"], **common)
             else:
+                self._bind_window(data)
                 out = act_mod.act(data, **common)
                 if mark_info is not None:
                     out["mark"] = mark_info

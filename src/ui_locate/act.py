@@ -296,6 +296,35 @@ def _is_window_spec(value: Any) -> bool:
     return low.startswith("window:") or low.startswith("hwnd:")
 
 
+def scope_monitor(spec: dict) -> Any:
+    """定位范围：显式 ``monitor`` 优先，其次是绑定的窗口。
+
+    绑定窗口既决定「投递给谁」，也就该决定「在哪找」。之前只看 ``monitor``，
+    于是 ``window=<句柄>`` + ``text`` 会拿**全屏** OCR 的坐标去换算该窗口的
+    客户区坐标 —— 文字其实在别处时，点下去就落在目标窗口的随机位置。
+    实测过一次：msinfo32 的「系统摘要」同时命中 DSH 正文，投递后点到了结果区
+    标题而不是树项。
+
+    这里只做「参数 → monitor 写法」的纯转换，不碰 Win32；真正的按窗抓图在
+    ``window.py`` 里，``as_spec`` 复用本函数，避免两处各写一套规则。
+    """
+    monitor = spec.get("monitor")
+    if monitor not in (None, ""):
+        return monitor
+    window = spec.get("window")
+    if window in (None, "", 0):
+        return None
+    if isinstance(window, int):
+        return f"hwnd:{window}"
+    s = str(window).strip()
+    low = s.lower()
+    if low.startswith("window:") or low.startswith("hwnd:"):
+        return s
+    if s.isdecimal() or low.startswith("0x"):
+        return f"hwnd:{s}"
+    return f"window:{s}"
+
+
 def _build(action: str, spec: dict, target: dict) -> tuple[str, dict]:
     params: dict[str, Any] = {}
 
