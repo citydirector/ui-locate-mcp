@@ -1187,6 +1187,9 @@ class Handler(BaseHTTPRequestHandler):
         self._frame_seq = 0
         try:
             if multi:
+                for step in data["steps"]:
+                    if isinstance(step, dict):
+                        self._bind_window(step)
                 out = act_mod.run_steps(data["steps"], **common)
             else:
                 self._bind_window(data)
