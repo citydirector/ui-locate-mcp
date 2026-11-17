@@ -353,6 +353,23 @@ export function apply(ctx, config) {
    * `webServer` 可能比本插件晚挂载，所以走 `ctx.inject` 而不是在 apply 时
    * 读一次；读一次会永远拿到 `undefined`。
    */
+  /**
+   * 新版 DSH 的 service proxy 要求插件**先声明** `connection.authentication`
+   * 依赖，才允许读 `connection.admit`（`admit` 内部要读 authentication），
+   * 否则抛 `cannot get property "connection.authentication" without inject`。
+   *
+   * 旧版没有这个服务，声明了也不会满足，所以这里做成「能声明就声明、声明不到
+   * 就退回原上下文」：有它时用内核准入，没有时用 `trust.mjs` 的结构栅栏。
+   * 两条路都不放行跨站/非 loopback 的请求。
+   */
+  let admissionScope
+  ctx.inject(["connection", "connection.authentication"], (scoped) => {
+    admissionScope = scoped
+    return () => {
+      admissionScope = undefined
+    }
+  })
+
   ctx.inject(["webServer"], (scoped) => {
     server = scoped.webServer
     scoped.effect(
@@ -375,7 +392,7 @@ export function apply(ctx, config) {
   /** 每次请求现取 `connection`：它同样是晚挂载的，缓存会缓存到 undefined。 */
   function readConnection(scoped) {
     try {
-      return scoped.get("connection")
+      return (admissionScope ?? scoped).get("connection")
     } catch {
       return undefined
     }

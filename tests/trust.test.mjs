@@ -162,6 +162,29 @@ test("admit 抛错 → 跨站 / 异源 / 非 loopback 仍然拒绝", () => {
   assert.equal(rejectionFor({ headers: {}, socket: {} }, broken), 403)
 })
 
+test("读 admit 就被 service proxy 拒绝（未声明 connection.authentication）→ 回退结构栅栏", () => {
+  // 新版 DSH 的 cordis proxy 在插件没声明 `connection.authentication` 时，
+  // 连属性读取都会抛；这不是请求不可信，不能变成 500。
+  const guarded = {
+    get admit() {
+      throw new Error('cannot get property "connection.authentication" without inject')
+    },
+  }
+  assert.equal(rejectionFor(loopback(), guarded), undefined)
+  assert.equal(rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), guarded), 403)
+  assert.equal(rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, guarded), 403)
+})
+
+test("读 requestRejection 被拒绝 → 同样回退结构栅栏", () => {
+  const guarded = {
+    get requestRejection() {
+      throw new Error('cannot get property "connection.authentication" without inject')
+    },
+  }
+  assert.equal(rejectionFor(loopback(), guarded), undefined)
+  assert.equal(rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, guarded), 403)
+})
+
 // ── admit 返回 503 → 回退 ────────────────────────────────────────────────
 
 test("admit 返回 503（验证器内部失败）→ 回退：loopback 同源放行", () => {

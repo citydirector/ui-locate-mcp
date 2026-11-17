@@ -203,7 +203,19 @@ function reportFailure(logger, label, error) {
 export function rejectionFor(req, connection, logger) {
   // 服务存在时的两种拼法：新版是 `admit` 返回 `{peer}` / `{rejection}`，0.1.7
   // 之前是 `requestRejection` 直接返回状态码。读错一次就会把每个请求都判成 503。
-  const admit = connection?.admit
+  //
+  // 读取 `admit` 本身也要包在 try 里：新版 DSH 的 service proxy 会在插件没有
+  // 声明 `connection.authentication` 依赖时，拒绝读取 `admit`（它内部要读
+  // authentication），抛 `cannot get property "connection.authentication"
+  // without inject`。那不是「请求不可信」，而是「这一层没资格问内核」——
+  // 退回自己的结构栅栏，别把 500 甩给设置页。
+  let admit
+  try {
+    admit = connection?.admit
+  } catch (error) {
+    reportFailure(logger, "admit unavailable", error)
+    return structuralRejection(req)
+  }
   if (typeof admit === "function") {
     let admission
     try {
@@ -227,7 +239,13 @@ export function rejectionFor(req, connection, logger) {
     }
     return status
   }
-  const reject = connection?.requestRejection
+  let reject
+  try {
+    reject = connection?.requestRejection
+  } catch (error) {
+    reportFailure(logger, "requestRejection unavailable", error)
+    return structuralRejection(req)
+  }
   if (typeof reject === "function") {
     // 0.1.x 的老拼法：这条分支保持原样（抛错就 503），只补一条日志。
     // `admit` 回退是因为 rc.3 的 503 有明确语义（验证器内部失败）；老接口
