@@ -10,18 +10,21 @@
  *
  * ## 三层，按序尝试
  *
- * 1. 组合里有 `connection.admit` 时，把请求**规范成 rc.3 的
+ * 1. 组合里有 `connection.admit`（rc.3）时，把请求**规范成 rc.3 的
  *    `ConnectionTrustRequest`** 再交给它——这就是内核给自身 `/api` 用的那套
  *    （信任栅栏 + 浏览器认证 cookie），插件不会比应用更松。
- * 2. `admit` 抛错、或返回 `503` 时，**回退**到结构等价的复刻检查，而不是
- *    无条件拒绝。503 在 rc.3 里是「验证器内部失败」——它说的是内核自己没验
- *    成，不是这个请求不可信；照单全收会把「内核某个 provider 抛了」变成
- *    「设置页全红」，用户连重装环境都点不了。
- * 3. 没有 `admit`（0.1.x 的 `requestRejection` 同理）时，直接用复刻检查。
+ * 2. 只有旧宿主的 `requestRejection` 时，走那条版本分支。
+ * 3. 两者都没有（0.1.x 之前）时，才用复刻的结构栅栏。
  *
- * 回退**不是放行**：复刻检查只认 loopback 的 Host、拒绝跨站 fetch、客户端
- * 带了 Origin/Referer 就必须与 Host 同源。跨站与非 loopback 在每一条路径上
- * 都过不去，包括 `admit` 抛错那条。
+ * ## 认证问不出结论就拒绝
+ *
+ * `admit` 抛错、返回未知形状、或返回 `503`（rc.3 里表示「验证器没验成」），
+ * 一律回 **503**，**不退回结构栅栏**。Host / Origin / Fetch Metadata 回答的是
+ * 「请求从哪来」，不是「谁发的」；用来源合规替代身份认证，等于把未认证调用
+ * 送进装包、抓屏、点击这些接口。远程代理转发后上游看到的也可能是 loopback。
+ *
+ * 结构栅栏只在「宿主根本没有身份服务」时才作为旧版适配使用，并且跨站 /
+ * 非 loopback 在每条路径上都过不去。
  *
  * ## 为什么必须规范化请求
  *
@@ -195,63 +198,69 @@ function reportFailure(logger, label, error) {
 /**
  * 判定一个请求该不该放行。
  *
+ * 认证结论只有三种来源：内核 `admit`、旧宿主 `requestRejection`、以及两者都
+ * 没有时的结构栅栏。前两者一旦问不出结论（抛错、未知形状、503），就按不可用
+ * 拒绝，不退回结构栅栏。
+ *
  * @param req - `node:http` 的 IncomingMessage。
  * @param connection - 组合里的 `connection` 服务；没有则走复刻栅栏。
- * @param logger - 可选日志器，`admit` 失败时记一条（只记消息，不记头）。
- * @returns `undefined` 表示放行，否则是要回的 HTTP 状态码。
+ * @param logger - 可选日志器，失败时记一条（只记消息，不记头）。
+ * @returns 放行是 `undefined`，否则是要回的 HTTP 状态码。
  */
-export function rejectionFor(req, connection, logger) {
-  // 服务存在时的两种拼法：新版是 `admit` 返回 `{peer}` / `{rejection}`，0.1.7
-  // 之前是 `requestRejection` 直接返回状态码。读错一次就会把每个请求都判成 503。
-  //
+export async function rejectionFor(req, connection, logger) {
   // 读取 `admit` 本身也要包在 try 里：新版 DSH 的 service proxy 会在插件没有
-  // 声明 `connection.authentication` 依赖时，拒绝读取 `admit`（它内部要读
-  // authentication），抛 `cannot get property "connection.authentication"
-  // without inject`。那不是「请求不可信」，而是「这一层没资格问内核」——
-  // 退回自己的结构栅栏，别把 500 甩给设置页。
+  // 声明 `connection.authentication` 依赖时拒绝读取它（内部要读 authentication），
+  // 抛 `cannot get property "connection.authentication" without inject`。
+  // 那不是「请求不可信」，但也不是「可以放行」——这一层拿不到身份结论，
+  // 按不可用拒绝。
   let admit
   try {
     admit = connection?.admit
   } catch (error) {
     reportFailure(logger, "admit unavailable", error)
-    return structuralRejection(req)
+    return 503
   }
+
   if (typeof admit === "function") {
     let admission
     try {
-      admission = admit.call(connection, admissionRequest(req))
+      admission = await admit.call(connection, admissionRequest(req))
     } catch (error) {
-      // 调用形状不对、或验证器内部炸了。内核没给结论，就自己给一个结构结论。
       reportFailure(logger, "threw", error)
-      return structuralRejection(req)
+      return 503
     }
-    // `{peer}`：内核认可了这个请求（它已经过了 Host / 跨站 / Origin 三栅栏）。
-    // 仍然过一遍结构检查——内核认了不等于插件这边也认，多一道不亏。
-    if (admission !== null && typeof admission === "object" && "peer" in admission) {
-      return structuralRejection(req)
+    if (admission === null || typeof admission !== "object") {
+      reportFailure(logger, "unknown result")
+      return 503
     }
-    const status = admission !== null && typeof admission === "object" ? admission.rejection : undefined
-    if (status === undefined) return structuralRejection(req)
-    if (status === 503) {
-      // rc.3：503 = 有 provider 抛错导致「没验成」，不是「这个请求不可信」。
+    if ("rejection" in admission) {
+      const status = admission.rejection
+      if (status === 401 || status === 403) return status
       reportFailure(logger, "unavailable")
-      return structuralRejection(req)
+      return 503
     }
-    return status
+    const peer = admission.peer
+    if (!peer || typeof peer !== "object") {
+      reportFailure(logger, "unknown result")
+      return 503
+    }
+    // 内核已经回答了身份；不再叠一层来源复刻判据，否则已认证的桌面 / 远程
+    // 入口会被无依据地拒掉。撤销状态写在 peer.signal 上，有就检查。
+    if (peer.signal?.aborted === true) return 401
+    return undefined
   }
+
   let reject
   try {
     reject = connection?.requestRejection
   } catch (error) {
     reportFailure(logger, "requestRejection unavailable", error)
-    return structuralRejection(req)
+    return 503
   }
   if (typeof reject === "function") {
     // 0.1.x 的老拼法：这条分支保持原样（抛错就 503），只补一条日志。
-    // `admit` 回退是因为 rc.3 的 503 有明确语义（验证器内部失败）；老接口
-    // 没有这个区分，不该顺手改掉一个没人报过问题的分支。
     try {
-      const status = reject.call(connection, req)
+      const status = await reject.call(connection, req)
       if (status === undefined) return structuralRejection(req)
       return status
     } catch (error) {
@@ -259,5 +268,7 @@ export function rejectionFor(req, connection, logger) {
       return 503
     }
   }
+
+  // 两个接口都没有：更老的宿主没有身份服务可问，只能按结构栅栏。
   return structuralRejection(req)
 }

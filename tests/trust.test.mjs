@@ -22,8 +22,9 @@
  *
  * ## 一条纪律
  *
- * 回退（admit 抛错 / 503）**不是放行**：凡是跨站、非 loopback、异源 Origin 的
- * 用例，在每一条路径上都必须拿到 403。这些断言比「放行」那几条更重要。
+ * 认证问不出结论就拒绝：`admit` 抛错、返回未知形状或 503 时一律 503，不退回
+ * 结构栅栏。来源合规不等于身份可信——跨站 / 非 loopback / 异源 Origin 的断言
+ * 仍然保留，但它们只在「宿主根本没有身份服务」的旧版分支里才会拿到 403。
  */
 
 import assert from "node:assert/strict"
@@ -94,7 +95,7 @@ function loopback(extra = {}) {
 
 // ── 契约形状 ───────────────────────────────────────────────────────────────
 
-test("admit 收到的是 Headers 实例，数组值按 append 合并", () => {
+test("admit 收到的是 Headers 实例，数组值按 append 合并", async () => {
   const received = []
   const connection = rc3Connection({ received, verifier: () => ({ id: "peer" }) })
   const req = {
@@ -103,7 +104,7 @@ test("admit 收到的是 Headers 实例，数组值按 append 合并", () => {
     url: "/api/ui-locate/setup",
     socket: { destroyed: false },
   }
-  assert.equal(rejectionFor(req, connection), undefined)
+  assert.equal(await rejectionFor(req, connection), undefined)
   const facts = received[0]
   assert.ok(facts.headers instanceof Headers, "递出去的 headers 必须是 Headers 实例")
   assert.equal(facts.headers.get("host"), "127.0.0.1:7788")
@@ -138,102 +139,115 @@ test("socket 只呈现 {destroyed}，method/url 缺席时不编造", () => {
   assert.equal("url" in bare, false)
 })
 
-// ── admit 抛错 → 回退 ─────────────────────────────────────────────────────
+// ── 认证问不出结论：一律 503，不退回结构栅栏 ──────────────────────────────
 
-test("admit 抛错 → 回退结构检查：loopback 同源请求放行", () => {
+test("admit 抛错 → 503（loopback 同源也不放行）", async () => {
   const broken = {
     admit() {
       throw new TypeError("Cannot read properties of undefined (reading 'some')")
     },
   }
-  assert.equal(rejectionFor(loopback(), broken), undefined)
-  assert.equal(rejectionFor(loopback({ origin: "http://127.0.0.1:7788", "sec-fetch-site": "same-origin" }), broken), undefined)
+  assert.equal(await rejectionFor(loopback(), broken), 503)
+  assert.equal(await rejectionFor(loopback({ origin: "http://127.0.0.1:7788", "sec-fetch-site": "same-origin" }), broken), 503)
 })
 
-test("admit 抛错 → 跨站 / 异源 / 非 loopback 仍然拒绝", () => {
+test("admit 抛错 → 跨站 / 异源 / 非 loopback 同样是 503", async () => {
   const broken = {
     admit() {
       throw new TypeError("boom")
     },
   }
-  assert.equal(rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), broken), 403)
-  assert.equal(rejectionFor(loopback({ origin: "http://evil.example" }), broken), 403)
-  assert.equal(rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, broken), 403)
-  assert.equal(rejectionFor({ headers: {}, socket: {} }, broken), 403)
+  assert.equal(await rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), broken), 503)
+  assert.equal(await rejectionFor(loopback({ origin: "http://evil.example" }), broken), 503)
+  assert.equal(await rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, broken), 503)
+  assert.equal(await rejectionFor({ headers: {}, socket: {} }, broken), 503)
 })
 
-test("读 admit 就被 service proxy 拒绝（未声明 connection.authentication）→ 回退结构栅栏", () => {
+test("读 admit 就被 service proxy 拒绝（未声明 connection.authentication）→ 503", async () => {
   // 新版 DSH 的 cordis proxy 在插件没声明 `connection.authentication` 时，
-  // 连属性读取都会抛；这不是请求不可信，不能变成 500。
+  // 连属性读取都会抛。这一层拿不到身份结论，只能拒绝——来源合规不等于已认证。
   const guarded = {
     get admit() {
       throw new Error('cannot get property "connection.authentication" without inject')
     },
   }
-  assert.equal(rejectionFor(loopback(), guarded), undefined)
-  assert.equal(rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), guarded), 403)
-  assert.equal(rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, guarded), 403)
+  assert.equal(await rejectionFor(loopback(), guarded), 503)
+  assert.equal(await rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), guarded), 503)
+  assert.equal(await rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, guarded), 503)
 })
 
-test("读 requestRejection 被拒绝 → 同样回退结构栅栏", () => {
+test("读 requestRejection 被拒绝 → 503", async () => {
   const guarded = {
     get requestRejection() {
       throw new Error('cannot get property "connection.authentication" without inject')
     },
   }
-  assert.equal(rejectionFor(loopback(), guarded), undefined)
-  assert.equal(rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, guarded), 403)
+  assert.equal(await rejectionFor(loopback(), guarded), 503)
 })
 
-// ── admit 返回 503 → 回退 ────────────────────────────────────────────────
+// ── admit 的拒绝状态：401/403 透传，503 拒绝 ───────────────────────────────
 
-test("admit 返回 503（验证器内部失败）→ 回退：loopback 同源放行", () => {
+test("admit 返回 503（验证器没验成）→ 503，不放行", async () => {
   const unavailable = { admit: () => ({ rejection: 503 }) }
-  assert.equal(rejectionFor(loopback(), unavailable), undefined)
+  assert.equal(await rejectionFor(loopback(), unavailable), 503)
+  assert.equal(await rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), unavailable), 503)
 })
 
-test("admit 返回 503 → 跨站 / 异源 / 非 loopback 仍然拒绝", () => {
-  const unavailable = { admit: () => ({ rejection: 503 }) }
-  assert.equal(rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), unavailable), 403)
-  assert.equal(rejectionFor(loopback({ origin: "http://evil.example" }), unavailable), 403)
-  assert.equal(rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, unavailable), 403)
+test("admit 的 401 / 403 原样透传", async () => {
+  assert.equal(await rejectionFor(loopback(), { admit: () => ({ rejection: 401 }) }), 401)
+  assert.equal(await rejectionFor(loopback(), { admit: () => ({ rejection: 403 }) }), 403)
 })
 
-test("admit 的 401 / 403 原样透传，不回退", () => {
-  assert.equal(rejectionFor(loopback(), { admit: () => ({ rejection: 401 }) }), 401)
-  assert.equal(rejectionFor(loopback(), { admit: () => ({ rejection: 403 }) }), 403)
+test("admit 返回未知形状 → 503", async () => {
+  assert.equal(await rejectionFor(loopback(), { admit: () => null }), 503)
+  assert.equal(await rejectionFor(loopback(), { admit: () => ({}) }), 503)
+  assert.equal(await rejectionFor(loopback(), { admit: () => ({ peer: null }) }), 503)
+  assert.equal(await rejectionFor(loopback(), { admit: () => ({ rejection: 418 }) }), 503)
 })
 
-test("admit 给出 {peer} 仍要过结构检查", () => {
-  const trusting = { admit: () => ({ peer: { id: "p" } }) }
-  assert.equal(rejectionFor(loopback(), trusting), undefined)
-  assert.equal(rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), trusting), 403)
+test("admit 给出有效 peer → 直接放行，不再叠结构判据", async () => {
+  const peer = { id: "p", signal: { aborted: false } }
+  const trusting = { admit: () => ({ peer }) }
+  assert.equal(await rejectionFor(loopback(), trusting), undefined)
+  // 内核已经回答了身份；跨站 / 非 loopback 是内核那道栅栏的事，插件不重复判。
+  assert.equal(await rejectionFor(loopback({ "sec-fetch-site": "cross-site" }), trusting), undefined)
+  assert.equal(await rejectionFor({ headers: { host: "evil.example:7788" }, socket: {} }, trusting), undefined)
+})
+
+test("peer 已撤销 → 401", async () => {
+  const revoked = { admit: () => ({ peer: { id: "p", signal: { aborted: true } } }) }
+  assert.equal(await rejectionFor(loopback(), revoked), 401)
+})
+
+test("admit 是异步的也能用", async () => {
+  const asyncAdmit = { admit: async () => ({ peer: { id: "p", signal: { aborted: false } } }) }
+  assert.equal(await rejectionFor(loopback(), asyncAdmit), undefined)
 })
 
 // ── 无 connection：纯结构栅栏 ─────────────────────────────────────────────
 
-test("没有 connection 时的结构栅栏", () => {
-  assert.equal(rejectionFor(loopback()), undefined)
-  assert.equal(rejectionFor({ headers: { host: "localhost:7788" }, socket: {} }), undefined)
-  assert.equal(rejectionFor({ headers: { host: "[::1]:7788" }, socket: {} }), undefined)
-  assert.equal(rejectionFor({ headers: { host: "192.168.1.10:7788" }, socket: {} }), 403)
-  assert.equal(rejectionFor({ headers: { host: "evil.example" }, socket: {} }), 403)
-  assert.equal(rejectionFor({ headers: { host: "127.0.0.1:7788", origin: "https://127.0.0.1:7788" }, socket: {} }), 403)
-  assert.equal(rejectionFor({ headers: { host: "127.0.0.1:7788", origin: "null" }, socket: {} }), 403)
-  assert.equal(rejectionFor({ headers: { host: "127.0.0.1:7788", "sec-fetch-site": "cross-site" }, socket: {} }), 403)
+test("没有 connection 时的结构栅栏（更老的宿主）", async () => {
+  assert.equal(await rejectionFor(loopback()), undefined)
+  assert.equal(await rejectionFor({ headers: { host: "localhost:7788" }, socket: {} }), undefined)
+  assert.equal(await rejectionFor({ headers: { host: "[::1]:7788" }, socket: {} }), undefined)
+  assert.equal(await rejectionFor({ headers: { host: "192.168.1.10:7788" }, socket: {} }), 403)
+  assert.equal(await rejectionFor({ headers: { host: "evil.example" }, socket: {} }), 403)
+  assert.equal(await rejectionFor({ headers: { host: "127.0.0.1:7788", origin: "https://127.0.0.1:7788" }, socket: {} }), 403)
+  assert.equal(await rejectionFor({ headers: { host: "127.0.0.1:7788", origin: "null" }, socket: {} }), 403)
+  assert.equal(await rejectionFor({ headers: { host: "127.0.0.1:7788", "sec-fetch-site": "cross-site" }, socket: {} }), 403)
 })
 
-test("桌面转发留下的 dsh-app Referer 放行，但同时带浏览器标记就拒", () => {
-  assert.equal(rejectionFor({ headers: { host: "127.0.0.1:7788", referer: "dsh-app://app" }, socket: {} }), undefined)
+test("桌面转发留下的 dsh-app Referer 放行，但同时带浏览器标记就拒", async () => {
+  assert.equal(await rejectionFor({ headers: { host: "127.0.0.1:7788", referer: "dsh-app://app" }, socket: {} }), undefined)
   assert.equal(
-    rejectionFor({ headers: { host: "127.0.0.1:7788", referer: "dsh-app://app", origin: "dsh-app://app" }, socket: {} }),
+    await rejectionFor({ headers: { host: "127.0.0.1:7788", referer: "dsh-app://app", origin: "dsh-app://app" }, socket: {} }),
     403,
   )
 })
 
 // ── 日志纪律 ──────────────────────────────────────────────────────────────
 
-test("admit 失败只记错误消息（不含 cookie/authorization），同一错误只记一条", () => {
+test("admit 失败只记错误消息（不含 cookie/authorization），同一错误只记一条", async () => {
   const logs = []
   const logger = { warn: (line) => logs.push(line) }
   const connection = {
@@ -245,8 +259,8 @@ test("admit 失败只记错误消息（不含 cookie/authorization），同一�
     headers: { host: "127.0.0.1:7788", cookie: "dsh-desktop-session=THE_SECRET", authorization: "Bearer TOPSECRET" },
     socket: {},
   }
-  rejectionFor(req, connection, logger)
-  rejectionFor(req, connection, logger)
+  await rejectionFor(req, connection, logger)
+  await rejectionFor(req, connection, logger)
   assert.equal(logs.length, 1, "同一错误应只记一次")
   assert.match(logs[0], /ui-locate: admission threw: provider exploded/)
   for (const line of logs) {
@@ -255,9 +269,9 @@ test("admit 失败只记错误消息（不含 cookie/authorization），同一�
   }
 })
 
-test("503 也记一条（区别于抛错），且不带请求头", () => {
+test("503 也记一条（区别于抛错），且不带请求头", async () => {
   const logs = []
-  rejectionFor(loopback({ cookie: "k=SECRETCOOKIE" }), { admit: () => ({ rejection: 503 }) }, { warn: (line) => logs.push(line) })
+  await rejectionFor(loopback({ cookie: "k=SECRETCOOKIE" }), { admit: () => ({ rejection: 503 }) }, { warn: (line) => logs.push(line) })
   assert.equal(logs.length, 1)
   assert.match(logs[0], /ui-locate: admission unavailable/)
   assert.ok(!logs[0].includes("SECRETCOOKIE"))

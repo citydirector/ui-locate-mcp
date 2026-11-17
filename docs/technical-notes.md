@@ -558,6 +558,29 @@ locate_text("设置")   →  matched='设置'   (1452, 1775)
 所有输入校验都在调用引擎**之前**完成，测试里用「失败路径下引擎调用次数为 0」
 钉住这一点：校验失败却已经跑了一遍 OCR，是既慢又危险的顺序。
 
+## 认证问不出结论就拒绝（`admit` 抛错 / 503）
+
+旧实现把「内核没给结论」当成「按来源判断」：`admit` 抛错、返回未知形状、或返回
+503 时退回 `structuralReason`，来源合规就放行。那是错的。
+
+`Host`、`Origin`、`Sec-Fetch-Site` 回答的是「请求从哪来」，不是「谁发的」。
+远程代理转发后，上游看到的也可能就是 loopback。用来源合规替代身份认证，等于把
+未认证调用送进装包（写磁盘、跑 uv）、抓屏和点击这些接口。
+
+现在的顺序：
+
+1. `connection.admit` 在 → 把请求规范成 rc.3 的 `ConnectionTrustRequest` 交过去。
+   - `{peer}` → 放行（`peer.signal.aborted` 为真 → 401）；
+   - `{rejection: 401 | 403}` → 原样透传；
+   - `{rejection: 503}`、抛错、`null`、未知形状 → **503**。
+2. 只有旧宿主的 `requestRejection` → 走那条版本分支（抛错同样 503）。
+3. 两者都没有（0.1.x 之前）→ 才用结构栅栏。
+
+读取 `admit` 本身也可能抛：新版 DSH 的 service proxy 在插件没有声明
+`connection.authentication` 依赖时拒绝这个属性（它内部要读 authentication）。
+插件的 `index.mjs` 用 `ctx.inject(["connection", "connection.authentication"], …)`
+在子作用域里读；拿不到就按 503 拒绝，而不是放行。
+
 ## 托管边界为什么落在 HTTP 进程里
 
 托管开关（`MANAGED_ENV`，见 `src/ui_locate/managed.py`）只由 **HTTP 服务进程自己的

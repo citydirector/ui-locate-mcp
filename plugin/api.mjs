@@ -95,7 +95,7 @@ export function createApi({ plan, inspect, setup, logger }) {
   }
 
   return async function handle(req, res, connection) {
-    const rejection = rejectionFor(req, connection, logger)
+    const rejection = await rejectionFor(req, connection, logger)
     if (rejection !== undefined) {
       const reason = rejection === 401 ? "unauthorized" : rejection === 503 ? "admission unavailable" : "forbidden"
       return send(res, rejection, { error: reason })
