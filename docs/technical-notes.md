@@ -693,3 +693,41 @@ collapsed_to_a_corner`、`test_box_entirely_left_or_above_is_dropped`、
 - `AnchoredTouch`（合成指针 + 提升 topmost + 透明窗口）：技术可行，但会改变窗口 z 序、且在部分合成器上闪烁；留作未来可选项，当前不做。
 
 **没有采用 UIA 的 `ElementFromPoint`。** 本机实测它一律回 `E_ACCESSDENIED`（`0x80070005`），`ElementFromHandle` 正常。所以坐标命中交给 Win32 几何下探（`ChildWindowFromPointEx` 逐层，每层从屏幕坐标副本重算），拿到叶子 hwnd 之后再用 `ElementFromHandle` 取 UIA 元素试 `InvokePattern`。
+## 常驻服务为什么要盯着 Host，而不是一直活着
+
+**现象**：DSH 关掉之后，任务管理器里还留着 `python.exe`（`-m ui_locate.mcp_server`）
+和 `pythonw.exe`（`-m ui_locate.server`），几乎每次都要手动结束。
+
+**为什么当初让它脱离父进程**：服务的价值全在「预热过一次的进程」上。CUDA 下
+每个新进程的首次卷积要枚举算法，约 35 秒；DirectML 建会话 1.5–2.6 秒。插件重载、
+MCP 重连都不该把这个进程一起带走，所以 `_spawn_server()` 用了
+`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`，stdin 接
+`DEVNULL`——它是**故意**不从父进程那里继承死亡通知的。
+
+**为什么不能就这么放着**：父亲的死亡通知可以不要，但不能没有替代品。没有替代
+品的结果就是它比 DSH 活得还久，而且服务端口一直占着，下次 DSH 起来连的是上一次
+遗留的进程（端口上那个可能是旧代码，`/health` 的 `contractVersion` 也未必对得上）。
+
+**做法**：把寿命的裁判权交给 Host，而不是交给 MCP 进程或操作系统。
+`cordis.patch.yml` 把 Host 主进程的 pid 写进 `UI_LOCATE_OWNER_PID`，这个环境变量
+会一路继承到 MCP 与 `pythonw`；两个进程各自用 `owner_watch` 盯着这个 pid
+（Windows 上 `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject(h, 0)`，POSIX 上
+`os.kill(pid, 0)`），**连续 3 次、每秒一次**都判死才认为自己该走，然后
+`os._exit(0)`。
+
+这样三种场景各自得到正确结果：
+
+| 场景 | 服务 |
+| --- | --- |
+| 插件重载 / MCP 重连 | 继续活着，复用热进程 |
+| DSH 退出 | 3 秒内自己停止，端口释放 |
+| 没有 `UI_LOCATE_OWNER_PID`（命令行手动起、脚本调用） | 不监控任何人，按调用方自己的进程语义活着 |
+
+**代价与取舍**：`os._exit(0)` 不做清理收尾，所以退出前显式 `capture.release()`、
+`window_wgc.POOL.release()`，把 WGC 会话和 D3D 设备放掉（否则 Windows 那边会短暂
+留一个捕获边框）。判死需要 3 次采样，所以 DSH 退出到进程消失最多 ~3 秒——比
+「进程永远在」好得多，也不需要 Hook Host 的退出事件。
+
+**不这么做会怎样**：如果改成让 MCP 进程自己杀服务（`atexit` / `finally`），插件
+重载时热进程还是会死；如果改成让服务盯着 MCP 的 stdin EOF，插件重载时同样会死。
+盯着 Host 是唯一同时满足「重载不丢热缓存」和「退出不留进程」的归属。

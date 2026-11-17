@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -32,7 +33,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from ui_locate import config, managed
+from ui_locate import config, managed, owner_watch
 
 ROOT = config.state_dir()
 
@@ -87,10 +88,14 @@ def _console_free_python() -> str:
 
 
 def _spawn_server() -> subprocess.Popen | None:
-    """在后台拉起常驻服务（独立进程，本进程退出也不受影响）。
+    """在后台拉起常驻服务（独立进程，跟着 Host 走，不跟着本进程走）。
 
-    用 DETACHED_PROCESS 让它脱离 MCP 进程的生命周期：宿主重启 MCP 时
+    用 DETACHED_PROCESS 让它脱离 MCP 进程的生命周期：插件重载、MCP 重连时
     不该把预热好的服务一起杀掉，否则下次又要等一轮预热（CUDA 约 35 秒）。
+    代价是它也失去了父进程的死亡通知 —— 所以寿命改由 `owner_watch` 盯着
+    Host（pid 来自环境变量 `UI_LOCATE_OWNER_PID`，子进程直接继承）：Host
+    在，服务就在；Host 退出，服务自己收工。没有这一层，DSH 关掉之后
+    pythonw 会一直留在进程列表里，只能手动结束。
 
     三件事一起做，才能做到「不弹窗、不留 conhost」：
       1. 用 pythonw.exe（Windows 子系统，不分配控制台）；
@@ -1211,7 +1216,25 @@ def ui_locate_frame(
 
 
 def main() -> None:
-    """stdio 传输入口。`python -m ui_locate.mcp_server` 与 console script 都走这里。"""
+    """stdio 传输入口。`python -m ui_locate.mcp_server` 与 console script 都走这里。
+
+    本进程同样跟着 Host 走：Host 退出时 DSH 未必来得及关掉这条 stdio 管道，
+    而 `mcp.run()` 只会在读到 EOF 时才返回。挂一个 owner 监控，Host 一走就
+    收工 —— 否则 `python -m ui_locate.mcp_server` 会和它拉起的 pythonw 一起
+    留在进程列表里。
+    """
+    owner_pid = owner_watch.parse_owner(os.environ.get(owner_watch.ENV))
+    if owner_pid is None:
+        # 没有显式配置时退到父进程：MCP 由 Host 通过 stdio 直接拉起，父进程就是
+        # Host。这样已经安装的用户升级到这一版立刻就正确，不必等 profile 里的
+        # 配置跟着更新；手动跑 `python -m ui_locate.mcp_server` 时父进程是 shell，
+        # 同样按「父在就在、父走就走」的直觉工作。
+        owner_pid = owner_watch.parse_owner(os.getppid())
+    if owner_pid is not None:
+        # 写回环境变量，让 `_spawn_server()` 拉起的 pythonw 继承同一个裁判。
+        os.environ[owner_watch.ENV] = str(owner_pid)
+        print(f"[ui-locate] 跟随 Host 进程 {owner_pid} 的生命周期", file=sys.stderr)
+        owner_watch.start(owner_pid, lambda: os._exit(0))
     mcp.run(transport="stdio")
 
 

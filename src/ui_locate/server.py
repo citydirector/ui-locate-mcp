@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sys
 import threading
 import time
@@ -59,7 +60,7 @@ cuda_dlls.register()
 
 from ui_locate import act as act_mod  # noqa: E402
 from ui_locate import background  # noqa: E402
-from ui_locate import compare_api, image_api, managed  # noqa: E402
+from ui_locate import compare_api, image_api, managed, owner_watch  # noqa: E402
 from ui_locate import capture as capture_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
@@ -1852,6 +1853,24 @@ def main() -> None:
     ENGINE = Engine(args.model, config.resolve_provider(args.provider), not args.no_ocr)
     print(f"[ui-locate] 就绪，预热耗时 {ENGINE.warmup_ms / 1000:.1f}s，"
           f"provider={ENGINE.det.active}", flush=True)
+
+    owner_pid = owner_watch.parse_owner(os.environ.get(owner_watch.ENV))
+    if owner_pid is not None:
+        # 服务由 MCP 进程拉起，但寿命归 Host：插件重载、MCP 重连都不该丢掉
+        # 预热，而 DSH 退出之后也不该留下 python / pythonw。
+        def _host_gone() -> None:
+            print("[ui-locate] Host 已退出，随它一起停止", flush=True)
+            try:
+                from ui_locate import capture, window_wgc
+
+                capture.release()
+                window_wgc.POOL.release()
+            except Exception:
+                pass
+            os._exit(0)
+
+        owner_watch.start(owner_pid, _host_gone)
+        print(f"[ui-locate] 跟随 Host 进程 {owner_pid} 的生命周期", flush=True)
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True

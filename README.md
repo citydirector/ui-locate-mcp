@@ -6,7 +6,7 @@
 
 Find on-screen UI text locally and return pixel coordinates for desktop interaction. Combined tools can locate, click, type, scroll and attempt to verify the result.
 
-Detection, OCR and actions run locally. Initial setup downloads Python dependencies and a detection model of about 80 MB. A persistent service runs inference; a lightweight MCP process forwards requests.
+Detection, OCR and actions run locally. Initial setup downloads Python dependencies and a detection model of about 80 MB. A persistent service runs inference; a lightweight MCP process forwards requests. The service lives and dies with DSH: it survives a plugin reload or an MCP reconnect (saving a warm-up), and stops on its own once DSH exits, so no `python` / `pythonw` process is left behind.
 
 ## Quick start
 
