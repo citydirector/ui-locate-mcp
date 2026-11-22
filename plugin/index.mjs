@@ -249,6 +249,15 @@ export function apply(ctx, config) {
       backend: target.backend,
       force,
       exec: execFile,
+      // 尺寸用来判断「模型是不是完整」：一个被截断的 .onnx 也会被当成已就绪，
+      // 要到推理时才炸。`inspect` 早就在用同一个注入点。
+      statSize: (path) => {
+        try {
+          return statSync(path).size
+        } catch {
+          return undefined
+        }
+      },
       onProgress: (written, total) => {
         const mb = (written / (1 << 20)).toFixed(1)
         report("下载模型", total > 0 ? `${mb} / ${(total / (1 << 20)).toFixed(1)} MB` : `${mb} MB`)
@@ -306,6 +315,7 @@ export function apply(ctx, config) {
             modelDir: { type: "string" },
             backend: { type: "string" },
             steps: { type: "array", items: { type: "object", additionalProperties: true } },
+            degraded: { type: "array", items: { type: "string" } },
             error: { type: "string" },
             runtime: { type: "object", additionalProperties: true },
           },
@@ -326,6 +336,8 @@ export function apply(ctx, config) {
           modelDir: target.modelDir,
           backend: target.backend,
           steps: result.steps ?? [],
+          // 装成功也可能少东西：可选依赖（OCR / 快速抓屏）失败只降级。
+          degraded: result.degraded ?? [],
           error: result.error,
           runtime: await inspect(target),
         })

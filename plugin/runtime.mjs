@@ -28,22 +28,67 @@
  * 真建 venv，也不需要网络。
  */
 
-import { existsSync, readFileSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { createWriteStream, existsSync, readFileSync, statSync } from "node:fs"
 import { dirname, join } from "node:path"
 
 import { NO_DEPS_WIN_DEPS } from "./core.mjs"
 
-/** 检测模型在 HuggingFace 上的地址与落盘名。 */
-export const MODEL_URL =
-  "https://huggingface.co/onnx-community/OmniParser-v2.0_icon_detect/resolve/main/onnx/model.onnx"
+/**
+ * 检测模型的源，按顺序试。
+ *
+ * 第二个是 HuggingFace 的国内镜像：**路径结构完全相同，只换域名**，所以在
+ * 代码里只是同一串路径前缀的替换。顺序是先官方后镜像——镜像站是公益项目，
+ * 能少给它一点压力就少一点，而且对国外用户来说官方那条本来更快。
+ */
+const MODEL_PATH = "onnx-community/OmniParser-v2.0_icon_detect/resolve/main/onnx/model.onnx"
+export const MODEL_SOURCES = [
+  `https://huggingface.co/${MODEL_PATH}`,
+  `https://hf-mirror.com/${MODEL_PATH}`,
+]
+export const MODEL_URL = MODEL_SOURCES[0]
 export const MODEL_FILENAME = "omniparser_icon_detect_yolo11m.onnx"
 /** 与 Python 侧 `config.py` 的 `MODEL_FILENAME` 保持一致；写错就对不上。 */
 export const MODEL_BYTES_HINT = 80_305_670
+/**
+ * 模型文件的 sha256，取自 HF 仓库里 `onnx/model.onnx` 的 LFS oid。
+ *
+ * 下完必须对上：一个截断的模型要到真正推理时才炸，而那时用户已经在用工具了，
+ * 报出来的还是 onnxruntime 内部的一句话。宁可在下载这一步就说「校验不符」。
+ */
+export const MODEL_SHA256 = "c0d3d261e3368a5e51fe0d632c5d62e4bd4da489ac4b95fbbee450eb640e36fe"
 
-/** pip 的 wheel 地址：按版本钉死，免得哪天上游改了文件名。 */
+/**
+ * pip 的 wheel，同样给多个源。
+ *
+ * 三个地址只差前缀：`files.pythonhosted.org` 是官方，两个镜像站原样搬了
+ * `packages/<hash 路径>` 这一层，所以文件名与目录结构可以共用一份常量。
+ * 版本钉死，免得哪天上游改了文件名。
+ */
+const PIP_WHEEL_PATH =
+  `packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl`
 export const PIP_VERSION = "26.2.2"
-export const PIP_WHEEL_URL =
-  `https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-${PIP_VERSION}-py3-none-any.whl`
+export const PIP_SOURCES = [
+  `https://files.pythonhosted.org/${PIP_WHEEL_PATH}`,
+  `https://pypi.tuna.tsinghua.edu.cn/${PIP_WHEEL_PATH}`,
+  `https://mirrors.aliyun.com/pypi/${PIP_WHEEL_PATH}`,
+]
+export const PIP_WHEEL_URL = PIP_SOURCES[0]
+/** pip 26.2.2 wheel 的 sha256（PyPI JSON API 的 `digests.sha256`）。 */
+export const PIP_SHA256 = "fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+
+/**
+ * 装依赖时用的索引，第一个是官方，后面是国内镜像。
+ *
+ * 与 wheel 不同，这里**不预先探测**：探测本身也要一次往返，而正常网络下官方
+ * 索引直接就通了。改成「先按默认装，失败再换镜像重来一次」——坏网络才会多花
+ * 那一轮，好网络一分钱不多付。
+ */
+export const PIP_INDEXES = [
+  "https://pypi.org/simple",
+  "https://pypi.tuna.tsinghua.edu.cn/simple",
+  "https://mirrors.aliyun.com/pypi/simple",
+]
 
 /**
  * 三个推理后端。
@@ -61,16 +106,38 @@ export const BACKENDS = {
 }
 export const DEFAULT_BACKEND = "directml"
 
-/** 非后端依赖。与 `pyproject.toml` 的 dependencies 去掉 ORT 后必须一致。 */
-export const COMMON_DEPS = [
+/**
+ * 缺了就跑不起来的依赖。
+ *
+ * `mcp_server.py` 在模块顶层 `import httpx`，`server.py` 顶层 `import cv2`，
+ * `detect.py` 顶层 `import onnxruntime`——这几个少一个，服务进程根本起不来。
+ */
+export const ESSENTIAL_DEPS = [
   "mcp>=1.10,<2",
+  "httpx",
   "numpy>=2.0",
   "opencv-python-headless",
-  "pillow",
-  "rapidocr>=3.0",
-  "httpx",
-  "dxcam>=0.3,<0.4; sys_platform == 'win32'",
 ]
+
+/**
+ * 缺了只降级的依赖。全部是**函数内部**才 import 的，所以装不上时服务照样起。
+ *
+ * * `rapidocr`：`locate.py:86` 里现 import，缺了等于没有 OCR，只剩图标检测。
+ * * `dxcam`：`capture.py:164` 现 import，缺了屏幕抓取退到 WGC / GDI。
+ * * `pillow`：`capture.py:130` 的 `ImageGrab`——最后一级的 GDI 兜底，缺了只剩
+ *   DXGI 与 WGC 两条路。
+ *
+ * 放在可选这一步，是因为它们在坏网络下恰恰是最容易失败的那几个（rapidocr 会
+ * 拖一串 onnxruntime 相关的依赖）。让它们挡住整个安装，用户就一个功能都用不上。
+ */
+export const OPTIONAL_DEPS = [
+  "rapidocr>=3.0",
+  "dxcam>=0.3,<0.4; sys_platform == 'win32'",
+  "pillow",
+]
+
+/** 两档合起来，与 `pyproject.toml` 的 dependencies 去掉 ORT 后必须一致。 */
+export const COMMON_DEPS = [...ESSENTIAL_DEPS, ...OPTIONAL_DEPS]
 
 
 // 只在 Windows、用 --no-deps 装的包：定义在 core.mjs，两条安装路径共用一份。
@@ -89,9 +156,11 @@ export function backendPackages(backend, platform = process.platform) {
   const chosen = BACKENDS[backend] ? backend : DEFAULT_BACKEND
   // 非 Windows 没有 DirectML，无论要哪个都退回 CPU 版；要 CUDA 得显式点名。
   const effective = platform !== "win32" && chosen === "directml" ? "cpu" : chosen
-  const packages = [...COMMON_DEPS, BACKENDS[effective]]
-  if (effective === "cuda") packages.push(...CUDA_RUNTIME_DEPS)
-  return { backend: effective, packages }
+  const essential = [...ESSENTIAL_DEPS, BACKENDS[effective]]
+  if (effective === "cuda") essential.push(...CUDA_RUNTIME_DEPS)
+  const optional = [...OPTIONAL_DEPS]
+  // `packages` 是两档的并集，保留给「一次装完」的调用方（含旧测试）。
+  return { backend: effective, essential, optional, packages: [...essential, ...optional] }
 }
 
 /**
@@ -224,49 +293,290 @@ function brief(result, limit = 400) {
 }
 
 /**
- * 下载一个文件，先写 `.part` 再改名。
+ * RID → 名字。与 Python 侧 `window.INTEGRITY_NAMES` 同一套阈值。
  *
- * 中途失败时留下的是 `.part` 而不是半截的正式文件——后者会被下一次启动
- * 当成「模型已就绪」，然后在推理时报一个看不懂的错。
- *
- * @returns `{ ok, bytes }` 或 `{ ok: false, error }`
+ * 降序排列，用 `value >= floor` 逐个比：完整性 RID 是「下限」，比如 0x2100
+ * （medium plus）与 0x2000（medium）只差一档，必须从高往低找才不会认错。
  */
-export async function download(url, destination, { fetch = globalThis.fetch, signal, onProgress } = {}) {
+const INTEGRITY_NAMES = [
+  [0x4000, "system"],
+  [0x3000, "high"],
+  [0x2100, "medium+"],
+  [0x2000, "medium"],
+  [0x1000, "low"],
+  [0x0000, "untrusted"],
+]
+
+/**
+ * 进程完整性级别 → 给设置页看的结论。
+ *
+ * 进程的完整性是「父进程令牌与主映像标签里更低的那个」，所以两种完全不同的
+ * 情况都会落到 Low：以低完整性启动 DSH，或者 `python.exe` 本身带了 Low 标签
+ * （运行目录被当成工作区时会写这种标签，且可继承）。两者后果一样——WGC 抓
+ * 不到画面、输入被 UIPI 拦——而**都不报错**。
+ *
+ * 这里只给一句人话让设置页有东西可标红；详细解释在服务侧的
+ * `window.integrity_warnings()`，那边能说清具体哪些子系统受影响。
+ */
+export function integrityFacts(rid, uiAccess) {
+  const value = Number(rid)
+  if (rid === null || rid === undefined || !Number.isFinite(value)) {
+    return { level: undefined, ui_access: Boolean(uiAccess), warnings: [] }
+  }
+  const level = (INTEGRITY_NAMES.find(([floor]) => value >= floor) ?? [0, "untrusted"])[1]
+  const warnings = []
+  if (level === "low" || level === "untrusted") {
+    warnings.push(
+      `运行环境在 ${level} 完整性级别：窗口捕获（WGC）会被系统拒绝，被遮挡的窗口会抓成全黑；` +
+        "向更高完整性的窗口发送输入会被静默丢弃。多半是运行目录被当成了工作区" +
+        "（那里会写入持久、可继承的 Low 标签）——把它挪到工作区之外，或以管理员身份启动 DSH。",
+    )
+  }
+  return { level, ui_access: Boolean(uiAccess), warnings }
+}
+
+/** 取文件尺寸；拿不到就返回 undefined —— 这是「不知道」，不是 0。 */
+function sizeOf(statSize, path) {
+  if (typeof statSize !== "function") return undefined
+  try {
+    const size = statSize(path)
+    return Number.isFinite(size) ? size : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 报错里只留域名：完整 URL 太长，一屏日志里反而看不出是哪个源挂了。 */
+function sourceLabel(url) {
+  try {
+    return new URL(url).host
+  } catch {
+    return String(url)
+  }
+}
+
+/** 这几个状态码换多少次都一样，别在一个 404 上耗掉整轮重试。 */
+function isFatalStatus(status) {
+  return status === 400 || status === 401 || status === 403 || status === 404 || status === 410
+}
+
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 文件内容的 sha256（小写十六进制）。 */
+async function fileSha256(path) {
+  const { createReadStream } = await import("node:fs")
+  const hash = createHash("sha256")
+  for await (const chunk of createReadStream(path)) hash.update(chunk)
+  return hash.digest("hex")
+}
+
+/**
+ * 从一个地址往 `.part` 里写，能续就续。
+ *
+ * 有残留的 `.part` 就带 `Range:`；服务器回 206 才追加，回 200 说明它不认
+ * Range，那就从头覆盖写——追加写会拼出一个坏文件，而且尺寸往往看着还挺对。
+ *
+ * @returns `{ ok, bytes }` / `{ ok: false, error, fatal?, restart? }`
+ */
+async function fetchInto(url, part, { fetch, signal, onProgress, expectedBytes, measure }) {
+  let offset = 0
+  const have = measure(part)
+  if (have > 0 && (expectedBytes === undefined || have < expectedBytes)) offset = have
+
   let response
   try {
-    response = await fetch(url, { signal, redirect: "follow" })
+    response = await fetch(url, {
+      signal,
+      redirect: "follow",
+      headers: offset > 0 ? { range: `bytes=${offset}-` } : {},
+    })
   } catch (error) {
-    return { ok: false, error: `下载失败：${String(error?.message ?? error)}` }
+    return { ok: false, error: String(error?.message ?? error) }
   }
-  if (!response?.ok) return { ok: false, error: `下载失败：HTTP ${response?.status ?? "?"}` }
-  const total = Number(response.headers?.get?.("content-length") ?? 0)
+  if (response?.status === 416) {
+    // 服务器说「这个范围不存在」：残留的 `.part` 跟它那一份对不上，删掉重来。
+    return { ok: false, error: "HTTP 416（断点位置无效）", restart: true }
+  }
+  if (!response?.ok) {
+    return {
+      ok: false,
+      error: `HTTP ${response?.status ?? "?"}`,
+      fatal: isFatalStatus(response?.status),
+    }
+  }
+
+  const resuming = offset > 0 && response.status === 206
+  if (!resuming) offset = 0
+  const length = Number(response.headers?.get?.("content-length") ?? 0)
+  const total = length > 0 ? length + offset : 0
+
+  const { pipeline } = await import("node:stream/promises")
+  const { Readable, Transform } = await import("node:stream")
+  const file = createWriteStream(part, resuming ? { flags: "a" } : { flags: "w" })
+  // 计数用 Transform，而不是在源上挂 `data` 监听：挂 `data` 会把流切到
+  // flowing 模式，接下来 `pipeline` 再接就已经晚了一步（小文件看不出差别，
+  // 80MB 上会丢首块）。
+  let written = offset
+  const counter = new Transform({
+    transform(chunk, _encoding, done) {
+      written += chunk.length
+      onProgress?.(written, total)
+      done(null, chunk)
+    },
+  })
+  await pipeline(Readable.fromWeb(response.body), counter, file)
+  return { ok: true, bytes: written }
+}
+
+
+/**
+ * 从多个地址里挑一个能用的把文件下下来，先写 `.part` 再改名。
+ *
+ * ## 为什么要多地址
+ *
+ * 只有一个地址时，那条链路挂了就等于装不上。模型在 huggingface.co 上，官方
+ * 镜像（hf-mirror.com）路径结构完全一样；pip 的 wheel 也一样，三个源只差域名
+ * 前缀。所以这里收一个**数组**，按顺序试，第一个成功的就用。
+ *
+ * ## 为什么要 `.part` 和 Range
+ *
+ * 77MB 的模型在坏网络上断在一半是常事。旧的写法是失败就把 `.part` 删掉、下次
+ * 从头再来——用户看到的是一遍又一遍的「下载中断」。现在失败时**保留** `.part`，
+ * 下一轮带 `Range:` 从断点续；服务器不认 Range（回 200）就老实从头覆盖写。
+ *
+ * ## 为什么要 sha256
+ *
+ * 半个文件比没有文件更坏：它会被当成「已就绪」，然后在推理时报一句看不懂的
+ * 错。给了 `sha256` 就先校验再改名，对不上就删掉换下一个源——宁可多下一遍，
+ * 也不留一个看起来装好了的坏文件。
+ *
+ * @param urls - 一个地址或多个地址（按顺序试）。
+ * @param destination - 最终文件路径。
+ * @param options
+ *   - `fetch` / `signal` / `onProgress`：注入点，测试替换。
+ *   - `sha256`：给了就校验，不符则换源重下。
+ *   - `expectedBytes`：已知大小，用来判断残留的 `.part` 是否已经完整。
+ *   - `attempts`：**每个源**试几次（默认 2）。
+ *   - `measure` / `sleep` / `log`：注入点。
+ * @returns `{ ok, bytes, url?, reused? }` 或 `{ ok: false, error }`
+ */
+export async function download(
+  urls,
+  destination,
+  {
+    fetch = globalThis.fetch,
+    signal,
+    onProgress,
+    sha256,
+    expectedBytes,
+    attempts = 2,
+    measure = (path) => {
+      try {
+        return statSync(path).size
+      } catch {
+        return 0
+      }
+    },
+    sleep = defaultSleep,
+    log = () => {},
+  } = {},
+) {
+  const sources = (Array.isArray(urls) ? urls : [urls]).filter(
+    (item) => typeof item === "string" && item !== "",
+  )
+  if (sources.length === 0) return { ok: false, error: "下载失败：没有可用的地址" }
   const part = `${destination}.part`
-  let written = 0
-  try {
-    const { createWriteStream } = await import("node:fs")
-    const { pipeline } = await import("node:stream/promises")
-    const { Readable } = await import("node:stream")
-    const file = createWriteStream(part)
-    const source = Readable.fromWeb(response.body)
-    if (onProgress) {
-      source.on("data", (chunk) => {
-        written += chunk.length
-        onProgress(written, total)
-      })
+  const { rename, rm } = await import("node:fs/promises")
+
+  // 上一轮已经下完、只是没来得及改名（或者改名那一步被打断）：先验一下再收工。
+  // 白下 80MB 是用户能感觉到的浪费，而验一次 sha256 只要一秒。
+  if (sha256 !== undefined && expectedBytes !== undefined && measure(part) === expectedBytes) {
+    const digest = await fileSha256(part).catch(() => undefined)
+    if (digest === sha256) {
+      await rename(part, destination)
+      return { ok: true, bytes: expectedBytes, reused: true }
     }
-    await pipeline(source, file)
-    const { rename } = await import("node:fs/promises")
-    await rename(part, destination)
-    return { ok: true, bytes: written }
-  } catch (error) {
-    try {
-      const { rm } = await import("node:fs/promises")
-      await rm(part, { force: true })
-    } catch {
-      /* 清理失败不该盖住真正的原因 */
-    }
-    return { ok: false, error: `下载中断：${String(error?.message ?? error)}` }
+    await rm(part, { force: true }).catch(() => {})
   }
+
+  const failures = []
+  const rounds = Math.max(1, attempts)
+  for (const url of sources) {
+    for (let attempt = 1; attempt <= rounds; attempt += 1) {
+      if (signal?.aborted) return { ok: false, error: "下载已取消" }
+      let step
+      try {
+        step = await fetchInto(url, part, { fetch, signal, onProgress, expectedBytes, measure })
+      } catch (error) {
+        // pipeline 中途断了：`.part` 留着，下一轮从断点接着下。
+        step = { ok: false, error: String(error?.message ?? error) }
+      }
+      if (step.restart === true) {
+        await rm(part, { force: true }).catch(() => {})
+        log(`下载 ${sourceLabel(url)}: 断点位置无效，从头重来`)
+        continue
+      }
+      if (step.ok !== true) {
+        failures.push(`${sourceLabel(url)}: ${step.error}`)
+        if (step.fatal === true) break
+        if (attempt < rounds) await sleep(attempt * 500)
+        continue
+      }
+      if (sha256 !== undefined) {
+        const digest = await fileSha256(part).catch(() => undefined)
+        if (digest !== sha256) {
+          // 内容坏了，续传只会继续坏下去：删掉，换下一个源重新下。
+          await rm(part, { force: true }).catch(() => {})
+          const got = String(digest ?? "读不出").slice(0, 12)
+          failures.push(`${sourceLabel(url)}: 校验不符（要 ${sha256.slice(0, 12)}… 拿到 ${got}…）`)
+          break
+        }
+      }
+      try {
+        await rename(part, destination)
+      } catch (error) {
+        return { ok: false, error: `下载完成但改名失败：${String(error?.message ?? error)}` }
+      }
+      return { ok: true, bytes: step.bytes, url }
+    }
+  }
+  return { ok: false, error: `下载失败（已试 ${sources.length} 个源）：${failures.join("；")}` }
+}
+
+/**
+ * 依赖装失败之后，按顺序找一个能用的索引。
+ *
+ * 只在**失败之后**调用，不预先探测：正常网络下官方索引一次就通，探测纯属多花
+ * 一次往返。每个候选先要一次 `simple/pip/`（几十 KB 的列表页），通不过就换下
+ * 一个。全都不通时返回 undefined，调用方仍可退回 pip 的默认行为。
+ *
+ * @returns 可用的索引地址，或 undefined。
+ */
+export async function pickIndex({
+  fetch = globalThis.fetch,
+  indexes = PIP_INDEXES,
+  probeMs = 5000,
+  signal,
+  log = () => {},
+} = {}) {
+  for (const index of indexes) {
+    if (signal?.aborted) return undefined
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), probeMs)
+    try {
+      const response = await fetch(`${index}/pip/`, { signal: controller.signal, redirect: "follow" })
+      if (response?.ok) {
+        log(`pip index: ${index}`)
+        return index
+      }
+      log(`pip index ${index} → HTTP ${response?.status ?? "?"}`)
+    } catch (error) {
+      log(`pip index ${index} → ${String(error?.message ?? error)}`)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return undefined
 }
 
 /**
@@ -283,11 +593,20 @@ export async function bootstrapPip(python, home, version, {
   fetch = globalThis.fetch,
   platform = process.platform,
   tmpDir,
-  wheelUrl = PIP_WHEEL_URL,
+  wheelUrls = PIP_SOURCES,
   signal,
+  log = () => {},
 } = {}) {
   const wheel = join(tmpDir ?? home, `pip-${PIP_VERSION}.whl`)
-  const got = await download(wheelUrl, wheel, { fetch, signal })
+  // 三个源只差域名，sha256 是同一个文件——所以校验值只有一份，多源不会
+  // 因为「哪个源的内容不一样」而误判。
+  const got = await download(wheelUrls, wheel, {
+    fetch,
+    signal,
+    sha256: PIP_SHA256,
+    expectedBytes: 1_819_850,
+    log,
+  })
   if (!got.ok) return { ok: false, error: `取 pip 失败：${got.error}` }
   const target = sitePackages(home, version, platform)
   const unzipped = await run(exec, python, ["-m", "zipfile", "-e", wheel, target])
@@ -361,6 +680,13 @@ export async function ensureRuntime({
   signal,
   log = () => {},
   onProgress,
+  statSize = (path) => {
+    try {
+      return statSync(path).size
+    } catch {
+      return undefined
+    }
+  },
 }) {
   const steps = []
   const done = (name, detail) => {
@@ -423,6 +749,7 @@ export async function ensureRuntime({
       platform,
       tmpDir: plan.home,
       signal,
+      log,
     })
     if (!bootstrapped.ok) return fail("pip", bootstrapped.error)
     done("pip", { ok: true, reused: false, version: bootstrapped.pip })
@@ -438,22 +765,60 @@ export async function ensureRuntime({
   //   b) `--no-deps` 装本包时才不会顺带拉一遍。
   //
   // 所以依赖在这里显式列出，并按用户选的后端决定装哪个 ORT。
-  const { backend, packages: deps } = backendPackages(requestedBackend, platform)
+  const { backend, essential, optional } = backendPackages(requestedBackend, platform)
   const env = { ...process.env, TEMP: plan.home, TMP: plan.home, TMPDIR: plan.home }
-  const depsArgs = ["-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check"]
-  if (force) depsArgs.push("--force-reinstall", "--upgrade")
-  depsArgs.push(...deps)
-  const depsInstalled = await run(exec, python, depsArgs, { env })
-  if (!depsInstalled.ok) return fail("依赖", `装依赖失败：${brief(depsInstalled)}`)
-  done("依赖", { ok: true, backend, packages: deps.length })
+  // `--timeout 30 --retries 2` 是有意的：pip 默认单次读 15 秒、重试 5 次，
+  // 一条死的连接要耗掉 90 秒才认输，后面换镜像那一步就被拖得没意义了。
+  const pipInstall = [
+    "-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check",
+    "--timeout", "30", "--retries", "2",
+  ]
+  if (force) pipInstall.push("--force-reinstall", "--upgrade")
 
-  // ── 3b. 只在 Windows、--no-deps 的可选包（失败不中断）────────────────────
+  const essentialArgs = [...pipInstall, ...essential]
+  let depsInstalled = await run(exec, python, essentialArgs, { env })
+  if (!depsInstalled.ok) {
+    // 第一次失败先别报死：坏网络下最常见的不是「包不存在」，而是那个索引根本
+    // 连不上。换一个能通的镜像再试一次，多半就成了。
+    const index = await pickIndex({ fetch, signal, log })
+    if (index !== undefined && index !== PIP_INDEXES[0]) {
+      log(`必需依赖安装失败，改用镜像重试：${index}`)
+      const retryArgs = [...pipInstall, "--index-url", index, "--extra-index-url", PIP_INDEXES[0], ...essential]
+      depsInstalled = await run(exec, python, retryArgs, { env })
+      if (depsInstalled.ok) done("依赖源", { ok: true, index })
+    }
+  }
+  if (!depsInstalled.ok) return fail("依赖", `装必需依赖失败：${brief(depsInstalled)}`)
+  done("依赖", { ok: true, backend, packages: essential.length })
+
+  // ── 3b. 可选依赖（失败只降级，不中断）──────────────────────────────────────
+  //
+  // `rapidocr` / `dxcam` 都是函数内部现 import 的（`locate.py:86`、
+  // `capture.py:164`），缺了服务照样起得来，只是少了 OCR 或退回慢速抓屏。
+  // 它们在坏网络下恰恰最容易失败（rapidocr 会拖一串依赖），让它们挡住整个
+  // 安装，用户就一个功能都用不上。
+  //
+  // `NO_DEPS_WIN_DEPS` 单独一步：`windows-capture` 声明依赖 `opencv-python`，
+  // 和 headless 版抢同一个 `cv2`，只能 `--no-deps` 装。
+  const degraded = []
+  // 一个一个装。放在一条命令里，`rapidocr` 拉不下来会把 `dxcam` 一起带下水——
+  // 而这两个是独立的：OCR 没了还能定位，抓屏慢了还能定位。多起两个 pip 进程
+  // 只在安装/修复时发生，比「少一半功能」便宜得多。
+  for (const spec of optional) {
+    const opt = await run(exec, python, [...pipInstall, spec], { env })
+    if (opt.ok) {
+      done("可选依赖", { ok: true, package: spec })
+    } else {
+      degraded.push(spec)
+      done("可选依赖", { ok: false, optional: true, package: spec, error: brief(opt) })
+    }
+  }
   if (platform === "win32" && NO_DEPS_WIN_DEPS.length) {
-    const optArgs = ["-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check", "--no-deps"]
-    if (force) optArgs.push("--force-reinstall", "--upgrade")
-    optArgs.push(...NO_DEPS_WIN_DEPS)
-    const opt = await run(exec, python, optArgs, { env })
-    done("可选依赖", opt.ok ? { ok: true, packages: NO_DEPS_WIN_DEPS } : { ok: false, optional: true, error: brief(opt) })
+    const opt = await run(exec, python, [...pipInstall, "--no-deps", ...NO_DEPS_WIN_DEPS], { env })
+    if (!opt.ok) degraded.push(...NO_DEPS_WIN_DEPS)
+    done("可选依赖", opt.ok
+      ? { ok: true, packages: NO_DEPS_WIN_DEPS }
+      : { ok: false, optional: true, error: brief(opt) })
   }
 
   // ── 4. 本包 ────────────────────────────────────────────────────────────────
@@ -467,15 +832,39 @@ export async function ensureRuntime({
   done("本包", { ok: true, path: packageRoot })
 
   // ── 5. 模型 ────────────────────────────────────────────────────────────────
-  if (exists(plan.model) && !force) {
-    done("模型", { ok: true, path: plan.model, reused: true })
+  //
+  // 尺寸对不上就当没有：一个截断的 `.onnx` 会被推理层当成「已就绪」，然后在
+  // 真正抓图时抛一句 onnxruntime 内部的话。`statSize` 拿不到尺寸时退回旧的
+  // 「文件在就算好」——那是测试注入的场合，不是真实环境。
+  const have = exists(plan.model) ? sizeOf(statSize, plan.model) : undefined
+  if (have !== undefined && have !== MODEL_BYTES_HINT) {
+    log(`模型大小异常：${have} 字节（应为 ${MODEL_BYTES_HINT}），重新下载`)
+  }
+  if (exists(plan.model) && !force && (have === undefined || have === MODEL_BYTES_HINT)) {
+    done("模型", { ok: true, path: plan.model, reused: true, bytes: have })
   } else {
-    const got = await download(MODEL_URL, plan.model, { fetch, signal, onProgress })
+    const got = await download(MODEL_SOURCES, plan.model, {
+      fetch,
+      signal,
+      onProgress,
+      sha256: MODEL_SHA256,
+      expectedBytes: MODEL_BYTES_HINT,
+      measure: (path) => sizeOf(statSize, path) ?? 0,
+      log,
+    })
     if (!got.ok) return fail("模型", got.error)
-    done("模型", { ok: true, path: plan.model, bytes: got.bytes })
+    done("模型", {
+      ok: true,
+      path: plan.model,
+      bytes: got.bytes,
+      reused: got.reused === true,
+      source: got.url === undefined ? undefined : new URL(got.url).host,
+    })
   }
 
-  return { ok: true, steps, plan }
+  // `degraded` 单独回给调用方：设置页要能显示「可用，但少了 X」，
+  // 而不是把可选依赖失败当成整次安装失败。
+  return { ok: true, steps, plan, degraded }
 }
 
 /** 这个文件叫这个名字，Python 侧的 `config.RUNTIME_FILE` 必须一致。 */
@@ -571,6 +960,9 @@ export async function inspectRuntime({
     pythonVersion: undefined,
     installedVersion: undefined,
     backend: undefined,
+    // 设置页要能**在装之前**就看出这个位置有问题，所以这一项不依赖本包是否
+    // 已装：探测脚本只用 ctypes，不 import ui_locate。
+    integrity: { level: undefined, ui_access: false, warnings: [] },
   }
   if (!venv || !exec) return facts
   const probe = [
@@ -581,7 +973,39 @@ export async function inspectRuntime({
     `try:`,
     `    import onnxruntime as o; b=",".join(o.get_available_providers())`,
     `except Exception: b=None`,
-    `print(json.dumps({"python":sys.version.split()[0],"pkg":v,"backend":b}))`,
+    // 完整性级别只用 ctypes 读，不 import 本包：首次安装时本包还没装，而那正是
+    // 最需要知道「这个位置会不会把进程降成 Low」的时刻。
+    "rid=None",
+    "ua=False",
+    "try:",
+    "    import ctypes, ctypes.wintypes as w",
+    "    k=ctypes.WinDLL('kernel32', use_last_error=True)",
+    "    a=ctypes.WinDLL('advapi32', use_last_error=True)",
+    "    k.GetCurrentProcess.restype=w.HANDLE",
+    "    k.CloseHandle.argtypes=[w.HANDLE]",
+    "    a.OpenProcessToken.argtypes=[w.HANDLE,w.DWORD,ctypes.POINTER(w.HANDLE)]",
+    "    a.GetTokenInformation.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.POINTER(w.DWORD)]",
+    "    a.GetSidSubAuthorityCount.argtypes=[ctypes.c_void_p]",
+    "    a.GetSidSubAuthorityCount.restype=ctypes.POINTER(ctypes.c_ubyte)",
+    "    a.GetSidSubAuthority.argtypes=[ctypes.c_void_p,w.DWORD]",
+    "    a.GetSidSubAuthority.restype=ctypes.POINTER(w.DWORD)",
+    "    t=w.HANDLE()",
+    "    if a.OpenProcessToken(k.GetCurrentProcess(),0x0008,ctypes.byref(t)):",
+    "        try:",
+    "            n=w.DWORD(0)",
+    "            a.GetTokenInformation(t,25,None,0,ctypes.byref(n))",
+    "            buf=ctypes.create_string_buffer(max(n.value,64))",
+    "            if a.GetTokenInformation(t,25,buf,len(buf),ctypes.byref(n)):",
+    "                sid=ctypes.c_void_p.from_buffer(buf).value",
+    "                cnt=a.GetSidSubAuthorityCount(sid)[0]",
+    "                rid=int(a.GetSidSubAuthority(sid,cnt-1)[0])",
+    "            u=w.DWORD(0)",
+    "            if a.GetTokenInformation(t,26,ctypes.byref(u),ctypes.sizeof(u),ctypes.byref(n)):",
+    "                ua=bool(u.value)",
+    "        finally:",
+    "            k.CloseHandle(t)",
+    "except Exception: pass",
+    `print(json.dumps({"python":sys.version.split()[0],"pkg":v,"backend":b,"rid":rid,"ui_access":ua}))`,
   ].join("\n")
   const result = await run(exec, plan.python, ["-c", probe])
   if (result.ok) {
@@ -590,6 +1014,7 @@ export async function inspectRuntime({
       facts.pythonVersion = parsed.python ?? undefined
       facts.installedVersion = parsed.pkg ?? undefined
       facts.backend = parsed.backend ?? undefined
+      facts.integrity = integrityFacts(parsed.rid, parsed.ui_access === true)
     } catch {
       /* 输出不是 JSON 就只报「venv 在」这一层 */
     }

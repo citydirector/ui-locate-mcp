@@ -19,6 +19,7 @@
  */
 
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -799,6 +800,259 @@ test("runtime：Windows 上 windows-capture 用 --no-deps 单独装，失败也�
     assert.ok(wc.includes("--no-deps"), wc.join(" "))
     const deps = calls.find((a) => a.includes("opencv-python-headless"))
     assert.ok(deps && !deps.some((x) => String(x).startsWith("windows-capture")), "不能混进主依赖那一步")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("runtime：两档依赖与 pyproject 的 dependencies 对得上", async () => {
+  // runtime.mjs 里那两档是手写的，pyproject 里那份也是手写的，两边迟早会漂。
+  // 漂了以后本地 `pip install -e .` 装得齐、插件安装器却少装一个——正是最难
+  // 查的那种 bug。这里只比「包名」：版本号与 marker 由各自那一份负责。
+  const { ESSENTIAL_DEPS, OPTIONAL_DEPS, COMMON_DEPS } = await import("../plugin/runtime.mjs")
+  const name = (spec) => spec.split(";")[0].trim().match(/^[A-Za-z0-9_.\-]+/)[0].toLowerCase()
+
+  assert.equal(new Set(COMMON_DEPS).size, COMMON_DEPS.length, "同一条不许出现在两档里")
+  assert.deepEqual(COMMON_DEPS, [...ESSENTIAL_DEPS, ...OPTIONAL_DEPS])
+
+  // pyproject.toml 是 CRLF，先归一化，否则下面的切片标记找不到、会切到文件尾
+  const toml = readFileSync(join(ROOT, "pyproject.toml"), "utf8").replace(/\r\n/g, "\n")
+  const blockText = toml.slice(toml.indexOf("dependencies = ["), toml.indexOf("]\n\n[project.optional-dependencies]"))
+  // 这一段里带引号的只有依赖声明本身，注释是纯文本
+  const declared = new Set([...blockText.matchAll(/"([^"]+)"/g)].map((m) => name(m[1])))
+  // ORT 与 CUDA 那几行由 `backendPackages()` 另外加，不属于这两档
+  const elsewhere = new Set(["onnxruntime", "onnxruntime-directml"].map(name))
+
+  for (const spec of COMMON_DEPS) {
+    assert.ok(declared.has(name(spec)), `pyproject 里没有 ${spec}`)
+  }
+  for (const dep of declared) {
+    if (elsewhere.has(dep)) continue
+    assert.ok(COMMON_DEPS.some((spec) => name(spec) === dep), `runtime.mjs 里没有 ${dep}`)
+  }
+})
+
+// ── 下载韧性：多源、断点续传、校验 ──────────────────────────────────────────
+//
+// 坏网络下首装失败是真实反馈里最常见的一条。旧实现只有一个地址、失败就把
+// `.part` 删掉从头再来、也不校验内容，所以用户看到的只是同一句「下载中断」
+// 反复出现。下面锁定四件事：换源、续传、服务器不认 Range 时别拼坏文件、
+// 校验不符要重来。全部用注入的 fetch，不打真实网络。
+
+/** 造一个空目录，返回目标文件路径。 */
+function downloadTarget() {
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-dl-"))
+  return { dir, file: join(dir, "model.onnx") }
+}
+
+/**
+ * 造一个真 `Response`。
+ *
+ * `download` 里走的是 `Readable.fromWeb(response.body)`，所以要给真的 web
+ * stream；`{ status, ok, headers }` 也必须是真对象，手搓一个是不够的。
+ */
+function streamResponse(bytes, { status = 200, headers = {} } = {}) {
+  return new Response(new Uint8Array(bytes), { status, headers: new Headers(headers) })
+}
+
+test("download：第一个源挂了会用第二个源，且报错里点得出域名", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  const seen = []
+  const fetch = async (url) => {
+    seen.push(url)
+    if (url.includes("primary")) throw new Error("ECONNREFUSED")
+    return streamResponse([1, 2, 3])
+  }
+  try {
+    const got = await download(["https://primary.test/a.onnx", "https://mirror.test/a.onnx"], file, {
+      fetch,
+      sleep: async () => {},
+    })
+    assert.equal(got.ok, true, JSON.stringify(got))
+    assert.equal(got.url, "https://mirror.test/a.onnx")
+    assert.equal(seen.filter((u) => u.includes("primary")).length, 2, "每个源默认试两次")
+    assert.deepEqual([...readFileSync(file)], [1, 2, 3])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("download：全都不通时报错要点出试过几个源、分别挂在哪", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  const fetch = async () => {
+    throw new Error("ECONNREFUSED")
+  }
+  try {
+    const got = await download(["https://a.test/x", "https://b.test/x"], file, { fetch, sleep: async () => {} })
+    assert.equal(got.ok, false)
+    assert.match(got.error, /已试 2 个源/)
+    assert.match(got.error, /a\.test/)
+    assert.match(got.error, /b\.test/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("download：404 不重试同一个源，直接换下一个", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  let primary = 0
+  const fetch = async (url) => {
+    if (url.includes("primary")) {
+      primary += 1
+      return streamResponse([], { status: 404 })
+    }
+    return streamResponse([5])
+  }
+  try {
+    const got = await download(["https://primary.test/x", "https://mirror.test/x"], file, { fetch, sleep: async () => {} })
+    assert.equal(got.ok, true, JSON.stringify(got))
+    assert.equal(primary, 1, "404 换几次都一样，不该耗掉整轮重试")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("download：残留的 .part 会带 Range 续传，服务器认了就追加", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  writeFileSync(`${file}.part`, Buffer.from([1, 2, 3]))
+  let range
+  const fetch = async (url, init) => {
+    range = init?.headers?.range
+    return streamResponse([4, 5], { status: 206, headers: { "content-length": "2" } })
+  }
+  try {
+    const got = await download("https://mirror.test/a.onnx", file, { fetch })
+    assert.equal(range, "bytes=3-", "断点位置要从 .part 的真实大小来")
+    assert.equal(got.ok, true, JSON.stringify(got))
+    assert.deepEqual([...readFileSync(file)], [1, 2, 3, 4, 5])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("download：服务器不认 Range（回 200）就从头覆盖写", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  writeFileSync(`${file}.part`, Buffer.from([9, 9, 9]))
+  const fetch = async () => streamResponse([1, 2], { status: 200 })
+  try {
+    const got = await download("https://mirror.test/a.onnx", file, { fetch })
+    assert.equal(got.ok, true, JSON.stringify(got))
+    // 追加写会得到 [9,9,9,1,2]——尺寸看着还挺对，内容全错。
+    assert.deepEqual([...readFileSync(file)], [1, 2])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("download：sha256 不符就丢掉这份、换下一个源重下", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  const wanted = createHash("sha256").update(Buffer.from([1, 2, 3])).digest("hex")
+  const fetch = async (url) =>
+    url.includes("bad") ? streamResponse([7, 7, 7]) : streamResponse([1, 2, 3])
+  try {
+    const got = await download(["https://bad.test/a", "https://good.test/a"], file, { fetch, sha256: wanted })
+    assert.equal(got.ok, true, JSON.stringify(got))
+    assert.equal(got.url, "https://good.test/a")
+    assert.deepEqual([...readFileSync(file)], [1, 2, 3])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("download：已经下完的 .part 不必重下一遍", async () => {
+  const { download } = await import("../plugin/runtime.mjs")
+  const { dir, file } = downloadTarget()
+  const bytes = [1, 2, 3]
+  const wanted = createHash("sha256").update(Buffer.from(bytes)).digest("hex")
+  writeFileSync(`${file}.part`, Buffer.from(bytes))
+  let calls = 0
+  const fetch = async () => {
+    calls += 1
+    return streamResponse(bytes)
+  }
+  try {
+    const got = await download("https://mirror.test/a.onnx", file, {
+      fetch,
+      sha256: wanted,
+      expectedBytes: bytes.length,
+    })
+    assert.equal(got.ok, true, JSON.stringify(got))
+    assert.equal(got.reused, true)
+    assert.equal(calls, 0, "内容已经对了就别再下一遍")
+    assert.deepEqual([...readFileSync(file)], bytes)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("integrity：Low 给出警告，High / medium+ 不给，读不到就不猜", async () => {
+  const { integrityFacts } = await import("../plugin/runtime.mjs")
+  const low = integrityFacts(0x1000, false)
+  assert.equal(low.level, "low")
+  assert.equal(low.warnings.length, 1, "Low 必须有一句人话")
+  assert.ok(!low.ui_access)
+
+  assert.deepEqual(integrityFacts(0x3000, false).warnings, [])
+  assert.equal(integrityFacts(0x3000, false).level, "high")
+  assert.equal(integrityFacts(0x2000, false).level, "medium")
+  assert.equal(integrityFacts(0x2100, false).level, "medium+", "0x2100 与 0x2000 只差一档")
+
+  const unknown = integrityFacts(null, false)
+  assert.equal(unknown.level, undefined)
+  assert.deepEqual(unknown.warnings, [], "读不到就别编一个级别出来")
+})
+
+test("runtime：可选依赖失败只降级，不把整次安装判死", async () => {
+  // rapidocr / dxcam 都是函数内部现 import 的（locate.py:86、capture.py:164），
+  // 缺了服务照样起得来。坏网络下它们恰恰最容易失败，让它们挡住整个安装，
+  // 用户就一个功能都用不上。
+  const { ensureRuntime, venvPython } = await import("../plugin/runtime.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "ui-locate-rt-"))
+  try {
+    const home = join(dir, "home")
+    // 不加 platform：`runtimePlan` 按**宿主**算解释器路径，这里必须跟它一致，
+    // 否则 exists() 认不出 venv，会白白去建一个。
+    const python = venvPython(home)
+    mkdirSync(join(python, ".."), { recursive: true })
+    writeFileSync(python, "")
+    const calls = []
+    const exec = (file, args, options, callback) => {
+      calls.push(args)
+      const done = typeof options === "function" ? options : callback
+      let text = ""
+      if (args.includes("--version")) text = "pip 26.2.2\n"
+      else if (args.join(" ").includes("sys.version")) text = "3.12.13\n"
+      if (args.some((a) => String(a).startsWith("rapidocr"))) {
+        setTimeout(() => done(Object.assign(new Error("no rapidocr"), { code: 1 }), "", "no rapidocr"), 0)
+        return
+      }
+      setTimeout(() => done(null, text, ""), 0)
+    }
+    const result = await ensureRuntime({
+      home,
+      modelDir: join(dir, "models"),
+      pythonExe: python,
+      packageRoot: dir,
+      backend: "cpu",
+      exec,
+      platform: "linux",
+      exists: (path) => path === python || path.endsWith(".onnx"),
+    })
+    // 逐个安装：一个可选包装不上不该连累另一个
+    const dxcamAlone = calls.some(
+      (a) => a.some((x) => String(x).startsWith("dxcam")) && !a.some((x) => String(x).startsWith("rapidocr")),
+    )
+    assert.ok(dxcamAlone, `dxcam 应该单独一次安装：${JSON.stringify(calls)}`)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.deepEqual(result.degraded, ["rapidocr>=3.0"], "只记失败的那条")
+    // 必需依赖不能混进降级名单
+    assert.ok(!result.degraded.some((spec) => spec.includes("opencv")), JSON.stringify(result.degraded))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

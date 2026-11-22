@@ -412,9 +412,42 @@ def _token_info(pid: int | None) -> tuple[int | None, bool]:
             _k.CloseHandle(proc)
 
 
+def integrity_warnings(level: str | None, ui_access: bool) -> list[str]:
+    """这个完整性级别会让哪些能力**静默**降级。
+
+    进程的完整性级别是「父进程令牌」与「主映像文件标签」里**更低**的那个，所以
+    ``python.exe`` 落在带 Low 标签的目录里时，即便从管理员窗口启动也照样是
+    Low——不需要谁去降权，也不会有任何提示。代价有两条，都不报错：
+
+    * WGC 抓窗口 ``E_ACCESSDENIED``，自动退回 PrintWindow；被遮挡的窗口与
+      GPU 渲染的内容抓成全黑，再退「按屏抓再裁」，那就要求窗口在前台。
+    * 向更高完整性（多半是以管理员运行）的窗口 ``SendInput`` / ``PostMessage``
+      会被 UIPI 拦掉，MS 文档明说这两种调用都**不会**通过返回值或
+      ``GetLastError`` 告诉你失败了。
+
+    坏处在于症状是「抓图质量变差」「点了没反应」，而不是一条错误。所以这里
+    只在 ``/health`` 里提前说清楚，不改任何行为——搬目录还是提权启动，得由
+    使用者决定。
+    """
+    if level is None:
+        return ["读不到本进程的完整性级别：无法判断读屏与输入会不会被系统拦下。"]
+    if level not in ("low", "untrusted"):
+        return []
+    notes = [
+        f"本服务运行在 {level} 完整性级别：WGC 抓窗口会被拒（E_ACCESSDENIED），"
+        "被遮挡的窗口与 GPU 渲染的游戏会抓成全黑；向更高完整性的窗口发送输入会被 "
+        "UIPI 静默丢弃。多半是运行目录被当成了工作区授权——那里会写入持久、可继承的 "
+        "Low 标签。把 UI_LOCATE_HOME 挪到工作区之外，或以管理员身份启动 DSH。",
+    ]
+    if not ui_access:
+        notes.append("没有 UIAccess：目标窗口的完整性级别高于本进程时，键鼠消息会被拦掉。")
+    return notes
+
+
 def self_integrity() -> dict:
     rid, ua = _token_info(None)
-    return {"level": integrity_name(rid), "ui_access": ua}
+    level = integrity_name(rid)
+    return {"level": level, "ui_access": ua, "warnings": integrity_warnings(level, ua)}
 
 
 def process_integrity(pid: int) -> str | None:

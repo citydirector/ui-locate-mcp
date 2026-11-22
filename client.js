@@ -69,6 +69,8 @@ window.__ModuleLoader__.load({
         'status.python': 'Python 版本',
         'status.pkg': '插件版本',
         'status.backend': '可用后端',
+        'status.integrity': '进程完整性',
+        'warn.integrity': '运行环境在低完整性级别：窗口捕获会被 Windows 拒绝，被遮挡的窗口会抓成全黑；向更高完整性的窗口发送输入也会被静默丢弃。多半是运行目录落在工作区里（那里会写持久的 Low 标签）——把运行目录挪到工作区之外，或以管理员身份启动 DSH。',
         'step.of': '当前步骤',
         'err.title': '准备失败',
         'err.retry': '可以再试一次；如果反复失败，看下面这段输出。',
@@ -104,6 +106,8 @@ window.__ModuleLoader__.load({
         'status.python': 'Python version',
         'status.pkg': 'Plugin version',
         'status.backend': 'Available backends',
+        'status.integrity': 'Process integrity',
+        'warn.integrity': 'The runtime sits at a low integrity level: Windows refuses window capture (occluded windows come back black), and input to higher-integrity windows is silently dropped. This usually means the runtime directory is inside a workspace, which stamps a persistent Low label — move it out of the workspace, or start DSH as administrator.',
         'step.of': 'Current step',
         'err.title': 'Preparation failed',
         'err.retry': 'Trying again is safe. If it keeps failing, the output below says where.',
@@ -174,6 +178,10 @@ window.__ModuleLoader__.load({
 .ul_step{font-size:11.5px;color:var(--dsw-alias-label-secondary)}
 .ul_step b{font-weight:660;color:var(--dsw-alias-label-primary)}
 .ul_note{font-size:11.5px;line-height:1.6;color:var(--dsw-alias-label-tertiary)}
+.ul_warn{padding:10px 12px;border-radius:10px;font-size:11.5px;line-height:1.6;
+  border:1px solid color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-business-primary)) 45%,transparent);
+  background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-business-primary)) 10%,transparent);
+  color:var(--dsw-alias-label-primary)}
 .ul_err{padding:10px 12px;border-radius:10px;font-size:11.5px;line-height:1.55;word-break:break-word;
   border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 40%,transparent);
   background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,transparent);color:var(--dsw-alias-state-error-primary)}
@@ -311,6 +319,11 @@ window.__ModuleLoader__.load({
               ? t('unknown')
               : t('state.missing')
       const pillClass = running ? 'warn' : ready ? 'ok' : venv || model ? 'warn' : 'bad'
+      // 完整性不是「装没装好」那一档，但它会让装好的环境**部分失效**：WGC 读不到
+      // 窗口、输入被 UIPI 吞掉，而且两者都不报错。所以单独标出来，别混进
+      // ready/missing 的判断里。
+      const integrityLevel = status?.integrity?.level
+      const lowIntegrity = integrityLevel === 'low' || integrityLevel === 'untrusted'
 
       const fact = (label, value, tone) =>
         h('div', { className: 'ul_fact' }, [
@@ -385,6 +398,7 @@ window.__ModuleLoader__.load({
             fact(t('status.python'), status?.pythonVersion ?? t('unknown'), 'mono'),
             fact(t('status.pkg'), status?.installedVersion ?? t('unknown'), 'mono'),
             fact(t('status.backend'), status?.backend ?? t('unknown'), 'mono'),
+            fact(t('status.integrity'), integrityLevel ?? t('unknown'), lowIntegrity ? 'bad' : ''),
           ]),
           h('div', { className: 'ul_row', key: 'row' }, [
             h('button', {
@@ -418,6 +432,9 @@ window.__ModuleLoader__.load({
                 h('div', { key: 'r' }, t('err.retry')),
                 h('pre', { key: 'p' }, String(job.error ?? '')),
               ])
+            : null,
+          lowIntegrity
+            ? h('div', { className: 'ul_warn', key: 'w' }, t('warn.integrity'))
             : null,
           error !== ''
             ? h('div', { className: 'ul_err', key: 'err' }, h('pre', {}, error))

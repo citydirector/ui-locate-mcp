@@ -1476,8 +1476,10 @@ class Handler(BaseHTTPRequestHandler):
                 # 托管模式下连"有几块屏、屏幕多大"都不能说：那本身就是一次
                 # 桌面发现。能力表里的 desktop:false 已经足够表达状态。
                 body["screen"] = screen.describe()
-                # 完整性级别只影响"能不能操作管理员窗口"，托管模式下不注入
-                # 输入，这项也就没有意义了。
+                # 完整性级别不只是「能不能操作管理员窗口」：它同时决定 WGC 能不能
+                # 拿到窗口画面。Low 进程读屏会 E_ACCESSDENIED，然后静默退回按屏
+                # 裁——症状是抓图质量变差，不是报错。warnings 把这层降级说出来。
+                # 托管模式下不注入输入，但读屏仍受影响，所以照样报。
                 body["integrity"] = window_mod.self_integrity()
             self._send(200, body)
             return

@@ -73,5 +73,49 @@ class PickTests(unittest.TestCase):
             del os.environ["UI_LOCATE_WINDOW_CAPTURE"]
 
 
+class IntegrityWarningsTests(unittest.TestCase):
+    """完整性级别 → 给使用者看的结论。
+
+    这两条都是**静默**失败（WGC 返回 E_ACCESSDENIED 后自动退回更差的路径、
+    UIPI 把消息丢掉且不设 GetLastError），所以除了在这里提前说一声，没有别的
+    地方会告诉用户「你的截图为什么是黑的」。
+    """
+
+    def test_none_says_it_does_not_know(self):
+        notes = W.integrity_warnings(None, False)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("读不到", notes[0])
+
+    def test_normal_levels_are_quiet(self):
+        for level in ("system", "high", "medium+", "medium"):
+            with self.subTest(level=level):
+                self.assertEqual(W.integrity_warnings(level, False), [])
+
+    def test_low_explains_the_ceiling_and_the_cure(self):
+        notes = W.integrity_warnings("low", True)
+        self.assertEqual(len(notes), 1, notes)
+        joined = notes[0]
+        self.assertIn("WGC", joined)
+        self.assertIn("UIPI", joined)
+        # 不能只说「有问题」，得给出可执行的那一步
+        self.assertIn("UI_LOCATE_HOME", joined)
+
+    def test_untrusted_is_treated_like_low(self):
+        self.assertTrue(W.integrity_warnings("untrusted", True))
+
+    def test_missing_uiaccess_adds_one_more_line(self):
+        self.assertEqual(len(W.integrity_warnings("low", True)), 1)
+        self.assertEqual(len(W.integrity_warnings("low", False)), 2)
+        self.assertIn("UIAccess", W.integrity_warnings("low", False)[1])
+
+    def test_self_integrity_always_reports_the_three_keys(self):
+        # 真机上结果是 high / medium，取决于谁启动的；这里只锁形状，
+        # 免得以后有人把 warnings 从返回里拿掉、设置页静默变成空白。
+        facts = W.self_integrity()
+        self.assertEqual(set(facts), {"level", "ui_access", "warnings"})
+        self.assertIsInstance(facts["warnings"], list)
+        self.assertIsInstance(facts["ui_access"], bool)
+
+
 if __name__ == "__main__":
     unittest.main()
