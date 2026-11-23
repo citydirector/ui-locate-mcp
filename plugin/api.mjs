@@ -24,7 +24,9 @@ let running = null
 
 /** 进度快照。前端每次拿到整份，不需要自己累加。 */
 function blankJob() {
-  return { id: "", state: "idle", step: "", detail: "", startedAt: 0, finishedAt: 0, error: "" }
+  // `degraded` 常驻在 job 上：装成功也可能少东西（可选依赖失败），上一次的结论
+  // 要留到下次安装之前都能在设置页看到，所以不能只在返回值里给一次。
+  return { id: "", state: "idle", step: "", detail: "", startedAt: 0, finishedAt: 0, error: "", degraded: [] }
 }
 
 /**
@@ -77,10 +79,11 @@ export function createApi({ plan, inspect, setup, logger }) {
     const promise = (async () => {
       try {
         const result = await setup(current, { force, onProgress })
+        const degraded = Array.isArray(result.degraded) ? result.degraded : []
         if (result.ok) {
-          job = { ...job, state: "done", step: "完成", detail: "", finishedAt: Date.now() }
+          job = { ...job, state: "done", step: "完成", detail: "", finishedAt: Date.now(), degraded }
         } else {
-          job = { ...job, state: "failed", error: result.error ?? "未知错误", finishedAt: Date.now() }
+          job = { ...job, state: "failed", error: result.error ?? "未知错误", finishedAt: Date.now(), degraded }
         }
         return result
       } catch (error) {

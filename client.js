@@ -6,7 +6,7 @@
  *
  * ## 为什么这件事必须在界面上做
  *
- * Python 的 venv 与 77MB 的检测模型都不在 npm 包里。以前要靠用户自己在终端
+ * Python 的 venv 与 80 MB 的检测模型都不在 npm 包里。以前要靠用户自己在终端
  * 跑 `scripts/bootstrap.ps1`，但那条路对普通用户是断的：机器上未必有 uv，
  * 有 uv 也可能被权限拦住，Windows 上直接敲 `python` 还会跳到应用商店。
  *
@@ -61,7 +61,12 @@ window.__ModuleLoader__.load({
         'btn.prepare': '准备环境',
         'btn.repair': '重新安装',
         'btn.save': '保存位置',
-        'hint.first': '首次准备要下载约 130MB 的依赖与 77MB 的模型，视网速需要几分钟。',
+        'hint.first': '首次准备要下载约 130 MB 的依赖与 80 MB 的模型，视网速需要几分钟。',
+        'degraded.title': '以下可选功能没装上，其他功能不受影响：',
+        'degraded.rapidocr': 'OCR 文字识别 —— 只剩图标检测，纯文字按钮可能找不到',
+        'degraded.dxcam': '屏幕抓屏（DXGI / WGC 都靠它）—— 只剩 GDI，慢，独占全屏的游戏会全黑',
+        'degraded.pillow': 'GDI 截屏兜底 —— 只剩 DXGI / WGC 两条路',
+        'degraded.windows-capture': 'Windows Graphics Capture —— 窗口捕获退回 PrintWindow，GPU 渲染的窗口会全黑',
         'hint.ready': '环境已就绪，工具可以直接使用。',
         'hint.job': '装好之后需要重启 DSH，MCP 客户端才会连上新解释器。',
         'status.venv': 'Python 环境',
@@ -98,7 +103,12 @@ window.__ModuleLoader__.load({
         'btn.prepare': 'Prepare runtime',
         'btn.repair': 'Reinstall',
         'btn.save': 'Save locations',
-        'hint.first': 'The first run downloads about 130MB of dependencies and a 77MB model; give it a few minutes.',
+        'hint.first': 'The first run downloads about 130 MB of dependencies and an 80 MB model; give it a few minutes.',
+        'degraded.title': 'These optional pieces did not install; everything else still works:',
+        'degraded.rapidocr': 'OCR — icon detection only, so plain text buttons may be missed',
+        'degraded.dxcam': 'screen capture (both DXGI and WGC go through it) — GDI only, slower, exclusive-fullscreen games come back black',
+        'degraded.pillow': 'GDI capture fallback — DXGI and WGC remain',
+        'degraded.windows-capture': 'Windows Graphics Capture — window capture falls back to PrintWindow, GPU-rendered windows come back black',
         'hint.ready': 'The runtime is ready; the tools work as they are.',
         'hint.job': 'After it finishes, restart DSH so the MCP client picks up the new interpreter.',
         'status.venv': 'Python environment',
@@ -178,6 +188,8 @@ window.__ModuleLoader__.load({
 .ul_step{font-size:11.5px;color:var(--dsw-alias-label-secondary)}
 .ul_step b{font-weight:660;color:var(--dsw-alias-label-primary)}
 .ul_note{font-size:11.5px;line-height:1.6;color:var(--dsw-alias-label-tertiary)}
+.ul_degraded{margin:6px 0 0;padding-left:18px;list-style:disc}
+.ul_degraded li{margin-top:2px}
 .ul_warn{padding:10px 12px;border-radius:10px;font-size:11.5px;line-height:1.6;
   border:1px solid color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-business-primary)) 45%,transparent);
   background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-business-primary)) 10%,transparent);
@@ -324,6 +336,16 @@ window.__ModuleLoader__.load({
       // ready/missing 的判断里。
       const integrityLevel = status?.integrity?.level
       const lowIntegrity = integrityLevel === 'low' || integrityLevel === 'untrusted'
+      // 装成功也可能少东西：可选依赖（OCR / 快速抓屏 / GDI 兜底）失败只降级。
+      // 只在跑完之后说，跑的过程中列表还是半成品，说了也没用。
+      const degraded = !running && Array.isArray(job?.degraded) ? job.degraded : []
+      // 把 `rapidocr>=3.0` 这种写法翻成人话；认不出的就原样给，总比藏起来好。
+      const degradedLabel = spec => {
+        const pkg = String(spec).split(';')[0].trim().toLowerCase().match(/^[a-z0-9_.\-]+/)?.[0] ?? ''
+        const key = `degraded.${pkg}`
+        const text = t(key)
+        return text === key ? String(spec) : text
+      }
 
       const fact = (label, value, tone) =>
         h('div', { className: 'ul_fact' }, [
@@ -435,6 +457,13 @@ window.__ModuleLoader__.load({
             : null,
           lowIntegrity
             ? h('div', { className: 'ul_warn', key: 'w' }, t('warn.integrity'))
+            : null,
+          degraded.length > 0
+            ? h('div', { className: 'ul_warn', key: 'deg' }, [
+                h('div', { key: 't' }, t('degraded.title')),
+                h('ul', { className: 'ul_degraded', key: 'l' },
+                  degraded.map(spec => h('li', { key: String(spec) }, degradedLabel(spec)))),
+              ])
             : null,
           error !== ''
             ? h('div', { className: 'ul_err', key: 'err' }, h('pre', {}, error))

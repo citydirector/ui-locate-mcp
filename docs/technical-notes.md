@@ -270,7 +270,7 @@ DirectML 与 CPU 的输出最大绝对误差 5.8e-4（值域 0~654），可忽�
     把同一个问题换个方向又犯一次：`plan()` 从插件配置与默认值算路径，而
     `runtime.json` 里躺着用户上次选的真实位置——两边不一致时，界面显示
     「模型缺失」、「准备环境」按钮亮着，而用户上次指定的那个目录（比如
-    `%USERPROFILE%\myLocalModels\ui-locate`）里那份 77MB 的现成模型被完全
+    `%USERPROFILE%\myLocalModels\ui-locate`）里那份 80 MB 的现成模型被完全
     忽略，点一下就是重新下一份。
 
     `readRuntimeSettings()` 把文件读回 `plan()` 的优先级链：
@@ -775,8 +775,9 @@ MCP 重连都不该把这个进程一起带走，所以 `_spawn_server()` 用了
 
 **Low 的代价，两条都不报错**：
 
-* WGC 抓窗口返回 `E_ACCESSDENIED`，于是自动退回 `PrintWindow`；被遮挡的窗口和
-  GPU 渲染的内容会抓成全黑，再退回「抓整屏再裁」，那时候窗口必须在最前面。
+* WGC 抓窗口返回 `E_ACCESSDENIED`，于是自动退回 `PrintWindow`——它靠窗口自己
+  重绘，GPU 渲染的窗口（浏览器、Electron 应用、游戏）通常回一张全黑；再退到
+  「抓整屏再裁」时，被遮挡的那部分就没了，窗口必须在前台。
 * 向更高完整性的窗口发 `SendInput` / `PostMessage` 会被 UIPI 拦掉，而 MS 文档
   明说这两种调用**不会**通过返回值或 `GetLastError` 告诉你失败了。
 
@@ -809,13 +810,22 @@ MCP 重连都不该把这个进程一起带走，所以 `_spawn_server()` 用了
    全量内容，那时候必须 `flags: "w"` 从头覆盖——否则会拼出「尺寸看着对、内容全错」
    的文件。`416` 说明断点已经越界，直接重来。
 3. **校验**。模型与 pip wheel 都带 sha256 与期望字节数。**已经下完的 `.part`
-   先校验再决定是否重下**（`reused: true`），这样第三方工具下好的半成品也能用。
+   先校验再决定是否重下**（`reused: true`）。真实场景是「上一轮下完了、只差最后
+   改名」——那种情况不该再从零下一遍。它要求**整份内容**都对得上，半截的 `.part`
+   仍然走续传。
 4. **分级安装**。`ESSENTIAL_DEPS`（`mcp` / `httpx` / `numpy` /
-   `opencv-python-headless` / `pillow` / onnxruntime）缺了服务根本起不来，失败即
-   终止；`OPTIONAL_DEPS`（`rapidocr` / `dxcam`）与 `NO_DEPS_WIN_DEPS`
-   （`windows-capture`）都是函数内部现 import 的，失败只记进 `degraded` 让设置页
-   显示「可用，但少了 X」。可选依赖**一个一个装**：放在一条命令里，
-   `rapidocr` 拉不下来会把 `dxcam` 一起带下水，而 OCR 和抓屏是独立的。
+   `opencv-python-headless` + 选定的 onnxruntime）缺了服务根本起不来，失败即终止。
+   `OPTIONAL_DEPS`（`rapidocr` / `dxcam` / `pillow`）与 `NO_DEPS_WIN_DEPS`
+   （`windows-capture`）都是函数内部现 import 的，失败只记进 `degraded`，设置页
+   按包名说成人话（「OCR 文字识别 —— 只剩图标检测」这种），`ui_locate_setup` 也
+   照样返回。可选依赖**一个一个装**：放在一条命令里，`rapidocr` 拉不下来会把
+   `dxcam` 一起带下水，而 OCR 和抓屏是独立的。
+
+   各包的归属不是随手分的：`pillow` 只用在 `capture.py:130` 的 `ImageGrab`
+   （GDI 兜底），`dxcam` 在 `capture.py:164` 现 import 且**同时**提供屏幕的
+   DXGI 与 WGC 两个后端（`capture.py:198` 用 `backend="winrt"` 那个相机），
+   `windows-capture` 只服务窗口捕获（`window_wgc.py:78`），所以缺 `dxcam` 时
+   屏幕只剩 GDI——不是「退回 WGC」。
 5. **镜像只当退路**。`PIP_INDEXES` 不预先探测——那会额外花零点几秒，还要处理
    探测本身超时；必需依赖第一次失败后先 `pickIndex()` 挑一个能通的镜像重试一次，
    仍失败才报错。`pip` 统一带 `--timeout 30 --retries 2`：默认的 15s×5 次会把
@@ -823,6 +833,6 @@ MCP 重连都不该把这个进程一起带走，所以 `_spawn_server()` 用了
 
 **为什么不做离线包**：模型（`onnx-community/OmniParser-v2.0_icon_detect`）的许可是
 **AGPL-3.0**，本仓库是 MIT，把模型打进 npm 包等于替使用者接受一份不兼容的许可。
-npm 单包上限 268435456 字节（256 MiB）倒不是障碍——模型 80 MB 放得下。所以离线
-安装包只能走 GitHub Release，或让使用者自己放模型文件（`modelDir` 可配，这是
-`runtime.mjs` 里 `MODEL_SOURCES` 之外的第三条路）。
+npm 单包上限 268435456 字节（256 MiB）倒不是障碍——模型 80 MB 放得下，挡路的是
+许可而不是体积。所以离线只能让使用者自己把模型文件放进 `modelDir`（那里有同尺寸
+的文件就直接复用，不再下载），或者另发一个不带 npm 的 Release 包。

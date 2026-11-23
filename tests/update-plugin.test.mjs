@@ -832,6 +832,81 @@ test("runtime：两档依赖与 pyproject 的 dependencies 对得上", async () 
   }
 })
 
+// ── 设置页那条链：degraded 要真的走到界面上 ────────────────────────────────
+//
+// 上一版把 `degraded` 只放在 `ui_locate_setup` 的返回里，设置页压根没有这条
+// 数据通路，而文档却写着「设置页会写明少了什么」。所以这里从 HTTP 路由往下锁：
+// `/setup` 之后 `/progress` 必须带着可选依赖的失败名单。
+
+/** 造一个够用的 req：`readJson` 只用到 async iterator。 */
+function fakeReq(method, url, body) {
+  const text = body === undefined ? "" : JSON.stringify(body)
+  const chunks = text === "" ? [] : [Buffer.from(text)]
+  return {
+    method,
+    url,
+    headers: { host: "127.0.0.1:7788" },
+    socket: { destroyed: false },
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk
+    },
+  }
+}
+
+/** 造一个够用的 res：只记下状态码与 JSON。 */
+function fakeRes() {
+  return {
+    status: 0,
+    payload: undefined,
+    writeHead(status) {
+      this.status = status
+    },
+    end(body) {
+      this.payload = JSON.parse(body)
+    },
+  }
+}
+
+test("api：可选依赖的降级名单会进 job，设置页才看得到", async () => {
+  const { createApi } = await import("../plugin/api.mjs")
+  const api = createApi({
+    plan: () => ({ home: "H", modelDir: "M" }),
+    inspect: async () => ({ venv: true, model: true }),
+    setup: async () => ({ ok: true, steps: [], degraded: ["rapidocr>=3.0"] }),
+  })
+
+  const startRes = fakeRes()
+  await api(fakeReq("POST", "/api/ui-locate/setup", {}), startRes, undefined)
+  assert.equal(startRes.status, 200, JSON.stringify(startRes.payload))
+  assert.equal(startRes.payload.job.state, "running")
+
+  // 任务在后台跑；让它把微任务走完，再去问进度。
+  let progress = startRes.payload.job
+  for (let i = 0; i < 20 && progress.state === "running"; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const res = fakeRes()
+    await api(fakeReq("GET", "/api/ui-locate/progress"), res, undefined)
+    progress = res.payload
+  }
+
+  assert.equal(progress.state, "done", JSON.stringify(progress))
+  assert.deepEqual(progress.degraded, ["rapidocr>=3.0"], "降级名单没走到设置页")
+})
+
+test("api：一直是空的 job 也不能缺 degraded 这个键", async () => {
+  const { createApi } = await import("../plugin/api.mjs")
+  const api = createApi({
+    plan: () => ({ home: "H", modelDir: "M" }),
+    inspect: async () => ({ venv: false, model: false }),
+  })
+  const res = fakeRes()
+  await api(fakeReq("GET", "/api/ui-locate/status"), res, undefined)
+  assert.equal(res.status, 200)
+  // 界面按 `Array.isArray(job.degraded)` 判断，缺键与空数组在 React 那边一样，
+  // 但 `/status` 是外部也能读的接口，形状要稳定。
+  assert.deepEqual(res.payload.job.degraded, [])
+})
+
 // ── 下载韧性：多源、断点续传、校验 ──────────────────────────────────────────
 //
 // 坏网络下首装失败是真实反馈里最常见的一条。旧实现只有一个地址、失败就把

@@ -413,9 +413,9 @@ async function fetchInto(url, part, { fetch, signal, onProgress, expectedBytes, 
   const { pipeline } = await import("node:stream/promises")
   const { Readable, Transform } = await import("node:stream")
   const file = createWriteStream(part, resuming ? { flags: "a" } : { flags: "w" })
-  // 计数用 Transform，而不是在源上挂 `data` 监听：挂 `data` 会把流切到
-  // flowing 模式，接下来 `pipeline` 再接就已经晚了一步（小文件看不出差别，
-  // 80MB 上会丢首块）。
+  // 计数用 Transform，而不是在源上挂 `data` 监听：`data` 会把流推进 flowing
+  // 模式，那条路不参与背压；放进 pipeline 里，读、计数、写盘就是同一条链，
+  // 慢盘时上游会跟着慢下来，而不是把整块塞进内存。
   let written = offset
   const counter = new Transform({
     transform(chunk, _encoding, done) {

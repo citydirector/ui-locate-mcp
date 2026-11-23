@@ -81,7 +81,7 @@ export const Config = z.object({
     .string()
     .default("")
     .volatile()
-    .description("检测模型的存放目录。留空则跟随运行目录下的 models/。已有模型可以指过来，省一次 77MB 下载。"),
+    .description("检测模型的存放目录。留空则跟随运行目录下的 models/。已有模型可以指过来，省一次 80 MB 下载。"),
   backend: z
     .string()
     .default("")
@@ -141,7 +141,7 @@ export function apply(ctx, config) {
     // 而它同时也是**用户上次在这里选过什么**的唯一记录。不读回来的话，界面
     // 永远按默认目录渲染，而 Python 按文件里的目录找模型，两边各说一套——
     // 用户明明把模型指到了现成的那一份，界面却说「模型缺失」，点一下又重新
-    // 下载 77MB。
+    // 下载 80 MB。
     const remembered = readRuntimeSettings(defaults)
     const resolved = runtimePlan({
       home: override.home ?? current?.runtimeDir ?? "",
@@ -293,7 +293,7 @@ export function apply(ctx, config) {
     defineTool({
       name: "ui_locate_setup",
       description:
-        "准备 ui-locate 的 Python 运行环境：建 venv、装依赖、下检测模型。首次约需下载 130MB 依赖与 77MB 模型。已就绪时直接返回现状；force=true 会删掉重装。会往磁盘写文件并启动 pip 子进程。",
+        "准备 ui-locate 的 Python 运行环境：建 venv、装依赖、下检测模型。首次约需下载 130 MB 依赖与 80 MB 模型。已就绪时直接返回现状；force=true 会删掉重装。会往磁盘写文件并启动 pip 子进程。",
       timeoutMs: 1_800_000,
       parameters: {
         type: "object",

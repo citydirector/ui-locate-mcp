@@ -168,9 +168,9 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 - **多源回退**：模型走 `huggingface.co` → `hf-mirror.com`，pip wheel 走官方 → 清华 → 阿里。每个源默认试两次，全失败才报错，报错里会列出试过哪些域名。
 - **断点续传**：下载过程中留 `<文件名>.part`，重试时带 `Range` 续传。服务器不认 Range、回了整份内容时会从头覆盖写，不会拼出一个坏文件。已经下完的 `.part` 校验通过就直接用。
 - **校验**：模型与 pip wheel 都带 sha256 和期望字节数，被截断的文件不会被当成「已就绪」。
-- **分级安装**：`mcp` / `httpx` / `numpy` / `opencv-python-headless` / onnxruntime 缺了服务起不来，失败即停；`rapidocr`（OCR）、`dxcam`（DXGI 快速抓屏）、`pillow`（最后一级 GDI 兜底）都是函数里现 import 的可选依赖，失败只降级——工具照样能用，设置页会写明少了什么，`ui_locate_setup` 的返回里是 `degraded`。可选依赖各自单独安装，一个失败不连累另一个。
+- **分级安装**：`mcp` / `httpx` / `numpy` / `opencv-python-headless` / onnxruntime 缺了服务起不来，失败即停；`rapidocr`（OCR）、`dxcam`（屏幕的 DXGI 与 WGC 抓屏）、`pillow`（最后一级 GDI 兜底）都是函数里现 import 的可选依赖，失败只降级——工具照样能用，设置页会写明少了什么，`ui_locate_setup` 的返回里是 `degraded`。可选依赖各自单独安装，一个失败不连累另一个。
 
-模型不能随包发布：`onnx-community/OmniParser-v2.0_icon_detect` 的许可是 AGPL-3.0，与本仓库的 MIT 不兼容。要用离线安装，把模型文件自己放到 `modelDir`，或者等 GitHub Release 上的离线包。
+模型不能随包发布：`onnx-community/OmniParser-v2.0_icon_detect` 的许可是 AGPL-3.0，与本仓库的 MIT 不兼容，所以它不会出现在 npm 包里，也不会有「带模型的 npm 离线包」。没有外网的机器可以把模型文件放到 `modelDir`，那里有同尺寸的模型时会直接复用，不再下载。
 
 ### 抓屏方式
 
@@ -187,7 +187,7 @@ Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PR
 
 目标窗口以管理员运行而服务不是时，Windows 会静默丢弃模拟输入（UIPI）。`health.integrity` 显示服务自己的级别，`/windows` 显示每个窗口的，对这种窗口的动作会返回 `uipi.blocked: true` 和 warning。
 
-进程的完整性级别取「父进程令牌」与「主映像文件标签」里**更低**的那个，所以把便携版解压在工作区里、或让运行目录落在被写上了 Low 标签的位置时，服务会一直是 Low——无论从多高的窗口启动。Low 不会报错，只会让 WGC 抓窗口被拒（被遮挡的窗口抓成全黑）、让输入被 UIPI 静默丢弃。设置页在 `low` / `untrusted` 时会把这一项标红并给出两条改法：把运行目录挪到工作区之外，或以管理员身份启动 DSH。
+进程的完整性级别取「父进程令牌」与「主映像文件标签」里**更低**的那个，所以把便携版解压在工作区里、或让运行目录落在被写上了 Low 标签的位置时，服务会一直是 Low——无论从多高的窗口启动。Low 不会报错，只会让 WGC 抓窗口被拒（退回 PrintWindow，GPU 渲染的窗口抓成全黑）、让输入被 UIPI 静默丢弃。设置页在 `low` / `untrusted` 时会把这一项标红并给出两条改法：把运行目录挪到工作区之外，或以管理员身份启动 DSH。
 
 ### 游戏里的输入
 

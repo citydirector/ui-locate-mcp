@@ -170,9 +170,9 @@ The first *Prepare runtime* pulls two things from the internet: pip dependencies
 - **Source fallback.** The model tries `huggingface.co` then `hf-mirror.com`; the pip wheel tries the official host, then Tsinghua, then Aliyun. Each source is tried twice by default, and the error names every host that failed.
 - **Resume.** A download keeps a `<name>.part` file and resumes with `Range`. A server that ignores the range and answers with the whole body is written from scratch, so the file is never stitched together wrong. A `.part` that already matches the checksum is reused as is.
 - **Verification.** The model and the pip wheel both carry a sha256 and an expected size, so a truncated file is never mistaken for a finished one.
-- **Staged install.** `mcp` / `httpx` / `numpy` / `opencv-python-headless` / onnxruntime are essential — the service cannot start without them, and a failure stops there. `rapidocr` (OCR), `dxcam` (fast DXGI capture) and `pillow` (the last-resort GDI grab) are imported inside functions and therefore optional: a failure only degrades, the tools still work, the settings page says what is missing and `ui_locate_setup` returns it in `degraded`. Each optional package is installed on its own, so one failure does not take the other down.
+- **Staged install.** `mcp` / `httpx` / `numpy` / `opencv-python-headless` / onnxruntime are essential — the service cannot start without them, and a failure stops there. `rapidocr` (OCR), `dxcam` (both the DXGI and the WGC screen backends) and `pillow` (the last-resort GDI grab) are imported inside functions and therefore optional: a failure only degrades, the tools still work, the settings page says what is missing and `ui_locate_setup` returns it in `degraded`. Each optional package is installed on its own, so one failure does not take the other down.
 
-The model cannot ship inside the package: `onnx-community/OmniParser-v2.0_icon_detect` is AGPL-3.0, which does not combine with this repository's MIT. For an offline install, drop the model file into `modelDir` yourself, or wait for the offline bundle on GitHub Releases.
+The model cannot ship inside the package: `onnx-community/OmniParser-v2.0_icon_detect` is AGPL-3.0, which does not combine with this repository's MIT, so it is neither in the npm package nor in an "npm bundle with the model". On a machine without internet, drop the model file into `modelDir`; a file there of the expected size is reused instead of downloaded.
 
 ### Screen capture
 
@@ -189,7 +189,7 @@ The model cannot ship inside the package: `onnx-community/OmniParser-v2.0_icon_d
 
 If a target window runs as administrator and the server does not, Windows silently drops synthetic input (UIPI). `health.integrity` shows the server's level, `/windows` shows each window's, and actions on such a window return `uipi.blocked: true` with a warning.
 
-A process's integrity level is the **lower** of its parent token's level and its main image file's label, so unpacking the portable build inside a workspace — or otherwise putting the runtime directory somewhere stamped with a Low label — pins the service at Low no matter how high the parent was. Low never raises an error: it makes WGC refuse window capture (occluded windows come back black) and lets UIPI drop input silently. The settings page flags `low` / `untrusted` and names the two fixes: move the runtime directory out of the workspace, or start DSH as administrator.
+A process's integrity level is the **lower** of its parent token's level and its main image file's label, so unpacking the portable build inside a workspace — or otherwise putting the runtime directory somewhere stamped with a Low label — pins the service at Low no matter how high the parent was. Low never raises an error: it makes WGC refuse window capture (the fallback, PrintWindow, returns black for GPU-rendered windows) and lets UIPI drop input silently. The settings page flags `low` / `untrusted` and names the two fixes: move the runtime directory out of the workspace, or start DSH as administrator.
 
 ### Input for games
 
