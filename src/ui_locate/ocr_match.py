@@ -81,13 +81,17 @@ def attach_text(
                 orphans.append(line)
                 continue
 
-        buckets.setdefault(best_i, []).append((line.cy, line.text, line.score))
+        buckets.setdefault(best_i, []).append((line.cy, line.text, line.score, line))
 
     for i, entries in buckets.items():
         entries.sort(key=lambda e: e[0])
         it = items[i]
         it["text"] = " ".join(e[1] for e in entries).strip()
         it["text_score"] = round(max(e[2] for e in entries), 3)
+        # 每行字自己的位置。框中心不一定落在字上：检测器有时框住整块面板，
+        # 或者把相邻两个按钮框成一个（「个人模拟 联合模拟」）。find 按行匹配、
+        # 必要时按行给坐标，靠的就是这个。下划线开头：内部字段，出口前剥掉。
+        it["_lines"] = [[e[3].text, e[3].x1, e[3].y1, e[3].x2, e[3].y2] for e in entries]
 
     # 没被任何检测框吃下的文字，作为纯文本元素补进列表，
     # 这样"按文字找位置"的查询不会因为漏检而失效
@@ -216,14 +220,24 @@ def find(
         return []
     allowed = _TIER_ORDER.index(min_tier)
 
+    def best_of(it: dict, raw: str) -> tuple[str | None, list | None]:
+        """整段文字和逐行文字里挑最好的一档；同档优先给出那一行（坐标更准）。"""
+        tier, hit = _tier_of(raw, q), None
+        for ln in it.get("_lines") or []:
+            t = _tier_of(str(ln[0]), q)
+            if t is not None and (tier is None or _TIER_ORDER.index(t) <= _TIER_ORDER.index(tier)):
+                if hit is None or t != tier:
+                    tier, hit = t, ln
+        return tier, hit
+
     buckets: dict[str, list[dict]] = {tier: [] for tier in _TIER_ORDER}
     for it in items:
         raw = (it.get("text") or "").strip()
         if not raw:
             continue
-        tier = _tier_of(raw, q)
+        tier, line = best_of(it, raw)
         if tier is not None:
-            buckets[tier].append(it)
+            buckets[tier].append(_anchor(it, line))
 
     def rank(d: dict) -> tuple[int, int, float]:
         # 用剥噪声后的长度算差，否则「8 插件」(4字) 会比「插件」(2字) 吃亏
@@ -240,3 +254,25 @@ def find(
         for it in group:
             out.append({**it, "match_tier": tier})
     return out[:limit]
+
+
+def _anchor(it: dict, line: list | None) -> dict:
+    """命中某一行时：框中心不在这行字上，就改用这行字的中心。
+
+    文字一定画在它所属的控件上，所以「点字」不会比「点框中心」更差；而框中心
+    在框比控件大得多时会落到别处（实测「联合模拟」被挂到一个大框上，框中心
+    偏出 340px）。框中心本来就落在字上的（多数按钮）保持原样。边距取半个行高。
+    返回浅拷贝，并剥掉内部字段 _lines。
+    """
+    out = {k: v for k, v in it.items() if k != "_lines"}
+    if line is None:
+        return out
+    text, x1, y1, x2, y2 = line
+    out["text"] = text
+    m = (y2 - y1) / 2
+    if x1 - m <= it["cx"] <= x2 + m and y1 - m <= it["cy"] <= y2 + m:
+        return out
+    out.update(cx=round((x1 + x2) / 2, 1), cy=round((y1 + y2) / 2, 1),
+               w=round(x2 - x1, 1), h=round(y2 - y1, 1), anchor="text",
+               box_center=[it["cx"], it["cy"]])
+    return out

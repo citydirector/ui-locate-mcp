@@ -168,6 +168,8 @@ class Engine:
                     it[k] = round(it[k] + oy, 1)
                 it["cx"] = round(it["cx"] + ox, 1)
                 it["cy"] = round(it["cy"] + oy, 1)
+                for ln in it.get("_lines") or []:
+                    ln[1], ln[2], ln[3], ln[4] = ln[1] + ox, ln[2] + oy, ln[3] + ox, ln[4] + oy
 
         labeled = [it for it in items if it.get("text")]
         unlabeled = [it for it in items if not it.get("text")]
@@ -403,6 +405,11 @@ def _inherit_monitor(spec: dict, mset: object) -> None:
     mon = getattr(mset, "monitor", None)
     if not spec.get("monitor") and screen.is_target_spec(mon):
         spec["monitor"] = mon
+
+
+def _public(elements: list[dict]) -> list[dict]:
+    """对外的元素列表：剥掉下划线开头的内部字段（如每行字的坐标 _lines）。"""
+    return [{k: v for k, v in it.items() if not k.startswith("_")} for it in elements]
 
 
 def _window_monitor(spec: object) -> object:
@@ -896,7 +903,19 @@ class Handler(BaseHTTPRequestHandler):
             # 一些也无妨；但 `/act` 会真的点下去，必须收紧到 starts 以上，
             # 否则会像实测那次——掉到 contains 档点中任务栏上另一个窗口，
             # 还得回一个 verified:true。详见 ocr_match.find 的 docstring。
-            hits = find(elements, str(text), min_tier=str(data.get("min_tier") or "contains"))
+            min_tier = str(data.get("min_tier") or "contains")
+            hits = find(elements, str(text), min_tier=min_tier)
+            fallback = None
+            if not hits and text_mode == "mosaic" and "text_mode" not in data:
+                # mosaic 只认检测框里的字，检测器漏框的字它永远读不到（实测
+                # 「规程」「成就统计」full 一字不差、mosaic 全无）。没命中时再整页
+                # 扫一遍：命中路径的耗时不变；调用方显式给了 text_mode 就不回退。
+                elements, stats = detect_monitors(
+                    data.get("monitor"), conf, 0.5, True, config.max_side(), 0.15,
+                    True, "full", smart,
+                )
+                hits = find(elements, str(text), min_tier=min_tier)
+                fallback = "full"
             if not hits:
                 return {
                     "ok": False,
@@ -917,6 +936,9 @@ class Handler(BaseHTTPRequestHandler):
                 "elements": len(elements),
                 "total_ms": stats["total_ms"],
                 "monitors": stats["monitors"],
+                **({"anchor": "text", "box_center": target["box_center"]}
+                   if target.get("anchor") == "text" else {}),
+                **({"fallback": fallback} if fallback else {}),
             }
 
         if "x" in data and "y" in data:
@@ -964,7 +986,8 @@ class Handler(BaseHTTPRequestHandler):
              裁片做 OCR，检测器一旦漏框，那段文字就根本没进 OCR —— 这正是上面
              那次漏掉按钮的原因。full 是整页扫描，召回更全但慢三倍；只在
              「马上要动手、而省的那点时间会换来点错」时才值得付这个代价。
-             只查不点的 `/locate` 不做这个回退，快更重要。
+             `/locate` 也在没命中时回退（命中路径不变），但调用方显式给了
+             text_mode 时尊重它。
         """
         def scan(text_mode: str) -> dict | None:
             elements, _stats = detect_monitors(
@@ -1708,6 +1731,7 @@ class Handler(BaseHTTPRequestHandler):
                         smart=smart, origin=(0, 0),
                     )
                     res["monitor"] = None
+                    res["elements"] = _public(res["elements"])
                     self._send(200, res)
                     return
 
@@ -1734,7 +1758,7 @@ class Handler(BaseHTTPRequestHandler):
                     "deprecated": ["detect_ms", "ocr_ms", "total_ms"],
                     "timings": {"detect_ms": stats["detect_ms"], "ocr_ms": stats["ocr_ms"],
                                 "total_ms": stats["total_ms"]},
-                    "elements": elements,
+                    "elements": _public(elements),
                 })
             except Exception as e:
                 self._send(500, {"error": f"{type(e).__name__}: {e}"})
