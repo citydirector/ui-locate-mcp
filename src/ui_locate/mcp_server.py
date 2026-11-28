@@ -367,7 +367,7 @@ def _as_float(value: object, field: str) -> float:
 def locate_text(
     text: str,
     conf: float = 0.25,
-    text_mode: str = "mosaic",
+    text_mode: str = "",
     monitor: str = "",
     smart: bool = True,
 ) -> str:
@@ -379,8 +379,8 @@ def locate_text(
     参数：
       text       要查找的文字，如 "保存"、"编辑"、"插件"
       conf       检测置信度下限，默认 0.25；找不到时降到 0.15 再试
-      text_mode  "mosaic"（默认，只认控件区域，快 2~4 倍）或
-                 "full"（整页 OCR，连正文段落也能认，慢）
+      text_mode  不给（默认）：先 mosaic（只认控件区域，快 2~4 倍），没找到再整页 OCR 找一次；
+                 "mosaic" / "full"：只用这一种，不回退
       monitor    找哪块屏：""（默认，整个虚拟桌面）/ "primary" / "0" / "1" /
                  设备名如 "\\\\.\\DISPLAY2"
       smart      内容感知切块（对齐切缝、跳过空白块），默认 True
@@ -399,9 +399,11 @@ def locate_text(
     payload: dict[str, Any] = {
         "text": text,
         "conf": _as_float(conf, "conf"),
-        "text_mode": text_mode,
         "smart": _as_bool(smart, "smart"),
     }
+    # 只在调用方真的给了才传：服务端把「带了 text_mode」当成显式指定、不做整页回退
+    if text_mode:
+        payload["text_mode"] = text_mode
     if monitor:
         payload["monitor"] = monitor
     res = _post("/locate", payload)
