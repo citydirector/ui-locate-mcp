@@ -677,6 +677,7 @@ def ui_locate_act(
     activate: str = "auto",
     hold_start_ms: int = 0,
     hold_end_ms: int = 0,
+    until: str = "",
 ):
     """定位 → 动作 → 验证，**一次调用走完**。
 
@@ -699,7 +700,12 @@ def ui_locate_act(
       mark_set    可选，标注时返回的集合号；画面已被重新标注过就拒绝执行
       action      click（默认）/ double_click / right_click / middle_click /
                   hover / drag / scroll / type / press / hold / hotkey / wait
-                  wait 不给 text = 等画面静止（加载完、动画放完），时限 verify_timeout_ms
+                  wait 给 text = 轮询到这段字出现为止；写成 "准备就绪|确认|模拟完成"
+                    表示任一出现就返回，结果 target.query 是命中的那一个（先写的优先）
+                  wait 不给 text = 等画面静止（加载完、动画放完）；until="change" 则从
+                    现在这一帧起等画面变了再返回（弹窗、战斗结束、过场）。
+                    以上时限都是 verify_timeout_ms，最长 170000（超过会截断并注明）
+                  click 等动作的 text 也接受 "A|B"（如 "确认|确定"）
                   hold = 按住 key/keys 一段时间（游戏里走路、蓄力），时长见 duration_ms
                   adb 目标另有 long_press / touch_down / touch_move / touch_up：
                   分段触摸，手指在两次调用之间一直按着，可以「按下 → 抓图看落点 →
@@ -745,7 +751,8 @@ def ui_locate_act(
       value       action=type 要输入的文字（不是 text！）
       key / keys  action=press 的单键，或 action=hotkey 的组合键（"ctrl+s"）
       verify_text verify="text" 时要等的文字
-      verify_timeout_ms  等文字的时限，默认 3000
+      verify_timeout_ms  等文字 / 等 wait 的时限，默认 3000
+      until       action=wait 且不给 text 时："stable"（默认，等静止）| "change"（等变化）
       pointer     鼠标怎么动：absolute（默认，一步到位）/ relative（像真鼠标那样推过去）。
                   **全屏游戏点了没反应、光标不动时换 relative** —— 用 Raw Input 的游戏
                   只认相对位移。结果里 relative.tracking=false 表示游戏锁住了系统光标，
@@ -801,8 +808,11 @@ def ui_locate_act(
     if focus and focus != "auto":
         payload["focus"] = False if focus in ("off", "false", "no", "none") else focus
     timeout_value = _as_int(verify_timeout_ms, "verify_timeout_ms")
-    if action == "wait" and not text:
+    if action == "wait":
+        # 带不带文字都要传：带文字时服务端轮询到文字出现，同样需要时限
         payload["timeout_ms"] = timeout_value
+        if until:
+            payload["until"] = until
     if text:
         payload["text"] = text
     mark_value = _as_int(mark, "mark")

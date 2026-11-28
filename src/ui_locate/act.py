@@ -67,6 +67,17 @@ _DEFAULT_CHANGE_THRESHOLD = 3.5
 # 「等画面停下来」的上限。多数界面动画 100~400ms；过场 / 加载更久的由调用方给
 # settle_timeout_ms，或者用 verify_text 等具体的字。
 _DEFAULT_STABLE_TIMEOUT_MS = 1500
+
+# action=wait 的上限。MCP 层的 HTTP 客户端超时是 180 秒，再长连接会先断；
+# 超过就截到这里，结果里写明 clamped_from_ms。
+_WAIT_MAX_MS = 170_000
+# until=change 的抓帧间隔：要等的是「界面切换」，不是逐帧动画
+_WAIT_CHANGE_POLL_MS = 1000
+# until=change 的判据：任一变化区域的强度（格内平均差的最大值，0~255）达到它。
+# 不用变化格占比：实测 1600x900 主界面空闲时，背景光效对基准帧的占比在
+# 0.03~0.15 之间漂移，而切换一个按钮的占比只有 0.14，两者重叠。强度分得开：
+# 空闲最大 34，界面切换最小 166（按钮）、217~226（换页）。取 64，两侧都有余量。
+_WAIT_CHANGE_STRENGTH = 64.0
 _STABLE_MIN_MS = 60
 _STABLE_POLL_MS = 50
 
@@ -552,6 +563,8 @@ def wait_for_text(
                 "conf": round(float(hit.get("conf") or 0), 3),
                 "elapsed_ms": _ms(start, clock),
                 "polls": polls,
+                # 文字写成「A|B|C」时，命中的是哪一个
+                **({"query": hit["query"]} if hit.get("query") else {}),
             }
         if _now(clock) >= deadline:
             return {
@@ -562,6 +575,61 @@ def wait_for_text(
                 "timeout_ms": timeout_ms,
             }
         sleep(max(poll_ms, 10) / 1000.0)
+
+
+def wait_change(
+    grab: Callable[[], Any],
+    differ: Callable[..., dict | None],
+    *,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    timeout_ms: int,
+    poll_ms: int = _WAIT_CHANGE_POLL_MS,
+    noise_ms: int = 300,
+) -> dict:
+    """从现在这一帧起，等画面变了再返回（弹窗出来、战斗结束、过场开始）。
+
+    先隔 noise_ms 再抓一帧，这两帧之间就在变的格子（粒子、闪烁）记为噪声、
+    之后不计。慢速漂移的背景（光效、渐变）在 300ms 里看不出来，但几秒后对
+    基准帧的差会累积到 1 成格子 —— 所以判据不看变化格多少，看变化有多强
+    （见 _WAIT_CHANGE_STRENGTH）：界面切换是硬边，漂移是缓变。
+    """
+    t0 = _now(clock)
+    deadline = t0 + max(timeout_ms, 0) / 1000.0
+    base = grab()
+    sleep(max(noise_ms, 0) / 1000.0)
+    second = grab()
+    d0 = differ(base, second)
+    ignore = d0.get("_mask") if d0 else None
+    frames = 2
+    noise = int(ignore.sum()) if ignore is not None else None
+    while True:
+        if _now(clock) >= deadline:
+            return {"changed": False, "elapsed_ms": _ms(t0, clock), "frames": frames,
+                    "timeout_ms": timeout_ms, "noise_cells": noise}
+        sleep(max(poll_ms, 10) / 1000.0)
+        cur = grab()
+        frames += 1
+        d = differ(base, cur, ignore=ignore) if ignore is not None else differ(base, cur)
+        if d is None:
+            return {"changed": True, "reason": "size", "elapsed_ms": _ms(t0, clock),
+                    "frames": frames}
+        strongest = max((float(r.get("strength") or 0) for r in d.get("regions") or []), default=0.0)
+        if strongest >= _WAIT_CHANGE_STRENGTH:
+            return {"changed": True, "elapsed_ms": _ms(t0, clock), "frames": frames,
+                    "strength": strongest,
+                    "changed_cells": d.get("changed_cells"),
+                    "changed_frac": d.get("changed_frac"),
+                    "regions": (d.get("regions") or [])[:5],
+                    "noise_cells": noise}
+
+
+def _wait_budget(spec: dict, default_ms: int) -> tuple[int, int | None]:
+    """(实际等多久, 被截断前的值或 None)。"""
+    want = int(spec.get("timeout_ms") or default_ms)
+    if want > _WAIT_MAX_MS:
+        return _WAIT_MAX_MS, want
+    return want, None
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +668,34 @@ def act(
     t_all = _now(clock)
     monitor = spec.get("monitor")
 
+    # wait 带文字：轮询到它出现为止。以前这里只查一次就走 resolve_target，
+    # 「等某个界面出来」只有 steps 里能做。文字可写成「A|B|C」，任一出现就返回。
+    if str(spec.get("action") or "").strip().lower() == "wait" and spec.get("text"):
+        budget, clamped = _wait_budget(spec, 8000)
+        res = wait_for_text(str(spec["text"]), spec, probe=probe, timeout_ms=budget,
+                            poll_ms=int(spec.get("poll_ms") or _DEFAULT_POLL_MS),
+                            sleep=sleep, clock=clock)
+        if clamped:
+            res["clamped_from_ms"] = clamped
+        timings["wait_ms"] = res["elapsed_ms"]
+        timings["total_ms"] = _ms(t_all, clock)
+        found = bool(res["found"])
+        out = {
+            "ok": found,
+            "stage": "done" if found else "wait",
+            "action": "none",
+            "target": {k: res[k] for k in ("cx", "cy", "w", "h", "conf")} | {
+                "text": res.get("matched"), "query": res.get("query")} if found else None,
+            "target_source": "text" if found else None,
+            "performed": None,
+            "verified": None,
+            "wait": res,
+            "timings": timings,
+        }
+        if not found:
+            out["error"] = f"等 {spec['text']!r} 超时（{budget}ms）"
+        return out
+
     # 纯等待 / 空动作没有目标可找 —— 必须在 resolve_target 之前截住。
     # 之前这里漏了，导致 steps 里的 {"action": "wait"} 直接抛「需要 text」，
     # 而它明明是合法的一步（"等界面加载完"）。
@@ -607,6 +703,22 @@ def act(
             and not spec.get("text") and spec.get("x") is None:
         settle_info = None
         ok = True
+        if str(spec.get("action")).strip().lower() == "wait" and differ is not None \
+                and str(spec.get("until") or "").lower() == "change":
+            budget, clamped = _wait_budget(spec, 30000)
+            change = wait_change(lambda: capture(monitor), differ, sleep=sleep, clock=clock,
+                                 timeout_ms=budget,
+                                 poll_ms=int(spec.get("poll_ms") or _WAIT_CHANGE_POLL_MS))
+            if clamped:
+                change["clamped_from_ms"] = clamped
+            timings["wait_ms"] = change["elapsed_ms"]
+            timings["total_ms"] = _ms(t_all, clock)
+            out = {"ok": bool(change["changed"]), "stage": "done" if change["changed"] else "wait",
+                   "action": "none", "target": None, "target_source": None,
+                   "performed": None, "verified": None, "change": change, "timings": timings}
+            if not change["changed"]:
+                out["error"] = f"{budget}ms 内画面没有变化"
+            return out
         if str(spec.get("action")).strip().lower() == "wait" and differ is not None \
                 and str(spec.get("until") or "stable").lower() == "stable":
             # 不给文字的 wait = 等画面停下来（加载完、动画放完）

@@ -407,6 +407,9 @@ def _inherit_monitor(spec: dict, mset: object) -> None:
         spec["monitor"] = mon
 
 
+_FRAMES_PER_TURN = 8
+
+
 def _public(elements: list[dict]) -> list[dict]:
     """对外的元素列表：剥掉下划线开头的内部字段（如每行字的坐标 _lines）。"""
     return [{k: v for k, v in it.items() if not k.startswith("_")} for it in elements]
@@ -1001,8 +1004,12 @@ class Handler(BaseHTTPRequestHandler):
                 text_mode,
                 _as_bool(spec.get("smart"), True),
             )
-            hits = find(elements, text, min_tier="starts")
-            if not hits:
+            # 「A|B|C」：一次检测，按写的顺序逐个找，先写的优先
+            for alt in alts:
+                hits = find(elements, alt, min_tier="starts")
+                if hits:
+                    break
+            else:
                 return None
 
             # 动手前先问一句：这个名字在范围内唯一吗？
@@ -1038,6 +1045,7 @@ class Handler(BaseHTTPRequestHandler):
 
             top = hits[0]
             return {
+                **({"query": alt} if len(alts) > 1 else {}),
                 "matched": top.get("text"),
                 "match_tier": top.get("match_tier"),
                 "cx": top["cx"],
@@ -1047,6 +1055,7 @@ class Handler(BaseHTTPRequestHandler):
                 "conf": float(top.get("conf") or 0.0),
             }
 
+        alts = [t.strip() for t in text.split("|") if t.strip()] if "|" in text else [text]
         wanted = str(spec.get("text_mode") or "mosaic")
         hit = scan(wanted)
         if hit is None and wanted != "full":
@@ -1073,7 +1082,10 @@ class Handler(BaseHTTPRequestHandler):
             seq = getattr(self, "_frame_seq", 0)
             self._frame_seq = seq + 1
             label = "before" if seq == 0 else "after" if seq == 1 else f"frame{seq}"
-            ENGINE.frames.put(turn, bgr, origin, label)
+            # 一个回合只存前若干帧。wait until=change 每秒抓一帧、能等近三分钟，
+            # 全存下来一个回合就会撑破帧记忆的总上限。
+            if seq < _FRAMES_PER_TURN:
+                ENGINE.frames.put(turn, bgr, origin, label)
         return bgr, origin
 
     def _focus(self, action_name: str, params: dict) -> dict | None:
