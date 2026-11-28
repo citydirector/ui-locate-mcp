@@ -648,6 +648,8 @@ def ui_locate_act(
     watch_max_keyframes: int = 6,
     hwnd: int = 0,
     activate: str = "auto",
+    hold_start_ms: int = 0,
+    hold_end_ms: int = 0,
 ):
     """定位 → 动作 → 验证，**一次调用走完**。
 
@@ -672,11 +674,17 @@ def ui_locate_act(
                   hover / drag / scroll / type / press / hold / hotkey / wait
                   wait 不给 text = 等画面静止（加载完、动画放完），时限 verify_timeout_ms
                   hold = 按住 key/keys 一段时间（游戏里走路、蓄力），时长见 duration_ms
+                  adb 目标另有 long_press / touch_down / touch_move / touch_up：
+                  分段触摸，手指在两次调用之间一直按着，可以「按下 → 抓图看落点 →
+                  移过去 → 松手」；duration_ms 是这一步之后再停多久
       verify      动作后怎么确认生效：
                     "screen"（默认）—— 点击点周围像素变了没有
                     "text"          —— 指定时间内有没有出现 verify_text
                     "none"          —— 不验证，快，但也就不知道成没成
-      monitor     ""（整个虚拟桌面）/ "primary" / "0" / "1" / 设备名
+      monitor     ""（整个虚拟桌面）/ "primary" / "0" / "1" / 设备名 /
+                  "adb:序列号"（Android 设备或模拟器，如 "adb:127.0.0.1:16384"）：
+                  截图和输入都走 adb，坐标是设备截图坐标，不切前台、不动本机鼠标。
+                  adb 路径取环境变量 UI_LOCATE_ADB，没有就找 PATH
       window      目标窗口：标题（或其中一段）/ 句柄。动手前先把它**切到前台**
                   （SendInput 只送给前台窗口；模型所在的聊天窗口在前台时，按键会打进
                   聊天框），验证时也只抓这个窗口（被挡住也能抓）。纯键盘动作强烈建议给
@@ -726,6 +734,9 @@ def ui_locate_act(
                   window > monitor > x,y 所在屏 > primary（目标在副屏时请给 monitor）
       watch_mode  "regions"（默认）| "full"，同 ui_locate_watch 的 mode
       watch_max_keyframes  最多几个关键帧，默认 6
+      hold_start_ms  action=drag 时按下后先停多久再移动（触屏游戏常要按住才拿得起来）
+      hold_end_ms    action=drag 时到终点后停多久再松手（带阻尼的列表不回弹）。
+                  这两个只对 adb 目标生效
 
     返回 JSON：
       ok        流程是否走完（**不代表动作生效了**）
@@ -811,6 +822,12 @@ def ui_locate_act(
     elif verify in ("none", ""):
         payload["verify"] = None
 
+    hold_start_value = _as_int(hold_start_ms, "hold_start_ms")
+    if hold_start_value:
+        payload["hold_start_ms"] = hold_start_value
+    hold_end_value = _as_int(hold_end_ms, "hold_end_ms")
+    if hold_end_value:
+        payload["hold_end_ms"] = hold_end_value
     watch_value = _as_int(watch_ms, "watch_ms")
     if watch_value:
         payload["watch_ms"] = watch_value
@@ -835,7 +852,7 @@ def _window_spec(window: str) -> str:
         return ""
     w = str(window).strip()
     low = w.lower()
-    if low.startswith(("window:", "hwnd:")):
+    if low.startswith(("window:", "hwnd:", "adb:")):
         return w
     if w.isdecimal() or low.startswith("0x"):
         return f"hwnd:{w}"

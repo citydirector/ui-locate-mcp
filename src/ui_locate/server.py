@@ -63,6 +63,7 @@ from ui_locate import background  # noqa: E402
 from ui_locate import compare_api, image_api, managed, owner_watch  # noqa: E402
 from ui_locate import capture as capture_mod  # noqa: E402
 from ui_locate import actions  # noqa: E402
+from ui_locate import adb as adb_mod  # noqa: E402
 from ui_locate import frames as frames_mod  # noqa: E402
 from ui_locate import griddiff  # noqa: E402
 from ui_locate import marks as marks_mod  # noqa: E402
@@ -241,7 +242,7 @@ def _make_marks(body: dict) -> dict:
     if box is not None:
         # box 是屏幕绝对坐标，可能跨屏，所以从整个虚拟桌面裁；
         # 按窗口工作时从窗口图里裁（窗口被挡住时屏幕上那块是别的东西）
-        full, (vx, vy) = screen.grab(monitor if window_mod.is_window_spec(monitor) else "all")
+        full, (vx, vy) = screen.grab(monitor if screen.is_target_spec(monitor) else "all")
         x1, y1 = max(box[0], vx), max(box[1], vy)
         x2 = min(box[2], vx + full.shape[1])
         y2 = min(box[3], vy + full.shape[0])
@@ -344,6 +345,9 @@ def _make_marks(body: dict) -> dict:
 def _capture_last(monitor: object = None) -> dict:
     from ui_locate.capture import CAPTURER
 
+    if monitor is not None and adb_mod.is_adb_spec(monitor):
+        last = adb_mod.LAST
+        return {k: last[k] for k in ("backend", "ms", "device", "notes") if k in last}
     if monitor is not None and window_mod.is_window_spec(monitor):
         last = window_mod.LAST
         return {"backend": last.get("backend"), "ms": last.get("ms"),
@@ -397,7 +401,7 @@ def apply_marks(spec: dict) -> dict:
 def _inherit_monitor(spec: dict, mset: object) -> None:
     """标注时是按窗口抓的，点的时候也按那个窗口验证、切前台 —— 除非调用方另给了。"""
     mon = getattr(mset, "monitor", None)
-    if not spec.get("monitor") and window_mod.is_window_spec(mon):
+    if not spec.get("monitor") and screen.is_target_spec(mon):
         spec["monitor"] = mon
 
 
@@ -405,6 +409,11 @@ def _window_monitor(spec: object) -> object:
     """``window: "原神"`` → 同时把 monitor 设成 ``window:原神``：抓图、验证都只看这个窗口。"""
     if not isinstance(spec, dict) or not spec.get("window"):
         return spec
+    if adb_mod.is_adb_spec(spec["window"]):
+        # window="adb:…" 与 monitor="adb:…" 同义：设备没有窗口，也不需要切前台
+        out = {k: v for k, v in spec.items() if k != "window"}
+        out.setdefault("monitor", spec["window"])
+        return out
     out = dict(spec)
     out["window"] = window_mod.as_spec(out["window"])
     if not out.get("monitor"):
@@ -744,8 +753,8 @@ def detect_monitors(
     """
     assert ENGINE is not None
 
-    if window_mod.is_window_spec(mon_spec):
-        # 只看一个窗口：抓它的客户区，按一块「屏」处理
+    if screen.is_target_spec(mon_spec):
+        # 只看一个窗口 / 一台 adb 设备：抓它，按一块「屏」处理
         bgr, origin = screen.grab(mon_spec)
         res = ENGINE.run(
             bgr, conf=conf, iou=iou, tiled=tiled, max_side=max_side,
@@ -1081,7 +1090,16 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def _perform(self, action_name: str, params: dict) -> dict:
-        """把动作名分派到输入层（`ui_locate.actions`），之前先确保目标窗口在前台。"""
+        """把动作名分派到输入层（`ui_locate.actions`），之前先确保目标窗口在前台。
+
+        目标是 adb 设备时走 `ui_locate.adb`：不切前台、不动本机鼠标。
+        """
+        device = params.pop("device", None)
+        if device:
+            try:
+                return adb_mod.dispatch(device, action_name, params)
+            except adb_mod.AdbError as exc:
+                raise actions.InputError(str(exc)) from exc
         focus = self._focus(action_name, params)
         out = self._dispatch(action_name, params)
         if isinstance(out, dict):

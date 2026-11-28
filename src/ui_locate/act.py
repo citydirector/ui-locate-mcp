@@ -213,6 +213,7 @@ def _keys(value: Any) -> str:
 
 
 _MOUSE_ACTIONS = {"click", "double_click", "right_click", "middle_click", "hover", "move"}
+_TOUCH_ACTIONS = {"long_press", "touch_down", "touch_move", "touch_up"}
 _KEYBOARD_ACTIONS = {"type", "write", "press", "key", "hold", "hold_key", "hotkey", "shortcut"}
 
 # 有后台实现的动作：只有点击类。它们能靠 PostMessage 把带坐标的 WM_* 直接
@@ -278,6 +279,10 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
         params["pointer"] = str(spec["pointer"])
     if spec.get("keys_mode") and action in ("press", "hotkey", "hold"):
         params["keys_mode"] = str(spec["keys_mode"])
+    # adb 设备：输入走 adb，不涉及前台窗口
+    if action != "none" and _is_adb_spec(spec.get("window") or spec.get("monitor")):
+        params["device"] = str(spec.get("window") or spec.get("monitor")).strip()
+        return action, params
     # 前台：输入层发 SendInput 前把目标窗口切到前台（见 server._focus）
     if action != "none":
         if spec.get("hwnd") not in (None, "", 0):
@@ -294,6 +299,10 @@ def build_action(spec: dict, target: dict) -> tuple[str, dict]:
             # 只在后台通道生效；非法值由 background 明确拒绝（bad_activate）。
             params["activate"] = str(spec["activate"])
     return action, params
+
+
+def _is_adb_spec(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower().startswith("adb:")
 
 
 def _is_window_spec(value: Any) -> bool:
@@ -370,6 +379,10 @@ def _build(action: str, spec: dict, target: dict) -> tuple[str, dict]:
         params["button"] = str(spec.get("button") or "left")
         params["steps"] = int(spec.get("steps") or 12)
         params["duration_ms"] = int(spec.get("duration_ms") or 300)
+        # 触屏拖动的两端停顿（只有 adb 目标用得上；见 ui_locate.adb.drag_commands）
+        for key in ("hold_start_ms", "hold_end_ms"):
+            if spec.get(key):
+                params[key] = int(spec[key])
         return action, params
 
     if action == "scroll":
@@ -401,12 +414,20 @@ def _build(action: str, spec: dict, target: dict) -> tuple[str, dict]:
         params = {"keys": _keys(spec.get("keys") or spec.get("value") or "")}
         return "hotkey", params
 
+    if action in _TOUCH_ACTIONS:
+        # 只对 adb 目标有意义；分段触摸让「按下 → 抓图看落点 → 移过去 → 松手」可以拆开做
+        params = {"x": target["cx"], "y": target["cy"]}
+        if spec.get("hold_ms"):
+            params["hold_ms"] = int(spec["hold_ms"])
+        return action, params
+
     if action in ("wait", "none", "noop"):
         return "none", {}
 
     raise ActError(
         f"不认识的动作 {action!r}；可用：click / double_click / right_click / "
-        "middle_click / hover / move / drag / scroll / type / press / hold / hotkey"
+        "middle_click / hover / move / drag / scroll / type / press / hold / hotkey；"
+        "adb 目标另有 long_press / touch_down / touch_move / touch_up"
     )
 
 

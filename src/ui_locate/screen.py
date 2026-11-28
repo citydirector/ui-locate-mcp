@@ -238,8 +238,11 @@ def grab(monitor: object = None) -> tuple[np.ndarray, tuple[int, int]]:
     一台相机，显示器之间不存在的空白保持全黑，和 GDI 抓出来的样子一致。
     """
     set_dpi_aware()
-    from ui_locate import window
+    from ui_locate import adb, window
 
+    if adb.is_adb_spec(monitor):
+        # "adb:序列号"：Android 设备屏幕，原点恒为 (0,0)，坐标就是设备坐标
+        return adb.grab(monitor)
     if window.is_window_spec(monitor):
         # "window:标题" / "hwnd:123"：只抓这个窗口的客户区（被挡住也能抓）
         return window.grab(monitor)
@@ -255,6 +258,13 @@ def grab(monitor: object = None) -> tuple[np.ndarray, tuple[int, int]]:
         check_tile(img.shape, mon, (vx, vy, vw, vh))
         canvas[y0:y0 + mon.h, x0:x0 + mon.w] = img
     return canvas, (vx, vy)
+
+
+def is_target_spec(spec: object) -> bool:
+    """单一目标写法（``window:`` / ``hwnd:`` / ``adb:``）：只抓它，按一块屏处理。"""
+    from ui_locate import adb, window
+
+    return window.is_window_spec(spec) or adb.is_adb_spec(spec)
 
 
 def check_tile(shape: tuple, mon: "Monitor", virtual: tuple[int, int, int, int]) -> None:
