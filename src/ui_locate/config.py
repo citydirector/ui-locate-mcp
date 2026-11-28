@@ -301,3 +301,17 @@ def max_side() -> int:
 
 def ocr_on_cuda() -> bool:
     return os.environ.get("UI_LOCATE_OCR_CUDA", "") in ("1", "true", "True", "yes")
+
+
+def prewarm() -> bool:
+    """MCP 进程一启动就在后台拉起并预热服务（默认关）。
+
+    打开后第一次调用不必等「起进程 + 加载模型」；代价是从没用到定位的会话
+    也会常驻一个服务进程。环境变量 UI_LOCATE_PREWARM 优先，其次 runtime.json
+    的 prewarm。
+    """
+    value = os.environ.get("UI_LOCATE_PREWARM")
+    if value is None:
+        raw = runtime_settings().get("prewarm")
+        value = str(raw) if raw is not None else ""
+    return value.strip().lower() in ("1", "true", "yes", "on")

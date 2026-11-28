@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,10 @@ def _console_free_python() -> str:
     return str(cand if cand.exists() else exe)
 
 
+# 最近一次拉起失败的原因；ensure_ready 据此立刻报错，而不是空等到超时
+_SPAWN_ERROR = ""
+
+
 def _spawn_server() -> subprocess.Popen | None:
     """在后台拉起常驻服务（独立进程，跟着 Host 走，不跟着本进程走）。
 
@@ -143,7 +148,9 @@ def _spawn_server() -> subprocess.Popen | None:
             creationflags=creationflags,
             close_fds=True,
         )
-    except OSError:
+    except OSError as exc:
+        global _SPAWN_ERROR
+        _SPAWN_ERROR = f"{type(exc).__name__}: {exc}（命令 {cmd}，工作目录 {ROOT}）"
         return None
     finally:
         for handle in opened:
@@ -191,17 +198,37 @@ def _check_contract(h: dict[str, Any]) -> dict[str, Any]:
     return h
 
 
+# 拉起服务这一段只能有一个人在做：后台预热还没完、第一个工具调用就来了的话，
+# 两边都看到「没就绪」，会各拉一个服务进程。
+_READY_LOCK = threading.Lock()
+
+# 等预热的探测间隔。试过 0.25 秒，冷启动总耗时没有可测差别（7.1s 对 7.2s），维持 1 秒。
+_POLL_S = 1.0
+
+
 def ensure_ready(wait_s: float = 120.0) -> dict[str, Any]:
     """确保服务可用。必要时拉起并等待预热完成。"""
     h = _probe()
     if h and h.get("ready"):
         return _check_contract(h)
+    with _READY_LOCK:
+        return _start_and_wait(wait_s)
+
+
+def _start_and_wait(wait_s: float) -> dict[str, Any]:
+    h = _probe()  # 拿到锁之前，可能已经有人把它拉起来了
+    if h and h.get("ready"):
+        return _check_contract(h)
 
     child = _spawn_server()
+    if child is None:
+        # 进程根本没起来（解释器不在、工作目录不存在……）。以前这里照样等满
+        # wait_s，两分钟后只报「没就绪」，真正的原因被吞掉了。
+        raise RuntimeError(f"拉不起 ui-locate 服务：{_SPAWN_ERROR or '未知原因'}")
 
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        time.sleep(1.0)
+        time.sleep(_POLL_S)
         h = _probe()
         if h and h.get("ready"):
             return _check_contract(h)
@@ -1232,6 +1259,14 @@ def ui_locate_frame(
     ]
 
 
+def _prewarm() -> None:
+    """后台预热。失败只记日志：这是提速，不是前提，工具调用时会再试一次。"""
+    try:
+        ensure_ready()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ui-locate] 预热失败，首次调用时再试：{exc}", file=sys.stderr, flush=True)
+
+
 def main() -> None:
     """stdio 传输入口。`python -m ui_locate.mcp_server` 与 console script 都走这里。
 
@@ -1252,6 +1287,9 @@ def main() -> None:
         os.environ[owner_watch.ENV] = str(owner_pid)
         print(f"[ui-locate] 跟随 Host 进程 {owner_pid} 的生命周期", file=sys.stderr)
         owner_watch.start(owner_pid, lambda: os._exit(0))
+    # 预热放在 owner 设置之后：拉起的服务要继承同一个 owner 变量
+    if config.prewarm():
+        threading.Thread(target=_prewarm, name="ui-locate-prewarm", daemon=True).start()
     mcp.run(transport="stdio")
 
 
