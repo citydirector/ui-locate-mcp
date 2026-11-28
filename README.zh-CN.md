@@ -71,7 +71,9 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 
 除了检测器的框，编号还包括纯几何规则找出的「成排成列、同尺寸」格子（物品栏、标签页、技能栏、表格，`kind: "cell"`），这类东西 UI 检测器在游戏里通常认不出。编号只属于生成它的那张图；带上 `mark_set` 可拒绝过期的编号。
 
-坐标使用屏幕绝对位置，多显示器可能返回负坐标。`monitor` 可为 `primary`、索引字符串、`all`、`window:<标题>` 或 `hwnd:<句柄>`。界面移动后应重新定位，不要长期复用旧坐标。
+坐标使用屏幕绝对位置，多显示器可能返回负坐标。`monitor` 可为 `primary`、索引字符串、`all`、`window:<标题>`、`hwnd:<句柄>` 或 `adb:<序列号>`。界面移动后应重新定位，不要长期复用旧坐标。
+
+按文字命中时，坐标取命中的那一行字。检测框有时框住整块面板或两个相邻按钮，框中心会离字很远，这时改用这行字的中心（`anchor: "text"`，原框中心在 `box_center`）。默认的 mosaic OCR 没找到时，`locate_text` 会用整页 OCR 再找一次（调用方显式给了 `text_mode` 就不回退）；动作类调用本来就会回退。
 
 ### 分析手上已有的图片
 
@@ -134,9 +136,18 @@ ui_locate_act(cell="B2")                     # 点某一格的中心
 - 输入通道与焦点是两件事（`delivery=`）。`auto`（默认）走前台路径，点击仅在**明确观察到光标没动**时才补一次窗口消息。`foreground` 恒定走前台路径，可能移动真实指针。`background` 只投窗口消息 —— 不切前台、不动真实指针 —— 窗口吃不下时明确返回 `BACKGROUND_UNAVAILABLE`（UIA 结果不可知时是 `BACKGROUND_UNKNOWN`），绝不悄悄升级成 SendInput。后台目前只覆盖点击类（单击/双击/右键/中键）；键盘、滚动、拖动、移动需要 `foreground`。它是消息投递，不是保证：有些框架会忽略投递的点击，所以看 `dispatched`。不给 `window=` 时，鼠标动作会切到点击点下面的窗口；`focus="off"` 关闭。结果里 `performed.focus` 报告是否成功。
 - 用 `window=` 标注的编号会记住这个窗口，之后 `ui_locate_act(mark=…)` 自动切前台、按窗口验证。
 
+### Android 设备（adb）
+
+`monitor="adb:127.0.0.1:16384"`（或 `window=`）通过 adb 操作模拟器或手机：截图走 `screencap`，输入走 `input tap` / `motionevent`。不切桌面前台，也不动本机鼠标。坐标就是设备截图的像素，原点 (0, 0)。`adb:` 不带序列号时交给 adb 挑（只连了一台设备才行）。adb 路径取 `UI_LOCATE_ADB`，没有就找 `PATH`。
+
+- 取原始帧，设备端不做 PNG 编码（1600x900 模拟器上中位 374ms，`-p` 为 864ms）；原始格式解不出的设备退回 PNG。
+- `action="drag"` 支持 `hold_start_ms`（按下后先停一会，很多游戏要长按才能拿起卡牌或单位）和 `hold_end_ms`（松手前停一会，列表不带惯性）。
+- `long_press`，以及 `touch_down` / `touch_move` / `touch_up` 把一次触摸拆成几次调用，中间手指一直按着：可以按下 → 截图看会落在哪 → 移过去 → 松手。
+- `press` 把 `back`、`home`、`esc`、`enter`、字母数字换成 Android 键码，也可以直接写 `KEYCODE_…`。`type` 只支持 ASCII。右键、中键会被拒绝。
+
 ### 等待与验证
 
-`verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 不给文字 = 等画面静止。动作前会先静置约 80ms 量一下画面自己在动多少（水面、粒子、视频）；这类画面（`verify.noise.animated`）上阈值随噪声抬高，本来就在动的格子不计，点空白动态背景不会再报 `verified: true`。
+`verify="screen"` 且不给 `settle_ms` 时，动作后等画面停下来再比对（32px 网格差分，最多 1.5 秒；结果里有 `settle.stable` / `elapsed_ms`），不再固定等 220ms。验证结果会列出变化区域 `regions`；平均差被稀释、但目标旁边有一块明显变化时也算生效（`by: "region"`）。`action="wait"` 给 `text` 时轮询到这段字出现为止；写成 `"准备就绪|确认"` 表示任一出现就返回，命中的那个在 `target.query`（先写的优先）。动作目标也接受 `A|B` 写法。不给文字 = 等画面静止；加 `until="change"` 则从当前这一帧起等画面变化再返回（弹窗出来、战斗结束）：300ms 后再抓一帧，把闪烁的格子屏蔽掉；任一变化区域强度达到 64 才算变了。背景缓慢漂移会碰到很多格子但强度低（实测菜单界面最高 34），界面切换是硬边（最低 166）。等待时长取 `verify_timeout_ms`，上限 170 秒（低于 MCP 的 HTTP 超时），超过会截断并报 `clamped_from_ms`。动作前会先静置约 80ms 量一下画面自己在动多少（水面、粒子、视频）；这类画面（`verify.noise.animated`）上阈值随噪声抬高，本来就在动的格子不计，点空白动态背景不会再报 `verified: true`。
 
 结果把两个问题分开：`dispatched` 说明输入有没有送达目标（投递的消息被接受、或 SendInput 真的发了事件），`verified` 说明画面随后有没有确认预期的变化。`verified: false` **不会**自动重放 —— 模拟输入有副作用，因为像素没变就再点一次，正是同一个按钮被点两下的由来。
 
@@ -159,7 +170,9 @@ Host 行 ID 是 `ui-locate-update`，MCP 行 ID 是 `mcp-ui-locate`。
 
 默认运行目录按 `UI_LOCATE_HOME` → `DSH_HOME/ui-locate` → `LOCALAPPDATA/ui-locate` 选择。目录留空可跟随便携版的数据目录；显式绝对路径需要自行维护。
 
-Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PROVIDER` 和 `UI_LOCATE_PORT`，详见 [config.py](src/ui_locate/config.py)。MCP 默认连接本机 7788 端口。给模型的图统一是 JPEG 质量 90、色度不降采样（4:4:4），彩色小字不会糊；视觉 token 只看像素尺寸，不看文件大小。`UI_LOCATE_JPEG_QUALITY` 可改质量。
+Python 服务还识别 `UI_LOCATE_MODEL`、`UI_LOCATE_MODEL_DIR`、`UI_LOCATE_PROVIDER`、`UI_LOCATE_PORT` 和 `UI_LOCATE_ADB`，详见 [config.py](src/ui_locate/config.py)。MCP 默认连接本机 7788 端口。给模型的图统一是 JPEG 质量 90、色度不降采样（4:4:4），彩色小字不会糊；视觉 token 只看像素尺寸，不看文件大小。`UI_LOCATE_JPEG_QUALITY` 可改质量。
+
+MCP 进程默认在第一次调用工具时才拉起服务，这次调用要等约 7 秒（起进程、加载模型）。`UI_LOCATE_PREWARM=1`（或 `runtime.json` 里 `"prewarm": true`）让 MCP 一启动就在后台拉起；默认关，因为打开后从没用到定位的会话也会常驻一个服务。服务根本拉不起来时，调用会立即报错并给出原因。
 
 ### 首次准备与网络
 

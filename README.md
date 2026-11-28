@@ -71,7 +71,9 @@ ui_locate_act(cell="B2")                     # click a cell's center
 
 Besides detector boxes, marks include repeated same-size cells found by geometry alone (inventory slots, tabs, skill bars, tables; `kind: "cell"`), which UI detectors usually miss in games. Numbers belong to one marked image; pass `mark_set` to refuse a stale one.
 
-Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string, `all`, `window:<title>` or `hwnd:<handle>`. Locate again after the UI moves.
+Coordinates are absolute screen coordinates and may be negative on secondary displays. `monitor` accepts `primary`, an index string, `all`, `window:<title>`, `hwnd:<handle>` or `adb:<serial>`. Locate again after the UI moves.
+
+A text hit is reported at the matched OCR line. When a detection box spans a whole panel or two buttons, its center can sit far from the text, so the line center is used instead (`anchor: "text"`, with `box_center` for reference). If the default mosaic OCR finds nothing, `locate_text` retries once with full-page OCR unless `text_mode` was given; actions already did.
 
 ### Analysing an image you already have
 
@@ -136,9 +138,18 @@ Pass `window=` (title or part of it, or a handle) to `ui_locate_marks`, `ui_loca
 - Input channel and focus are separate decisions (`delivery=`). `auto` (default) sends input to the foreground window and, for clicks, falls back to window messages only when the cursor demonstrably did not move. `foreground` always takes the foreground path and may move the real pointer. `background` posts window messages only — it never focuses and never moves the pointer — and refuses with `BACKGROUND_UNAVAILABLE` (or `BACKGROUND_UNKNOWN` when UIA`s outcome is unknowable) when the target window cannot take them, instead of quietly escalating to SendInput. Background exists for the click family (single/double/right/middle); keyboard, scroll, drag and move need `foreground`. It is a message route, not a guarantee: some frameworks ignore posted clicks, so inspect `dispatched`. Without `window=`, mouse actions focus the window under the point; `focus="off"` disables it. `performed.focus` reports whether it worked.
 - Marks taken with `window=` keep it, so `ui_locate_act(mark=…)` later focuses and verifies that window.
 
+### Android devices (adb)
+
+`monitor="adb:127.0.0.1:16384"` (or `window=`) targets an emulator or phone through adb: screenshots come from `screencap`, input from `input tap` / `motionevent`. Nothing on the desktop is focused and the host mouse never moves. Coordinates are the device screenshot's pixels with origin (0, 0). `adb:` without a serial lets adb pick the only connected device. The adb binary comes from `UI_LOCATE_ADB`, else `PATH`.
+
+- Raw frames skip on-device PNG encoding (374 ms median vs 864 ms for `-p` on a 1600x900 emulator); devices whose raw format cannot be decoded fall back to PNG.
+- `action="drag"` takes `hold_start_ms` (pause after touching down; many games need a long press to pick up a card or unit) and `hold_end_ms` (pause before lifting; stops list inertia).
+- `long_press`, and `touch_down` / `touch_move` / `touch_up` split one touch across calls: the finger stays down between them, so you can touch, capture to see where the item would land, move, and release.
+- `press` maps `back`, `home`, `esc`, `enter`, letters and digits to Android key codes, or takes `KEYCODE_…` directly. `type` accepts ASCII only. Right and middle clicks are rejected.
+
 ### Waiting and verifying
 
-With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` without text waits for a still screen. Before acting, about 80 ms of idle frames measure how much the scene moves by itself (water, particles, video); on such scenes (`verify.noise.animated`) the threshold rises with the noise and cells that were already moving are ignored, so clicking empty animated background no longer reports `verified: true`.
+With `verify="screen"` and no `settle_ms`, an action waits until the screen stops changing (32 px grid diff, up to 1.5 s; `settle.stable` / `elapsed_ms` in the result) instead of a fixed 220 ms. The check also lists the changed `regions` and counts a strong change next to the target (`by: "region"`) when the averaged difference is diluted. `action="wait"` with `text` polls until that text appears; `"Ready|Confirm"` returns on whichever shows up first and reports it as `target.query` (earlier alternatives win). Action targets accept the same `A|B` form. Without text it waits for a still screen, or with `until="change"` for the screen to differ from the current frame (a dialog opens, a battle ends): the frame 300 ms later masks cells that flicker, and a change counts when any changed region's strength reaches 64, because slow background drift can touch many cells but stays weak (≤34 on a measured menu) while a UI switch is a hard edge (≥166). Waits use `verify_timeout_ms` and are capped at 170 s, below the MCP HTTP timeout; a longer request reports `clamped_from_ms`. Before acting, about 80 ms of idle frames measure how much the scene moves by itself (water, particles, video); on such scenes (`verify.noise.animated`) the threshold rises with the noise and cells that were already moving are ignored, so clicking empty animated background no longer reports `verified: true`.
 
 Results keep two questions apart: `dispatched` says whether the input reached the target (a posted message was accepted, or SendInput delivered events), `verified` says whether the screen then confirmed the expected change. `verified: false` is never retried automatically — synthetic input has side effects, and replaying a click because the pixels did not move is how the same button gets pressed twice.
 
@@ -161,7 +172,9 @@ The Host row ID is `ui-locate-update`; the MCP row is `mcp-ui-locate`.
 
 The default home follows `UI_LOCATE_HOME` → `DSH_HOME/ui-locate` → `LOCALAPPDATA/ui-locate`. Empty directory settings follow portable DSH data; explicit absolute paths require maintenance.
 
-The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCATE_PROVIDER` and `UI_LOCATE_PORT`; see [config.py](src/ui_locate/config.py). MCP connects to local port 7788 by default. Images for the model are JPEG at quality 90 with 4:4:4 chroma (no subsampling) so small colored text stays legible; vision tokens depend on pixel size, not bytes. `UI_LOCATE_JPEG_QUALITY` changes the quality.
+The Python service also reads `UI_LOCATE_MODEL`, `UI_LOCATE_MODEL_DIR`, `UI_LOCATE_PROVIDER`, `UI_LOCATE_PORT` and `UI_LOCATE_ADB`; see [config.py](src/ui_locate/config.py). MCP connects to local port 7788 by default. Images for the model are JPEG at quality 90 with 4:4:4 chroma (no subsampling) so small colored text stays legible; vision tokens depend on pixel size, not bytes. `UI_LOCATE_JPEG_QUALITY` changes the quality.
+
+The MCP process starts the service on the first tool call, which then waits about 7 s for process start and model load. `UI_LOCATE_PREWARM=1` (or `"prewarm": true` in `runtime.json`) starts it in the background as soon as MCP starts; it is off by default because it keeps a service running in sessions that never locate anything. If the service cannot be started at all, the call fails at once with the cause.
 
 ### First-time setup and the network
 
